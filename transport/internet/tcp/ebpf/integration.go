@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 )
@@ -59,6 +60,11 @@ func AccelerateDialedConnection(ctx context.Context, conn net.Conn, streamSettin
 	if err := accelerator.AccelerateConnection(conn, realityEnabled); err != nil {
 		errors.LogDebug(ctx, "Failed to accelerate connection: ", err)
 		return nil // 不影响正常连接
+	}
+
+	// 启用TCP拥塞控制优化
+	if destination, err := xnet.ParseDestination(conn.RemoteAddr().String()); err == nil {
+		EnableTCPCongestionControl(ctx, conn, destination)
 	}
 
 	if realityEnabled {

@@ -249,6 +249,10 @@ if [ -d "transport/internet/tcp/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o xtls_vision_accelerator.o xtls_vision_accelerator.c
         echo "   ✅ XTLS Vision eBPF程序编译成功"
     fi
+    if [ -f tcp_congestion_control.c ]; then
+        clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o tcp_congestion_control.o tcp_congestion_control.c
+        echo "   ✅ TCP拥塞控制eBPF程序编译成功"
+    fi
     cd "$BUILD_ROOT"
 fi
 
@@ -359,6 +363,31 @@ if [ -f transport/internet/tcp/ebpf/xtls_vision_accelerator.o ]; then
     echo "      🚀 Splice操作优化"
 else
     echo "   ❌ XTLS Vision eBPF程序文件未找到"
+fi
+
+# 🚀 加载TCP拥塞控制eBPF程序
+echo "   🚀 加载TCP拥塞控制eBPF程序..."
+if [ -f transport/internet/tcp/ebpf/tcp_congestion_control.o ]; then
+    # 创建TCP拥塞控制专用Maps
+    echo "      创建TCP拥塞控制Maps..."
+    bpftool map create /sys/fs/bpf/xray/tcp_congestion_states type lru_hash key 8 value 64 entries 100000 name tcp_congestion_states 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/congestion_statistics type array key 4 value 64 entries 1 name congestion_statistics 2>/dev/null || true
+
+    # 加载TCP拥塞控制XDP程序
+    echo "      加载TCP拥塞控制XDP程序（拥塞控制优化）..."
+    bpftool prog load transport/internet/tcp/ebpf/tcp_congestion_control.o /sys/fs/bpf/xray/tcp_congestion_control_xdp type xdp 2>/dev/null && echo "         ✅ TCP拥塞控制XDP程序加载成功" || echo "         ❌ TCP拥塞控制XDP程序加载失败"
+
+    # 加载TCP拥塞控制TC程序
+    echo "      加载TCP拥塞控制TC程序（出口优化）..."
+    bpftool prog load transport/internet/tcp/ebpf/tcp_congestion_control.o /sys/fs/bpf/xray/tcp_congestion_control_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+
+    echo "   🎉 TCP拥塞控制eBPF加速器部署完成！"
+    echo "      ⚡ 智能拥塞控制算法"
+    echo "      🔒 BBR拥塞控制优化"
+    echo "      📊 ECN标记处理"
+    echo "      🚀 自适应窗口调整"
+else
+    echo "   ❌ TCP拥塞控制eBPF程序文件未找到"
 fi
 
 # 设置Xray权限
