@@ -38,6 +38,17 @@ errorgen
 # Build assets
 /build_assets
 
+# Build directory and compiled files
+/build/
+/dist/
+
+# eBPF compiled files (but keep source .c files)
+*.o
+*_bpfel.go
+*_bpfel.o
+*_bpfeb.go
+*_bpfeb.o
+
 # Output from dlv test
 **/debug.*
 

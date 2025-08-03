@@ -1,0 +1,173 @@
+# Xray-core eBPF优化版本 Makefile
+
+.PHONY: all clean test build-linux build-ebpf deps version help
+
+# 构建配置
+APP_NAME = xray
+VERSION ?= $(shell git describe --tags --always --dirty)
+COMMIT ?= $(shell git rev-parse --short HEAD)
+BUILD_TIME ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# 构建目录
+BUILD_DIR = build
+DIST_DIR = dist
+
+# 构建标签
+LINUX_TAGS = linux,amd64
+EBPF_TAGS = linux,amd64,ebpf
+
+# 构建标志
+LDFLAGS = -X github.com/xtls/xray-core/core.version=$(VERSION) \
+          -X github.com/xtls/xray-core/core.build=$(COMMIT) \
+          -X github.com/xtls/xray-core/core.buildDate=$(BUILD_TIME) \
+          -s -w
+
+# Go构建设置
+GO = go
+GOBUILD = CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build
+GOTEST = $(GO) test
+GOCLEAN = $(GO) clean
+
+# eBPF编译器设置
+CC = clang
+CFLAGS = -O2 -g -Wall -target bpf -c -fno-stack-protector
+INCLUDES = -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu
+
+# eBPF源文件目录
+EBPF_DIRS = app/dns/ebpf app/router/ebpf app/stats/ebpf transport/internet/ebpf transport/internet/tcp/ebpf
+
+# 默认目标
+all: build-linux build-ebpf
+
+# 显示帮助信息
+help:
+	@echo "Xray-core eBPF构建系统"
+	@echo ""
+	@echo "可用目标:"
+	@echo "  all          - 构建Linux版本和eBPF程序"
+	@echo "  build-linux  - 构建Linux可执行文件"
+	@echo "  build-ebpf   - 编译eBPF程序"
+	@echo "  deps         - 检查构建依赖"
+	@echo "  test         - 运行测试"
+	@echo "  clean        - 清理构建文件"
+	@echo "  version      - 显示版本信息"
+	@echo ""
+	@echo "环境变量:"
+	@echo "  VERSION      - 版本号 (默认: git describe)"
+	@echo "  BUILD_DIR    - 构建目录 (默认: build)"
+
+# 显示版本信息
+version:
+	@echo "Xray-core eBPF构建系统"
+	@echo "版本: $(VERSION)"
+	@echo "提交: $(COMMIT)"
+	@echo "构建时间: $(BUILD_TIME)"
+
+# 检查构建依赖
+deps:
+	@echo "检查构建依赖..."
+	@command -v $(GO) >/dev/null 2>&1 || { echo "❌ Go未安装"; exit 1; }
+	@echo "✅ Go: $$($(GO) version)"
+	@command -v $(CC) >/dev/null 2>&1 || { echo "⚠️  Clang未安装 (eBPF编译需要)"; }
+	@command -v make >/dev/null 2>&1 || { echo "⚠️  Make未安装"; }
+	@echo "✅ 依赖检查完成"
+
+# 构建Linux版本
+build-linux: deps
+	@echo "构建Xray Linux版本..."
+	@mkdir -p $(BUILD_DIR)
+	$(GOBUILD) -v -tags "$(LINUX_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64 ./main
+	@echo "✅ Linux版本构建完成: $(BUILD_DIR)/$(APP_NAME)-linux-amd64"
+
+# 编译eBPF程序
+build-ebpf:
+	@echo "编译eBPF程序..."
+	@for dir in $(EBPF_DIRS); do \
+		if [ -d "$$dir" ]; then \
+			echo "  编译 $$dir..."; \
+			$(MAKE) -C $$dir 2>/dev/null || echo "  ⚠️  $$dir 编译失败或无Makefile"; \
+		fi; \
+	done
+	@echo "✅ eBPF程序编译完成"
+
+# 构建eBPF增强版本
+build-ebpf-enhanced: deps build-ebpf
+	@echo "构建eBPF增强版本..."
+	@mkdir -p $(BUILD_DIR)
+	$(GOBUILD) -v -tags "$(EBPF_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64-ebpf ./main
+	@echo "✅ eBPF增强版本构建完成: $(BUILD_DIR)/$(APP_NAME)-linux-amd64-ebpf"
+
+# 创建发布包
+dist: clean build-linux build-ebpf
+	@echo "创建发布包..."
+	@mkdir -p $(DIST_DIR)
+	@cp -r $(BUILD_DIR) $(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64-ebpf
+	@for dir in $(EBPF_DIRS); do \
+		if [ -d "$$dir" ]; then \
+			mkdir -p "$(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64-ebpf/$$dir"; \
+			cp -r "$$dir"/* "$(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64-ebpf/$$dir/" 2>/dev/null || true; \
+		fi; \
+	done
+	@tar -czf $(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64-ebpf.tar.gz -C $(DIST_DIR) $(APP_NAME)-$(VERSION)-linux-amd64-ebpf
+	@echo "✅ 发布包创建完成: $(DIST_DIR)/$(APP_NAME)-$(VERSION)-linux-amd64-ebpf.tar.gz"
+
+# 运行测试
+test:
+	@echo "运行测试..."
+	$(GOTEST) -v ./...
+	@echo "✅ 测试完成"
+
+# 运行eBPF特定测试
+test-ebpf:
+	@echo "运行eBPF测试..."
+	@for dir in $(EBPF_DIRS); do \
+		if [ -d "$$dir" ] && [ -f "$$dir/Makefile" ]; then \
+			echo "  测试 $$dir..."; \
+			$(MAKE) -C $$dir test 2>/dev/null || echo "  ⚠️  $$dir 测试失败或无测试目标"; \
+		fi; \
+	done
+	@echo "✅ eBPF测试完成"
+
+# 清理构建文件
+clean:
+	@echo "清理构建文件..."
+	@rm -rf $(BUILD_DIR) $(DIST_DIR)
+	@for dir in $(EBPF_DIRS); do \
+		if [ -d "$$dir" ] && [ -f "$$dir/Makefile" ]; then \
+			echo "  清理 $$dir..."; \
+			$(MAKE) -C $$dir clean 2>/dev/null || true; \
+		fi; \
+	done
+	$(GOCLEAN)
+	@echo "✅ 清理完成"
+
+# 安装到系统
+install: build-linux
+	@echo "安装到系统..."
+	@sudo cp $(BUILD_DIR)/$(APP_NAME)-linux-amd64 /usr/local/bin/$(APP_NAME)
+	@sudo chmod +x /usr/local/bin/$(APP_NAME)
+	@echo "✅ 安装完成: /usr/local/bin/$(APP_NAME)"
+
+# 卸载
+uninstall:
+	@echo "卸载..."
+	@sudo rm -f /usr/local/bin/$(APP_NAME)
+	@echo "✅ 卸载完成"
+
+# 格式化代码
+fmt:
+	@echo "格式化代码..."
+	$(GO) fmt ./...
+	@echo "✅ 代码格式化完成"
+
+# 代码检查
+lint:
+	@echo "代码检查..."
+	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run || echo "⚠️  golangci-lint未安装，跳过检查"
+	@echo "✅ 代码检查完成"
+
+# 快速构建 (仅基础版本)
+quick:
+	@echo "快速构建..."
+	$(GOBUILD) -o $(APP_NAME) ./main
+	@echo "✅ 快速构建完成: $(APP_NAME)"

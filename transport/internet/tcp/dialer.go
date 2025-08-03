@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -87,8 +88,27 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			return nil, errors.New("MITM freedom RAW TLS: unexpected Negotiated Protocol (" + negotiatedProtocol + ") with " + mitmServerName).AtWarning()
 		}
 	} else if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
+		// 🎯 尝试使用目标域名加速
+		targetAccelerator := reality.GetGlobalTargetAccelerator()
+		if acceleratedConn, err := targetAccelerator.AccelerateTargetDial(ctx, dest); err == nil {
+			errors.LogDebug(ctx, "🚀 Using accelerated target connection for REALITY")
+			conn.Close() // 关闭原连接
+			conn = acceleratedConn
+		}
+
+		// 优化REALITY握手
+		if err := ebpf.OptimizeRealityHandshake(ctx, conn, config); err != nil {
+			errors.LogDebug(ctx, "Failed to optimize REALITY handshake: ", err)
+		}
+
 		if conn, err = reality.UClient(conn, config, ctx, dest); err != nil {
 			return nil, err
+		}
+
+		// 🔒 REALITY握手成功，标记为已验证以启用eBPF快速路径
+		if err := ebpf.MarkRealityHandshakeComplete(ctx, conn); err != nil {
+			errors.LogDebug(ctx, "Failed to mark REALITY handshake complete: ", err)
+			// 不影响正常连接，继续执行
 		}
 	}
 
@@ -104,6 +124,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn = auth.Client(conn)
 	}
+
+	// 为连接启用eBPF加速
+	if err := ebpf.AccelerateDialedConnection(ctx, conn, streamSettings); err != nil {
+		errors.LogDebug(ctx, "Failed to enable eBPF acceleration: ", err)
+		// 不影响正常连接，继续执行
+	}
+
 	return stat.Connection(conn), nil
 }
 

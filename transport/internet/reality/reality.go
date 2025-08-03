@@ -117,6 +117,17 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 }
 
 func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
+	// 🚀 首先尝试REALITY 0-RTT握手
+	if conn, is0RTT, err := TryZeroRTTHandshake(c, config, ctx, dest); err == nil {
+		if is0RTT {
+			errors.LogInfo(ctx, "🚀 REALITY 0-RTT handshake completed successfully")
+			return conn, nil
+		}
+		// 非0-RTT但握手成功，直接返回
+		return conn, nil
+	}
+
+	// 0-RTT失败，执行标准REALITY握手
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
 		Config: config,
