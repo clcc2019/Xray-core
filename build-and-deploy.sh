@@ -245,6 +245,10 @@ if [ -d "transport/internet/tcp/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o tcp_reality_accelerator.o tcp_reality_accelerator.c
         echo "   ✅ TCP+REALITY eBPF程序编译成功"
     fi
+    if [ -f xtls_vision_accelerator.c ]; then
+        clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o xtls_vision_accelerator.o xtls_vision_accelerator.c
+        echo "   ✅ XTLS Vision eBPF程序编译成功"
+    fi
     cd "$BUILD_ROOT"
 fi
 
@@ -331,6 +335,32 @@ else
     echo "   ❌ Proxy eBPF程序文件未找到"
 fi
 
+# 🚀 加载XTLS Vision eBPF程序
+echo "   🚀 加载XTLS Vision eBPF程序..."
+if [ -f transport/internet/tcp/ebpf/xtls_vision_accelerator.o ]; then
+    # 创建XTLS Vision专用Maps
+    echo "      创建XTLS Vision Maps..."
+    bpftool map create /sys/fs/bpf/xray/xtls_inbound_connections type hash key 8 value 64 entries 100000 name xtls_inbound_connections 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/xtls_stats type hash key 4 value 64 entries 1000 name xtls_stats 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/xtls_hot_connections type lru_hash key 8 value 8 entries 10000 name hot_connections 2>/dev/null || true
+
+    # 加载XTLS Vision XDP程序
+    echo "      加载XTLS Vision XDP程序（入站Vision协议加速）..."
+    bpftool prog load transport/internet/tcp/ebpf/xtls_vision_accelerator.o /sys/fs/bpf/xray/xtls_vision_inbound_accelerator_xdp type xdp 2>/dev/null && echo "         ✅ XTLS Vision XDP程序加载成功" || echo "         ❌ XTLS Vision XDP程序加载失败"
+
+    # 加载XTLS Vision TC程序
+    echo "      加载XTLS Vision TC程序（入站出口优化）..."
+    bpftool prog load transport/internet/tcp/ebpf/xtls_vision_accelerator.o /sys/fs/bpf/xray/xtls_vision_inbound_accelerator_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+
+    echo "   🎉 XTLS Vision eBPF加速器部署完成！"
+    echo "      ⚡ Vision协议零拷贝加速"
+    echo "      🔒 TLS 1.3握手优化"
+    echo "      📊 Vision连接跟踪"
+    echo "      🚀 Splice操作优化"
+else
+    echo "   ❌ XTLS Vision eBPF程序文件未找到"
+fi
+
 # 设置Xray权限
 echo "🔐 设置Xray权限..."
 chmod +x xray-linux-amd64-ebpf
@@ -340,6 +370,9 @@ echo "✅ eBPF挂载完成！"
 echo "📊 检查状态:"
 echo "   bpftool prog list | grep xray"
 echo "   bpftool map list | grep xray"
+echo "   systemctl stop xray"
+echo "   cp xray-linux-amd64-ebpf /usr/local/bin/xray"
+echo "   systemctl start xray"
 
 EOF
     
