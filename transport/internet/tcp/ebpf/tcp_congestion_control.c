@@ -245,7 +245,7 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
 }
 
 // TCP拥塞控制TC程序
-SEC("sched_cls")
+SEC("tc/ingress")
 int tcp_congestion_control_tc(struct __sk_buff *skb) {
     __u32 key = 0;
     struct congestion_stats *stats = bpf_map_lookup_elem(&congestion_statistics, &key);

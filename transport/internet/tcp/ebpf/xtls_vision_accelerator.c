@@ -306,7 +306,7 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
 }
 
 // TC程序 - 入站出口优化
-SEC("tc")
+SEC("tc/ingress")
 int xtls_vision_inbound_accelerator_tc(struct __sk_buff *skb) {
     // 简化的TC程序，只更新基本统计
     __u32 key = 0;

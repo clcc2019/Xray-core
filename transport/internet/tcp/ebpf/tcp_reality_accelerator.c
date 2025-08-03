@@ -276,7 +276,7 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
 }
 
 // TC程序 - 出口优化和统计
-SEC("tc")
+SEC("tc/ingress")
 int tcp_reality_accelerator_tc(struct __sk_buff *skb) {
     // 简化的TC程序，专注于统计更新
     __u32 key = 0;

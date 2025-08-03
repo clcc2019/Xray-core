@@ -253,6 +253,10 @@ if [ -d "transport/internet/tcp/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o tcp_congestion_control.o tcp_congestion_control.c
         echo "   ✅ TCP拥塞控制eBPF程序编译成功"
     fi
+    if [ -f tcp_stats_tc.c ]; then
+        clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o tcp_stats_tc.o tcp_stats_tc.c
+        echo "   ✅ TCP统计TC程序编译成功"
+    fi
     cd "$BUILD_ROOT"
 fi
 
@@ -302,7 +306,7 @@ if [ -f transport/internet/tcp/ebpf/tcp_reality_accelerator.o ]; then
 
     # 加载TCP+REALITY TC程序（可选）
     echo "      加载TCP+REALITY TC程序（出口优化）..."
-    bpftool prog load transport/internet/tcp/ebpf/tcp_reality_accelerator.o /sys/fs/bpf/xray/tcp_reality_accelerator_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+    bpftool prog load transport/internet/tcp/ebpf/tcp_reality_accelerator.o /sys/fs/bpf/xray/tcp_reality_accelerator_tc type classifier 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
 
     echo "   🎉 TCP+REALITY eBPF加速器部署完成！"
     echo "      ⚡ 支持零拷贝快速转发"
@@ -328,7 +332,7 @@ if [ -f proxy/ebpf/proxy_accelerator.o ]; then
 
     # 加载Proxy TC程序
     echo "      加载Proxy TC程序（出口优化）..."
-    bpftool prog load proxy/ebpf/proxy_accelerator.o /sys/fs/bpf/xray/proxy_accelerator_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+    bpftool prog load proxy/ebpf/proxy_accelerator.o /sys/fs/bpf/xray/proxy_accelerator_tc type classifier 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
 
     echo "   🎉 Proxy eBPF加速器部署完成！"
     echo "      ⚡ 支持零拷贝数据转发"
@@ -354,7 +358,7 @@ if [ -f transport/internet/tcp/ebpf/xtls_vision_accelerator.o ]; then
 
     # 加载XTLS Vision TC程序
     echo "      加载XTLS Vision TC程序（入站出口优化）..."
-    bpftool prog load transport/internet/tcp/ebpf/xtls_vision_accelerator.o /sys/fs/bpf/xray/xtls_vision_inbound_accelerator_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+    bpftool prog load transport/internet/tcp/ebpf/xtls_vision_accelerator.o /sys/fs/bpf/xray/xtls_vision_inbound_accelerator_tc type classifier 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
 
     echo "   🎉 XTLS Vision eBPF加速器部署完成！"
     echo "      ⚡ Vision协议零拷贝加速"
@@ -377,9 +381,9 @@ if [ -f transport/internet/tcp/ebpf/tcp_congestion_control.o ]; then
     echo "      加载TCP拥塞控制XDP程序（拥塞控制优化）..."
     bpftool prog load transport/internet/tcp/ebpf/tcp_congestion_control.o /sys/fs/bpf/xray/tcp_congestion_control_xdp type xdp 2>/dev/null && echo "         ✅ TCP拥塞控制XDP程序加载成功" || echo "         ❌ TCP拥塞控制XDP程序加载失败"
 
-    # 加载TCP拥塞控制TC程序
-    echo "      加载TCP拥塞控制TC程序（出口优化）..."
-    bpftool prog load transport/internet/tcp/ebpf/tcp_congestion_control.o /sys/fs/bpf/xray/tcp_congestion_control_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+    # 加载TCP统计TC程序
+    echo "      加载TCP统计TC程序（基本统计）..."
+    bpftool prog load transport/internet/tcp/ebpf/tcp_stats_tc.o /sys/fs/bpf/xray/tcp_stats_tc type classifier 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
 
     echo "   🎉 TCP拥塞控制eBPF加速器部署完成！"
     echo "      ⚡ 智能拥塞控制算法"
@@ -394,14 +398,15 @@ fi
 echo "🔐 设置Xray权限..."
 chmod +x xray-linux-amd64-ebpf
 setcap cap_bpf+ep ./xray-linux-amd64-ebpf 2>/dev/null || true
+systemctl stop xray
+cp xray-linux-amd64-ebpf /usr/local/bin/xray
+systemctl start xray
 
 echo "✅ eBPF挂载完成！"
 echo "📊 检查状态:"
 echo "   bpftool prog list | grep xray"
 echo "   bpftool map list | grep xray"
-echo "   systemctl stop xray"
-echo "   cp xray-linux-amd64-ebpf /usr/local/bin/xray"
-echo "   systemctl start xray"
+
 
 EOF
     
