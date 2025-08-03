@@ -41,6 +41,8 @@ if [ "$OS" = "Darwin" ]; then
     cp -r app/loadbalancer build/app/
     cp -r transport/internet/ebpf build/transport/internet/
     cp -r transport/internet/tcp/ebpf build/transport/internet/tcp/
+    mkdir -p build/proxy
+    cp -r proxy/ebpf build/proxy/
     
     # 创建eBPF挂载脚本
     echo "📦 创建eBPF挂载脚本..."
@@ -136,7 +138,7 @@ fi
 echo "🔨 编译eBPF程序..."
 
 # 保存当前目录
-BUILD_ROOT=\\\$(pwd)
+BUILD_ROOT=$(pwd)
 
 # 编译DNS eBPF程序
 echo "   编译DNS eBPF程序..."
@@ -150,7 +152,7 @@ if [ -d "app/dns/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o dns_cache.o dns_cache.c
     fi
     echo "   ✅ DNS缓存eBPF程序编译成功"
-    cd "\\\$BUILD_ROOT"
+    cd "$BUILD_ROOT"
 fi
 
 # 编译GeoIP/GeoSite eBPF程序
@@ -171,7 +173,7 @@ if [ -d "app/router/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o geosite_matcher.o geosite_matcher.c
     fi
     echo "   ✅ GeoSite eBPF程序编译成功"
-    cd "\\\$BUILD_ROOT"
+    cd "$BUILD_ROOT"
 fi
 
 # 编译统计eBPF程序
@@ -182,7 +184,7 @@ if [ -d "app/stats/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o connection_tracker.o connection_tracker.c
         echo "   ✅ 连接跟踪eBPF程序编译成功"
     fi
-    cd "\\\$BUILD_ROOT"
+    cd "$BUILD_ROOT"
 fi
 
 # 编译传输层eBPF程序
@@ -193,7 +195,17 @@ if [ -d "transport/internet/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o xray_accelerator.o xray_accelerator.c
         echo "   ✅ Xray加速器eBPF程序编译成功"
     fi
-    cd "\\\$BUILD_ROOT"
+    cd "$BUILD_ROOT"
+fi
+
+# 编译Proxy eBPF程序
+echo "   编译Proxy eBPF程序..."
+if [ -d "proxy/ebpf" ]; then
+    cd proxy/ebpf
+    make clean 2>/dev/null || true
+    clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o proxy_accelerator.o proxy_accelerator.c
+    echo "   ✅ Proxy eBPF程序编译成功"
+    cd "$BUILD_ROOT"
 fi
 
 # 编译TCP+REALITY eBPF程序
@@ -204,7 +216,7 @@ if [ -d "transport/internet/tcp/ebpf" ]; then
         clang -O2 -g -Wall -target bpf -c -fno-stack-protector -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o tcp_reality_accelerator.o tcp_reality_accelerator.c
         echo "   ✅ TCP+REALITY eBPF程序编译成功"
     fi
-    cd "\\\$BUILD_ROOT"
+    cd "$BUILD_ROOT"
 fi
 
 # 挂载eBPF
@@ -257,6 +269,7 @@ EOF
     echo "   app/dns/ebpf/ - DNS eBPF源文件"
     echo "   app/router/ebpf/ - GeoIP & GeoSite eBPF源文件"
     echo "   app/stats/ebpf/ - 统计eBPF源文件"
+    echo "   proxy/ebpf/ - Proxy eBPF源文件"
     echo "   transport/internet/ebpf/ - 传输eBPF源文件"
     echo "   mount-ebpf.sh - eBPF挂载脚本"
     echo "🚀 将整个build目录上传到Linux服务器，然后运行:"

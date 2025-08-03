@@ -1,0 +1,35 @@
+# Xray Proxy eBPF with Cilium ebpf-go
+
+TARGET_ARCH ?= x86_64
+GO ?= go
+
+all: generate
+
+# 使用 bpf2go 生成 Go 绑定
+generate:
+	@echo "🔨 使用 Cilium bpf2go 生成 eBPF Go 绑定..."
+	$(GO) generate ./proxy_integration_cilium.go
+	@echo "✅ eBPF Go 绑定生成成功"
+
+clean:
+	rm -f proxy_accelerator_bpfel.go proxy_accelerator_bpfeb.go
+	rm -f proxy_accelerator_bpfel.o proxy_accelerator_bpfeb.o
+	@echo "🧹 清理完成"
+
+install: generate
+	@echo "📦 Cilium eBPF 程序已准备就绪"
+	@echo "✅ 无需手动安装 - Cilium ebpf-go 会自动处理程序加载"
+
+status:
+	@echo "📊 Cilium eBPF 程序状态:"
+	@echo "   检查生成的 Go 文件:"
+	@ls -la proxy_accelerator_bpf*.go 2>/dev/null || echo "   需要运行 'make generate'"
+
+help:
+	@echo "Cilium eBPF Proxy 加速器构建帮助:"
+	@echo "  make generate  - 使用 bpf2go 生成 Go 绑定"
+	@echo "  make clean     - 清理生成的文件"
+	@echo "  make install   - 准备安装（实际加载由 Go 代码处理）"
+	@echo "  make status    - 显示状态"
+
+.PHONY: all generate clean install status help

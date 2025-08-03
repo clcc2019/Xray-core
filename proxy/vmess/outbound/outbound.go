@@ -86,6 +86,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination().NetAddr())
+	
+	// 启用VMess eBPF加速
+	EnableVMessEBPFAcceleration(ctx, conn, target)
 
 	command := protocol.RequestCommandTCP
 	if target.Network == net.Network_UDP {

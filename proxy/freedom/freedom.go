@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"os"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -24,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/proxy/ebpf"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -171,6 +173,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
+	
+	// 启用eBPF加速
+	EnableEBPFAcceleration(ctx, conn)
 
 	var newCtx context.Context
 	var newCancel context.CancelFunc
@@ -217,6 +222,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process request").Base(err)
+		}
+
+		// 记录Cilium eBPF统计
+		if os.Getenv("XRAY_EBPF") == "1" {
+			if accelerator := ebpf.GetProxyAccelerator(); accelerator != nil && accelerator.IsEnabled() {
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					// 启动Cilium统计记录
+					go recordConnectionStats(ctx, tcpConn, accelerator)
+				}
+			}
 		}
 
 		return nil
