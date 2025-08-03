@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
-	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 )
@@ -62,10 +61,7 @@ func AccelerateDialedConnection(ctx context.Context, conn net.Conn, streamSettin
 		return nil // 不影响正常连接
 	}
 
-	// 启用TCP拥塞控制优化
-	if destination, err := xnet.ParseDestination(conn.RemoteAddr().String()); err == nil {
-		EnableTCPCongestionControl(ctx, conn, destination)
-	}
+	// TCP拥塞控制优化已移除，专注于REALITY优化
 
 	if realityEnabled {
 		errors.LogInfo(ctx, "TCP+REALITY eBPF acceleration enabled for ", conn.RemoteAddr().String())

@@ -94,16 +94,12 @@ done
 log_info "复制eBPF源文件..."
 mkdir -p $BUILD_DIR/{app/{dns,router,stats},transport/internet/tcp,proxy}
 
-cp -r app/dns/ebpf $BUILD_DIR/app/dns/
-cp -r app/router/ebpf $BUILD_DIR/app/router/
-cp -r app/stats/ebpf $BUILD_DIR/app/stats/
-cp -r transport/internet/ebpf $BUILD_DIR/transport/internet/
-cp -r transport/internet/tcp/ebpf $BUILD_DIR/transport/internet/tcp/
-cp -r transport/internet/quic/ebpf $BUILD_DIR/transport/internet/quic/
-cp -r transport/internet/http3/ebpf $BUILD_DIR/transport/internet/http3/
-cp -r transport/internet/tls/ebpf $BUILD_DIR/transport/internet/tls/
-cp -r transport/internet/zerocopy/ebpf $BUILD_DIR/transport/internet/zerocopy/
-cp -r proxy/ebpf $BUILD_DIR/proxy/
+    cp -r app/dns/ebpf $BUILD_DIR/app/dns/
+    cp -r app/router/ebpf $BUILD_DIR/app/router/
+    cp -r app/stats/ebpf $BUILD_DIR/app/stats/
+    cp -r transport/internet/ebpf $BUILD_DIR/transport/internet/
+    cp -r transport/internet/tcp/ebpf $BUILD_DIR/transport/internet/tcp/
+    cp -r proxy/ebpf $BUILD_DIR/proxy/
 
 # 创建优化的eBPF挂载脚本
 log_info "创建eBPF挂载脚本..."
@@ -236,10 +232,7 @@ compile_ebpf() {
     compile_program "app/stats/ebpf" "*.c" "统计eBPF程序"
     compile_program "transport/internet/ebpf" "*.c" "传输层eBPF程序"
     compile_program "transport/internet/tcp/ebpf" "*.c" "TCP eBPF程序"
-    compile_program "transport/internet/quic/ebpf" "*.c" "QUIC eBPF程序"
-    compile_program "transport/internet/http3/ebpf" "*.c" "HTTP/3 eBPF程序"
-    compile_program "transport/internet/tls/ebpf" "*.c" "TLS 1.3 eBPF程序"
-    compile_program "transport/internet/zerocopy/ebpf" "*.c" "零拷贝eBPF程序"
+
     compile_program "proxy/ebpf" "*.c" "Proxy eBPF程序"
     
     log_success "eBPF编译完成: $success_count/$total_count 成功"
@@ -325,20 +318,8 @@ load_ebpf() {
     load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_xdp" "xdp" "xtls_inbound_connections xtls_stats xtls_hot_connections" "$interface_name"
     load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc" "classifier" "" ""
     
-    # TCP拥塞控制
+    # TCP拥塞控制（简化版）
     load_program "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp" "xdp" "tcp_basic_states basic_stats_map" "$interface_name"
-    
-    # QUIC协议优化
-    load_program "transport/internet/quic/ebpf/quic_accelerator.o" "quic_accelerator_xdp" "xdp" "quic_connections quic_statistics" "$interface_name"
-    
-    # HTTP/3协议优化
-    load_program "transport/internet/http3/ebpf/http3_optimizer.o" "http3_optimizer_xdp" "xdp" "http3_streams http3_statistics" "$interface_name"
-    
-    # TLS 1.3优化
-    load_program "transport/internet/tls/ebpf/tls13_optimizer.o" "tls13_optimizer_xdp" "xdp" "tls13_connections tls13_statistics" "$interface_name"
-    
-    # 零拷贝优化
-    load_program "transport/internet/zerocopy/ebpf/zerocopy_optimizer.o" "zerocopy_optimizer_xdp" "xdp" "zerocopy_connections zerocopy_statistics" "$interface_name"
 }
 
 # 设置权限

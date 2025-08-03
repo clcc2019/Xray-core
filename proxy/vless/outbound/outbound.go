@@ -100,8 +100,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination().NetAddr())
 
 	// 启用REALITY eBPF优化
-	if destination, err := net.ParseDestination(conn.RemoteAddr().String()); err == nil {
-		ebpf.EnableRealityEBPF(ctx, conn, destination)
+	if _, err := net.ParseDestination(conn.RemoteAddr().String()); err == nil {
+		// 使用现有的eBPF加速函数
+		if err := ebpf.AccelerateDialedConnection(ctx, conn, nil); err != nil {
+			errors.LogDebug(ctx, "Failed to enable REALITY eBPF optimization: ", err)
+		}
 	}
 
 	// 启用VLESS eBPF加速

@@ -184,9 +184,20 @@ func (a *TCPRealityAccelerator) MarkRealityVerified(conn net.Conn) error {
 
 // updateConnectionSecurityState 更新eBPF map中的连接安全状态
 func (a *TCPRealityAccelerator) updateConnectionSecurityState(connID string, realityVerified, tlsEstablished bool) error {
-	// 这里应该调用bpftool或使用libbpf来更新eBPF map
-	// 由于我们在用户态，暂时记录日志
-	errors.LogDebug(context.Background(), "Updating eBPF security state for ", connID,
+	// 直接操作eBPF map来更新连接状态
+	// 使用bpftool map update命令
+	key := fmt.Sprintf("conn_%s", connID)
+	value := fmt.Sprintf("%t_%t", realityVerified, tlsEstablished)
+
+	cmd := exec.Command("bpftool", "map", "update", "pinned", "/sys/fs/bpf/xray/tcp_connections",
+		"key", key, "value", value)
+
+	if err := cmd.Run(); err != nil {
+		errors.LogDebug(context.Background(), "Failed to update eBPF map: ", err)
+		return err
+	}
+
+	errors.LogDebug(context.Background(), "Updated eBPF security state for ", connID,
 		" - REALITY verified: ", realityVerified, ", TLS established: ", tlsEstablished)
 	return nil
 }
