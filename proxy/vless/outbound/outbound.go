@@ -28,6 +28,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -97,7 +98,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination().NetAddr())
-	
+
+	// 启用REALITY eBPF优化
+	if destination, err := net.ParseDestination(conn.RemoteAddr().String()); err == nil {
+		ebpf.EnableRealityEBPF(ctx, conn, destination)
+	}
+
 	// 启用VLESS eBPF加速
 	var sni string
 	if target.Address.Family().IsDomain() {

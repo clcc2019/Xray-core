@@ -262,6 +262,7 @@ load_ebpf() {
         local prog_name=$2
         local prog_type=$3
         local map_name=$4
+        local attach_interface=$5
         
         if [ -f "$obj_file" ]; then
             # 创建专用maps
@@ -274,6 +275,22 @@ load_ebpf() {
             # 加载程序
             if bpftool prog load "$obj_file" $BPF_ROOT/$prog_name type $prog_type 2>/dev/null; then
                 log_success "$prog_name 加载成功"
+                
+                # 如果是XDP程序且有指定接口，则附加到网络接口
+                if [ "$prog_type" = "xdp" ] && [ -n "$attach_interface" ]; then
+                    # 尝试原生XDP
+                    if ip link set dev $attach_interface xdp obj $BPF_ROOT/$prog_name 2>/dev/null; then
+                        log_success "$prog_name 附加到 $attach_interface 成功 (原生XDP)"
+                    else
+                        # 尝试通用XDP
+                        if ip link set dev $attach_interface xdp obj $BPF_ROOT/$prog_name mode skb 2>/dev/null; then
+                            log_success "$prog_name 附加到 $attach_interface 成功 (通用XDP)"
+                        else
+                            log_warning "$prog_name 附加到 $attach_interface 失败"
+                        fi
+                    fi
+                fi
+                
                 return 0
             else
                 log_warning "$prog_name 加载失败"
@@ -283,37 +300,45 @@ load_ebpf() {
         return 1
     }
     
-    # 加载各模块
-    load_program "app/dns/ebpf/dns_cache.o" "dns_cache_prog" "xdp" ""
-    load_program "app/router/ebpf/geoip_matcher.o" "geoip_matcher" "xdp" ""
-    load_program "app/router/ebpf/geosite_matcher.o" "geosite_matcher" "xdp" ""
+    # 获取网络接口名称
+    local interface_name=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -1)
+    if [ -z "$interface_name" ]; then
+        interface_name="ens5"  # 默认接口
+    fi
     
-    # TCP+REALITY
-    load_program "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp" "xdp" "tcp_connections reality_sessions hot_connections tcp_reality_stats_map"
-    load_program "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc" "classifier" "tcp_connections_tc stats_map_tc"
+    log_info "使用网络接口: $interface_name"
+    
+    # 加载各模块
+    load_program "app/dns/ebpf/dns_cache.o" "dns_cache_prog" "xdp" "" "$interface_name"
+    load_program "app/router/ebpf/geoip_matcher.o" "geoip_matcher" "xdp" "" "$interface_name"
+    load_program "app/router/ebpf/geosite_matcher.o" "geosite_matcher" "xdp" "" "$interface_name"
+    
+    # TCP+REALITY - 最重要的优化
+    load_program "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp" "xdp" "tcp_connections reality_sessions hot_connections tcp_reality_stats_map" "$interface_name"
+    load_program "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc" "classifier" "tcp_connections_tc stats_map_tc" ""
     
     # Proxy
-    load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp" "xdp" "proxy_connections tls_sessions proxy_stats_map"
-    load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_tc" "classifier" ""
+    load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp" "xdp" "proxy_connections tls_sessions proxy_stats_map" "$interface_name"
+    load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_tc" "classifier" "" ""
     
     # XTLS Vision
-    load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_xdp" "xdp" "xtls_inbound_connections xtls_stats xtls_hot_connections"
-    load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc" "classifier" ""
+    load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_xdp" "xdp" "xtls_inbound_connections xtls_stats xtls_hot_connections" "$interface_name"
+    load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc" "classifier" "" ""
     
     # TCP拥塞控制
-    load_program "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp" "xdp" "tcp_basic_states basic_stats_map"
+    load_program "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp" "xdp" "tcp_basic_states basic_stats_map" "$interface_name"
     
     # QUIC协议优化
-    load_program "transport/internet/quic/ebpf/quic_accelerator.o" "quic_accelerator_xdp" "xdp" "quic_connections quic_statistics"
+    load_program "transport/internet/quic/ebpf/quic_accelerator.o" "quic_accelerator_xdp" "xdp" "quic_connections quic_statistics" "$interface_name"
     
     # HTTP/3协议优化
-    load_program "transport/internet/http3/ebpf/http3_optimizer.o" "http3_optimizer_xdp" "xdp" "http3_streams http3_statistics"
+    load_program "transport/internet/http3/ebpf/http3_optimizer.o" "http3_optimizer_xdp" "xdp" "http3_streams http3_statistics" "$interface_name"
     
     # TLS 1.3优化
-    load_program "transport/internet/tls/ebpf/tls13_optimizer.o" "tls13_optimizer_xdp" "xdp" "tls13_connections tls13_statistics"
+    load_program "transport/internet/tls/ebpf/tls13_optimizer.o" "tls13_optimizer_xdp" "xdp" "tls13_connections tls13_statistics" "$interface_name"
     
     # 零拷贝优化
-    load_program "transport/internet/zerocopy/ebpf/zerocopy_optimizer.o" "zerocopy_optimizer_xdp" "xdp" "zerocopy_connections zerocopy_statistics"
+    load_program "transport/internet/zerocopy/ebpf/zerocopy_optimizer.o" "zerocopy_optimizer_xdp" "xdp" "zerocopy_connections zerocopy_statistics" "$interface_name"
 }
 
 # 设置权限

@@ -271,15 +271,38 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
     // 处理已建立的连接
     if (conn && conn->state >= TCP_STATE_ESTABLISHED) {
         
-        // 🔒 REALITY连接快速转发
+        // 🔒 REALITY连接快速转发 - 这是核心优化
         if (conn->reality_enabled && conn->reality_verified && conn->fast_path_enabled) {
+            update_stats(4); // reality_fast_forward
             return fast_forward_packet(ctx, conn);
         }
         
+        // 🔒 检测并启用REALITY
+        if (!conn->reality_enabled) {
+            // 检查是否是REALITY端口 (443)
+            if (bpf_ntohs(tcp->dest) == 443 || bpf_ntohs(tcp->source) == 443) {
+                conn->reality_enabled = 1;
+                conn->state = TCP_STATE_REALITY_HANDSHAKE;
+                update_stats(5); // reality_connections_detected
+            }
+        }
+        
         // 🔒 尝试REALITY握手加速
-        void *tcp_payload = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + (tcp->doff * 4);
-        if (accelerate_reality_handshake(conn, tcp_payload, data_end, conn_id) == 0) {
-            update_stats(3); // handshake_accelerations
+        if (conn->reality_enabled && !conn->reality_verified) {
+            void *tcp_payload = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + (tcp->doff * 4);
+            if (accelerate_reality_handshake(conn, tcp_payload, data_end, conn_id) == 0) {
+                update_stats(3); // handshake_accelerations
+                // 握手成功后启用快速路径
+                conn->fast_path_enabled = 1;
+            }
+        }
+        
+        // 🔒 对于已建立的REALITY连接，启用快速路径
+        if (conn->reality_enabled && conn->reality_verified && !conn->fast_path_enabled) {
+            conn->fast_path_enabled = 1;
+            conn->next_hop_ip = conn->remote_ip;
+            conn->next_hop_port = conn->remote_port;
+            update_stats(6); // reality_fast_path_enabled
         }
         
         // 更新连接统计
