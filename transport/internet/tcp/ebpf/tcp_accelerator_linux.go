@@ -162,7 +162,7 @@ func (a *TCPRealityAccelerator) MarkRealityVerified(conn net.Conn) error {
 	}
 
 	connID := fmt.Sprintf("%s->%s", conn.LocalAddr().String(), conn.RemoteAddr().String())
-	
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -170,12 +170,12 @@ func (a *TCPRealityAccelerator) MarkRealityVerified(conn net.Conn) error {
 		connInfo.RealityVerified = true
 		connInfo.TLSEstablished = true
 		errors.LogInfo(context.Background(), "🔒 REALITY handshake verified for connection: ", connID)
-		
+
 		// 更新eBPF map中的连接状态
 		if err := a.updateConnectionSecurityState(connID, true, true); err != nil {
 			errors.LogDebug(context.Background(), "Failed to update eBPF connection security state: ", err)
 		}
-		
+
 		return nil
 	}
 
@@ -186,7 +186,7 @@ func (a *TCPRealityAccelerator) MarkRealityVerified(conn net.Conn) error {
 func (a *TCPRealityAccelerator) updateConnectionSecurityState(connID string, realityVerified, tlsEstablished bool) error {
 	// 这里应该调用bpftool或使用libbpf来更新eBPF map
 	// 由于我们在用户态，暂时记录日志
-	errors.LogDebug(context.Background(), "Updating eBPF security state for ", connID, 
+	errors.LogDebug(context.Background(), "Updating eBPF security state for ", connID,
 		" - REALITY verified: ", realityVerified, ", TLS established: ", tlsEstablished)
 	return nil
 }
