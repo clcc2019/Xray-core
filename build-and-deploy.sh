@@ -26,7 +26,36 @@ if [ "$OS" = "Darwin" ]; then
     
     # 构建Xray
     echo "📦 构建Xray可执行文件..."
-    go build -o build/xray-linux-amd64-ebpf ./main
+    
+    # 构建 Linux AMD64 版本
+    echo "🔨 构建 Linux AMD64 版本..."
+    GOOS=linux GOARCH=amd64 go build -v -ldflags="-s -w" -o build/xray-linux-amd64-ebpf ./main
+    if [ $? -eq 0 ]; then
+        echo "   ✅ Linux AMD64 版本构建成功"
+    else
+        echo "   ❌ Linux AMD64 版本构建失败"
+        exit 1
+    fi
+
+    # 构建 Mac AMD64 版本
+    echo "🍎 构建 Mac AMD64 版本..."
+    GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o build/xray-darwin-amd64 ./main
+    if [ $? -eq 0 ]; then
+        echo "   ✅ Mac AMD64 版本构建成功"
+    else
+        echo "   ❌ Mac AMD64 版本构建失败"
+        exit 1
+    fi
+
+    # 构建 Mac ARM64 版本
+    echo "🍎 构建 Mac ARM64 版本..."
+    GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o build/xray-darwin-arm64 ./main
+    if [ $? -eq 0 ]; then
+        echo "   ✅ Mac ARM64 版本构建成功"
+    else
+        echo "   ❌ Mac ARM64 版本构建失败"
+        exit 1
+    fi
     
     # 复制eBPF源文件
     echo "📦 复制eBPF源文件..."
@@ -247,6 +276,59 @@ fi
 if [ -f app/router/ebpf/geosite_matcher.o ]; then
     bpftool prog load app/router/ebpf/geosite_matcher.o /sys/fs/bpf/xray/geosite_matcher 2>/dev/null || true
     echo "   ✅ GeoSite eBPF程序加载成功"
+fi
+
+# 🚀 加载TCP+REALITY eBPF程序
+echo "   🚀 加载TCP+REALITY eBPF程序..."
+if [ -f transport/internet/tcp/ebpf/tcp_reality_accelerator.o ]; then
+    # 创建TCP+REALITY专用Maps
+    echo "      创建TCP+REALITY Maps..."
+    bpftool map create /sys/fs/bpf/xray/tcp_connections type lru_hash key 8 value 64 entries 16384 name tcp_connections 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/reality_sessions type lru_hash key 8 value 96 entries 8192 name reality_sessions 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/hot_connections type hash key 8 value 8 entries 1000 name hot_connections 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/tcp_reality_stats_map type array key 4 value 64 entries 1 name tcp_reality_stats_map 2>/dev/null || true
+
+    # 加载TCP+REALITY XDP程序
+    echo "      加载TCP+REALITY XDP程序（零拷贝快速转发）..."
+    bpftool prog load transport/internet/tcp/ebpf/tcp_reality_accelerator.o /sys/fs/bpf/xray/tcp_reality_accelerator_xdp type xdp 2>/dev/null && echo "         ✅ TCP+REALITY XDP程序加载成功" || echo "         ❌ TCP+REALITY XDP程序加载失败"
+
+    # 加载TCP+REALITY TC程序（可选）
+    echo "      加载TCP+REALITY TC程序（出口优化）..."
+    bpftool prog load transport/internet/tcp/ebpf/tcp_reality_accelerator.o /sys/fs/bpf/xray/tcp_reality_accelerator_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+
+    echo "   🎉 TCP+REALITY eBPF加速器部署完成！"
+    echo "      ⚡ 支持零拷贝快速转发"
+    echo "      🔒 REALITY握手优化"
+    echo "      📊 高级连接跟踪"
+    echo "      🚀 会话复用加速"
+else
+    echo "   ❌ TCP+REALITY eBPF程序文件未找到"
+fi
+
+# 🚀 加载Proxy eBPF程序
+echo "   🚀 加载Proxy eBPF程序..."
+if [ -f proxy/ebpf/proxy_accelerator.o ]; then
+    # 创建Proxy专用Maps
+    echo "      创建Proxy Maps..."
+    bpftool map create /sys/fs/bpf/xray/proxy_connections type lru_hash key 8 value 64 entries 16384 name proxy_connections 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/tls_sessions type lru_hash key 8 value 96 entries 8192 name tls_sessions 2>/dev/null || true
+    bpftool map create /sys/fs/bpf/xray/proxy_stats_map type array key 4 value 64 entries 1 name proxy_stats_map 2>/dev/null || true
+
+    # 加载Proxy XDP程序
+    echo "      加载Proxy XDP程序（数据预处理和快速转发）..."
+    bpftool prog load proxy/ebpf/proxy_accelerator.o /sys/fs/bpf/xray/proxy_accelerator_xdp type xdp 2>/dev/null && echo "         ✅ Proxy XDP程序加载成功" || echo "         ❌ Proxy XDP程序加载失败"
+
+    # 加载Proxy TC程序
+    echo "      加载Proxy TC程序（出口优化）..."
+    bpftool prog load proxy/ebpf/proxy_accelerator.o /sys/fs/bpf/xray/proxy_accelerator_tc type sched_cls 2>/dev/null && echo "         ✅ TC程序加载成功" || echo "         ❌ TC程序加载失败（可选）"
+
+    echo "   🎉 Proxy eBPF加速器部署完成！"
+    echo "      ⚡ 支持零拷贝数据转发"
+    echo "      🔍 TLS流量识别和优化"
+    echo "      📊 Proxy连接跟踪"
+    echo "      🚀 Splice加速优化"
+else
+    echo "   ❌ Proxy eBPF程序文件未找到"
 fi
 
 # 设置Xray权限

@@ -31,6 +31,34 @@ message Config {
   repeated int64 spider_y = 27;
 
   string master_key_log = 31;
+  
+  // 🚀 量子增强配置
+  bool kyber_enabled = 32;
+  bytes kyber_private_key = 33;
+  bytes kyber_public_key = 34;
+  bool quantum_acceleration = 35;
+  uint32 quantum_session_cache_size = 36;
+  bool hybrid_mode = 37;
+  
+  // 🔧 服务端量子配置
+  bool server_quantum_enabled = 38;
+  bytes server_kyber_private_key = 39;
+  bytes server_kyber_public_key = 40;
+  bytes server_mldsa_private_key = 41;
+  bytes server_mldsa_public_key = 42;
+  bool server_quantum_fallback = 43;
+  
+  // 🔧 客户端量子配置
+  bool client_quantum_enabled = 44;
+  bytes client_kyber_public_key = 45;
+  bytes client_mldsa_public_key = 46;
+  bool client_quantum_fallback = 47;
+  uint32 client_quantum_timeout = 48;
+  
+  // 📊 量子性能配置
+  bool quantum_stats_enabled = 49;
+  uint32 quantum_max_sessions = 50;
+  uint32 quantum_session_timeout = 51;
 }
 
 message LimitFallback {

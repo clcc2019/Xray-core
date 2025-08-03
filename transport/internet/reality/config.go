@@ -37,6 +37,22 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 		_, key := mldsa65.NewKeyFromSeed((*[32]byte)(c.Mldsa65Seed))
 		config.Mldsa65Key = key.Bytes()
 	}
+
+	// 🚀 量子增强：添加 Kyber 密钥支持（预留接口）
+	// 注意：需要扩展 reality.Config 结构体以支持量子配置
+	// 当前版本暂时注释，等待 upstream 支持
+	/*
+		if c.KyberEnabled {
+			if c.KyberPrivateKey != nil && len(c.KyberPrivateKey) > 0 {
+				config.KyberPrivateKey = c.KyberPrivateKey
+				config.KyberPublicKey = c.KyberPublicKey
+			} else {
+				kyberPriv, kyberPub := kyber1024.GenerateKeyPair()
+				config.KyberPrivateKey = kyberPriv.Bytes()
+				config.KyberPublicKey = kyberPub.Bytes()
+			}
+		}
+	*/
 	if c.LimitFallbackUpload != nil {
 		config.LimitFallbackUpload.AfterBytes = c.LimitFallbackUpload.AfterBytes
 		config.LimitFallbackUpload.BytesPerSec = c.LimitFallbackUpload.BytesPerSec

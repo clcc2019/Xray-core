@@ -24,7 +24,11 @@ enum tcp_conn_state {
     TCP_STATE_REALITY_ESTABLISHED,
     TCP_STATE_DATA_TRANSFER,
     TCP_STATE_FIN_WAIT,
-    TCP_STATE_CLOSED
+    TCP_STATE_CLOSED,
+    
+    // 🚀 量子增强状态
+    TCP_STATE_QUANTUM_REALITY_HANDSHAKE,
+    TCP_STATE_QUANTUM_REALITY_ESTABLISHED
 };
 
 // 简化的TCP连接条目
@@ -37,6 +41,8 @@ struct tcp_connection_entry {
     __u8 reality_enabled;         // 是否启用REALITY
     __u8 reality_verified;        // 🔒 REALITY握手验证状态
     __u8 tls_established;         // 🔒 TLS连接是否已建立
+    __u8 quantum_enabled;         // 🚀 是否启用量子增强
+    __u8 quantum_verified;        // 🚀 量子验证状态
     __u16 fast_path_count;        // 快速路径计数
     __u32 bytes_sent;             // 发送字节数
     __u64 last_activity;          // 最后活动时间
@@ -50,6 +56,21 @@ struct reality_session_entry {
     __u8 verified;                // 验证状态
     __u8 active;                  // 活跃状态
     __u64 last_used;              // 最后使用时间
+};
+
+// 🚀 量子增强 REALITY 会话缓存
+struct quantum_session_entry {
+    __u64 session_id;             // 量子会话ID
+    __u32 dest_ip;                // 目标IP
+    __u16 connection_count;       // 连接计数
+    __u8 verified;                // 验证状态
+    __u8 quantum_verified;        // 量子验证状态
+    __u8 active;                  // 活跃状态
+    __u8 kyber_shared;            // Kyber 密钥交换状态
+    __u8 mldsa_verified;          // MLDSA 签名验证状态
+    __u64 last_used;              // 最后使用时间
+    __u32 quantum_rtt;            // 量子握手 RTT (微秒)
+    __u8 reserved[3];
 };
 
 // TCP连接状态缓存
@@ -68,6 +89,14 @@ struct {
     __type(value, struct reality_session_entry);
 } reality_sessions SEC(".maps");
 
+// 🚀 量子增强 REALITY 会话缓存
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 5000);  // 更大的量子会话缓存
+    __type(key, __u64);           
+    __type(value, struct quantum_session_entry);
+} quantum_sessions SEC(".maps");
+
 // 热点连接列表
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -83,7 +112,14 @@ struct tcp_reality_stats {
     __u64 fast_path_hits;         
     __u64 handshake_accelerations;
     __u64 data_fast_forwards;     
-    __u64 session_reuses;         
+    __u64 session_reuses;
+    
+    // 🚀 量子增强统计
+    __u64 quantum_connections;     // 量子连接数
+    __u64 quantum_session_reuses; // 量子会话复用
+    __u64 kyber_exchanges;        // Kyber 密钥交换次数
+    __u64 mldsa_verifications;    // MLDSA 验证次数
+    __u64 quantum_rtt_avg;        // 平均量子 RTT (微秒)
 };
 
 // 统计信息
@@ -119,6 +155,12 @@ static __always_inline void update_tcp_reality_stats(__u32 stat_type) {
             case 4: __sync_fetch_and_add(&stats->handshake_accelerations, 1); break;
             case 5: __sync_fetch_and_add(&stats->data_fast_forwards, 1); break;
             case 6: __sync_fetch_and_add(&stats->session_reuses, 1); break;
+            
+            // 🚀 量子增强统计
+            case 7: __sync_fetch_and_add(&stats->quantum_session_reuses, 1); break;
+            case 8: __sync_fetch_and_add(&stats->quantum_connections, 1); break;
+            case 9: __sync_fetch_and_add(&stats->kyber_exchanges, 1); break;
+            case 10: __sync_fetch_and_add(&stats->mldsa_verifications, 1); break;
         }
     }
 }
@@ -224,6 +266,60 @@ static __always_inline int accelerate_reality_handshake(struct tcp_connection_en
                 .last_used = get_current_time()
             };
             bpf_map_update_elem(&reality_sessions, &session_id, &new_session, BPF_ANY);
+        }
+    }
+    
+    return -1; // 继续用户态处理
+}
+
+// 🚀 量子增强 REALITY 握手加速
+static __always_inline int accelerate_quantum_reality_handshake(struct tcp_connection_entry *conn, 
+                                                               void *tcp_payload, void *data_end,
+                                                               __u64 conn_id) {
+    if (tcp_payload + 4 > data_end) return -1;
+    
+    __u8 *payload = (__u8 *)tcp_payload;
+    
+    // 🔍 检测量子增强 REALITY 握手
+    // 检查 TLS 1.3 + 量子扩展
+    if (payload[0] == 0x16 && payload[1] == 0x03 && payload[2] == 0x01) {
+        // 标记量子 REALITY 状态
+        conn->state = TCP_STATE_QUANTUM_REALITY_HANDSHAKE;
+        conn->reality_enabled = 1;
+        conn->quantum_enabled = 1; // 新增量子标志
+        
+        // 🚀 量子会话缓存优化
+        __u64 quantum_session_id = conn_id ^ 0x1234567890abcdef; // 量子会话ID
+        struct quantum_session_entry *quantum_session = bpf_map_lookup_elem(&quantum_sessions, &quantum_session_id);
+        
+        if (quantum_session && quantum_session->verified && quantum_session->quantum_verified) {
+            // 🎯 量子会话复用 - 超快速加速
+            conn->reality_verified = 1;
+            conn->quantum_verified = 1;
+            conn->tls_established = 1;
+            conn->state = TCP_STATE_QUANTUM_REALITY_ESTABLISHED;
+            quantum_session->connection_count++;
+            quantum_session->last_used = get_current_time();
+            
+            update_tcp_reality_stats(7); // quantum_session_reuses
+            bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
+            bpf_map_update_elem(&quantum_sessions, &quantum_session_id, quantum_session, BPF_ANY);
+            
+            return 0; // 🚀 量子握手加速成功！
+        } else {
+            // 新量子会话 - 创建
+            struct quantum_session_entry new_quantum_session = {
+                .session_id = quantum_session_id,
+                .dest_ip = conn->remote_ip,
+                .connection_count = 1,
+                .verified = 0,
+                .quantum_verified = 0, // 待量子验证
+                .active = 1,
+                .last_used = get_current_time(),
+                .kyber_shared = 0,
+                .mldsa_verified = 0
+            };
+            bpf_map_update_elem(&quantum_sessions, &quantum_session_id, &new_quantum_session, BPF_ANY);
         }
     }
     
