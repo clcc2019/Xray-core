@@ -1,0 +1,17 @@
+[Unit]
+Description=Xray eBPF Acceleration Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/xray-ebpf
+Environment=XRAY_EBPF=1
+ExecStartPre=/opt/xray-ebpf/deploy-xray-ebpf.sh
+ExecStart=/opt/xray-ebpf/xray-linux-amd64-ebpf run -config /opt/xray-ebpf/config.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
