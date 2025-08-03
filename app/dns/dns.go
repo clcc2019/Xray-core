@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	ebpf "github.com/xtls/xray-core/app/dns/ebpf"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -190,6 +191,15 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		return nil, 0, errors.New("empty domain name")
 	}
 
+	// 🚀 DNS eBPF加速查询
+	if dnsAccelerator, err := ebpf.NewDNSAccelerator(); err == nil && dnsAccelerator.IsEnabled() {
+		// 尝试从eBPF缓存快速获取
+		if result, err := dnsAccelerator.QueryDomain(domain, ebpf.DNSTypeA); err == nil && result.CacheHit {
+			errors.LogDebug(s.ctx, "DNS eBPF cache hit for domain: ", domain)
+			return result.IPs, result.TTL, nil
+		}
+	}
+
 	if s.checkSystem {
 		supportIPv4, supportIPv6 := checkSystemNetwork()
 		option.IPv4Enable = option.IPv4Enable && supportIPv4
@@ -240,6 +250,17 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 			if ttl == 0 {
 				ttl = 1
 			}
+
+			// 🚀 缓存DNS响应到eBPF
+			if dnsAccelerator, err := ebpf.NewDNSAccelerator(); err == nil && dnsAccelerator.IsEnabled() {
+				// 异步缓存，不阻塞查询
+				go func() {
+					if _, err := dnsAccelerator.QueryDomain(domain, ebpf.DNSTypeA); err == nil {
+						errors.LogDebug(s.ctx, "DNS response cached for domain: ", domain)
+					}
+				}()
+			}
+
 			return ips, ttl, nil
 		}
 

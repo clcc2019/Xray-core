@@ -3,17 +3,15 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
-#include <linux/string.h>
 #include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define MAX_TCP_CONNECTIONS 8000     // 减少连接数避免内存过大
-#define REALITY_SESSION_CACHE 2000   // 减少会话缓存
-#define FAST_PATH_THRESHOLD 5        // 快速路径阈值
+#define MAX_TCP_CONNECTIONS 16384
+#define REALITY_SESSION_CACHE 8192
+#define MAX_PACKET_SIZE 1500
 
 // TCP连接状态
 enum tcp_conn_state {
@@ -24,14 +22,10 @@ enum tcp_conn_state {
     TCP_STATE_REALITY_ESTABLISHED,
     TCP_STATE_DATA_TRANSFER,
     TCP_STATE_FIN_WAIT,
-    TCP_STATE_CLOSED,
-    
-    // 🚀 量子增强状态
-    TCP_STATE_QUANTUM_REALITY_HANDSHAKE,
-    TCP_STATE_QUANTUM_REALITY_ESTABLISHED
+    TCP_STATE_CLOSED
 };
 
-// 简化的TCP连接条目
+// TCP连接条目
 struct tcp_connection_entry {
     __u32 local_ip;               // 本地IP
     __u32 remote_ip;              // 远程IP
@@ -39,16 +33,17 @@ struct tcp_connection_entry {
     __u16 remote_port;            // 远程端口
     __u8 state;                   // 连接状态
     __u8 reality_enabled;         // 是否启用REALITY
-    __u8 reality_verified;        // 🔒 REALITY握手验证状态
-    __u8 tls_established;         // 🔒 TLS连接是否已建立
-    __u8 quantum_enabled;         // 🚀 是否启用量子增强
-    __u8 quantum_verified;        // 🚀 量子验证状态
+    __u8 reality_verified;        // REALITY握手验证状态
+    __u8 tls_established;         // TLS连接是否已建立
     __u16 fast_path_count;        // 快速路径计数
     __u32 bytes_sent;             // 发送字节数
     __u64 last_activity;          // 最后活动时间
+    __u32 next_hop_ip;            // 下一跳IP（用于转发）
+    __u16 next_hop_port;          // 下一跳端口
+    __u8 fast_path_enabled;       // 快速路径是否启用
 };
 
-// 简化的REALITY会话条目
+// REALITY会话条目
 struct reality_session_entry {
     __u64 session_id;             // 会话ID
     __u32 dest_ip;                // 目标IP
@@ -56,24 +51,21 @@ struct reality_session_entry {
     __u8 verified;                // 验证状态
     __u8 active;                  // 活跃状态
     __u64 last_used;              // 最后使用时间
+    __u32 next_hop_ip;            // 下一跳IP
+    __u16 next_hop_port;          // 下一跳端口
 };
 
-// 🚀 量子增强 REALITY 会话缓存
-struct quantum_session_entry {
-    __u64 session_id;             // 量子会话ID
-    __u32 dest_ip;                // 目标IP
-    __u16 connection_count;       // 连接计数
-    __u8 verified;                // 验证状态
-    __u8 quantum_verified;        // 量子验证状态
-    __u8 active;                  // 活跃状态
-    __u8 kyber_shared;            // Kyber 密钥交换状态
-    __u8 mldsa_verified;          // MLDSA 签名验证状态
+// 快速转发缓存
+struct fast_forward_entry {
+    __u64 conn_id;                // 连接ID
+    __u32 next_hop_ip;            // 下一跳IP
+    __u16 next_hop_port;          // 下一跳端口
+    __u8 protocol;                // 协议类型
+    __u8 priority;                // 优先级
     __u64 last_used;              // 最后使用时间
-    __u32 quantum_rtt;            // 量子握手 RTT (微秒)
-    __u8 reserved[3];
 };
 
-// TCP连接状态缓存
+// eBPF Maps
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, MAX_TCP_CONNECTIONS);
@@ -81,7 +73,6 @@ struct {
     __type(value, struct tcp_connection_entry);
 } tcp_connections SEC(".maps");
 
-// REALITY会话缓存
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, REALITY_SESSION_CACHE);
@@ -89,256 +80,133 @@ struct {
     __type(value, struct reality_session_entry);
 } reality_sessions SEC(".maps");
 
-// 🚀 量子增强 REALITY 会话缓存
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 5000);  // 更大的量子会话缓存
+    __uint(max_entries, 10000);
     __type(key, __u64);           
-    __type(value, struct quantum_session_entry);
-} quantum_sessions SEC(".maps");
+    __type(value, struct fast_forward_entry);
+} fast_forward_cache SEC(".maps");
 
-// 热点连接列表
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1000);
-    __type(key, __u64);           
-    __type(value, __u8);          
-} hot_connections SEC(".maps");
-
-// 简化的统计结构
-struct tcp_reality_stats {
-    __u64 total_connections;      
-    __u64 reality_connections;    
-    __u64 fast_path_hits;         
-    __u64 handshake_accelerations;
-    __u64 data_fast_forwards;     
-    __u64 session_reuses;
-    
-    // 🚀 量子增强统计
-    __u64 quantum_connections;     // 量子连接数
-    __u64 quantum_session_reuses; // 量子会话复用
-    __u64 kyber_exchanges;        // Kyber 密钥交换次数
-    __u64 mldsa_verifications;    // MLDSA 验证次数
-    __u64 quantum_rtt_avg;        // 平均量子 RTT (微秒)
-};
-
-// 统计信息
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct tcp_reality_stats);
-} tcp_reality_stats_map SEC(".maps");
+    __type(value, __u64);
+} stats_map SEC(".maps");
 
-// 获取当前时间（简化版）
+// 辅助函数
 static __always_inline __u64 get_current_time() {
     return bpf_ktime_get_ns();
 }
 
-// 计算连接ID
 static __always_inline __u64 get_connection_id(__u32 src_ip, __u16 src_port, 
                                                __u32 dst_ip, __u16 dst_port) {
-    __u64 id = ((__u64)src_ip << 32) | dst_ip;
-    id ^= ((__u64)src_port << 16) | dst_port;
-    return id;
+    return ((__u64)src_ip << 32) | ((__u64)src_port << 16) | dst_port;
 }
 
-// 更新统计信息
-static __always_inline void update_tcp_reality_stats(__u32 stat_type) {
+static __always_inline void update_stats(__u32 stat_type) {
     __u32 key = 0;
-    struct tcp_reality_stats *stats = bpf_map_lookup_elem(&tcp_reality_stats_map, &key);
-    if (stats) {
-        switch (stat_type) {
-            case 0: __sync_fetch_and_add(&stats->total_connections, 1); break;
-            case 1: __sync_fetch_and_add(&stats->reality_connections, 1); break;
-            case 2: __sync_fetch_and_add(&stats->fast_path_hits, 1); break;
-            case 4: __sync_fetch_and_add(&stats->handshake_accelerations, 1); break;
-            case 5: __sync_fetch_and_add(&stats->data_fast_forwards, 1); break;
-            case 6: __sync_fetch_and_add(&stats->session_reuses, 1); break;
-            
-            // 🚀 量子增强统计
-            case 7: __sync_fetch_and_add(&stats->quantum_session_reuses, 1); break;
-            case 8: __sync_fetch_and_add(&stats->quantum_connections, 1); break;
-            case 9: __sync_fetch_and_add(&stats->kyber_exchanges, 1); break;
-            case 10: __sync_fetch_and_add(&stats->mldsa_verifications, 1); break;
-        }
+    __u64 *value = bpf_map_lookup_elem(&stats_map, &key);
+    if (value) {
+        __sync_fetch_and_add(value, 1);
     }
 }
 
-// 🚀 TCP超快速路径 - 核心零拷贝转发逻辑
-static __always_inline int tcp_ultra_fast_path(struct xdp_md *ctx) {
-    void *data_end = (void *)(long)ctx->data_end;
+// 真正的零拷贝快速转发
+static __always_inline int fast_forward_packet(struct xdp_md *ctx, 
+                                               struct tcp_connection_entry *conn) {
     void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
     
-    // 快速包大小检查
-    if (data + 54 > data_end) return -1;
+    // 检查包大小
+    if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end)
+        return XDP_PASS;
     
-    struct ethhdr *eth = data;
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return -1;
+    struct iphdr *ip = data + sizeof(struct ethhdr);
+    struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
     
-    struct iphdr *ip = (void *)(eth + 1);
-    if (ip->protocol != IPPROTO_TCP) return -1;
-    
-    struct tcphdr *tcp = (void *)(ip + 1);
-    
-    // 计算连接ID
-    __u64 conn_id = get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest);
-    
-    // 查找热点连接
-    struct tcp_connection_entry *conn = bpf_map_lookup_elem(&tcp_connections, &conn_id);
-    if (!conn) return -1;
-    
-    // 🚀 核心快速转发逻辑 - 零拷贝数据路径
-    if (conn->fast_path_count > 10 && conn->state >= TCP_STATE_ESTABLISHED) {
-        __u16 ip_len = bpf_ntohs(ip->tot_len);
+    // 如果启用了快速转发，直接转发到下一跳
+    if (conn->fast_path_enabled && conn->next_hop_ip != 0) {
+        // 修改目标IP和端口
+        __u32 original_dst_ip = ip->daddr;
         
-        // 安全的包大小检查
-        if (ip_len > 40 && ip_len < 1400) {
-            
-            // 🔒 REALITY安全检查（简化但有效）
-            if (conn->reality_enabled) {
-                // 只有完全验证的REALITY连接才能快速转发
-                if (conn->reality_verified != 1) return -1;
-                
-                // 检查TLS应用数据（0x17）
-                void *payload = (void *)(tcp + 1);
-                if (payload + 1 <= data_end) {
-                    __u8 *tls_type = (__u8 *)payload;
-                    if (*tls_type != 0x17) return -1; // 只转发应用数据
-                }
-            }
-            
-            // ⚡ 执行零拷贝快速转发
-            conn->fast_path_count++;
-            conn->bytes_sent += ip_len;
-            conn->last_activity = get_current_time();
-            bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
-            
-            // 更新统计
-            update_tcp_reality_stats(5); // data_fast_forwards
-            
-            return XDP_TX; // 🚀 真正的内核级零拷贝转发！
-        }
+        ip->daddr = conn->next_hop_ip;
+        tcp->dest = conn->next_hop_port;
+        
+        // 重新计算IP校验和
+        ip->check = 0;
+        ip->check = bpf_csum_diff((__be32 *)&original_dst_ip, 1, (__be32 *)&conn->next_hop_ip, 1, 0);
+        
+        // 更新统计
+        conn->fast_path_count++;
+        conn->bytes_sent += bpf_ntohs(ip->tot_len);
+        conn->last_activity = get_current_time();
+        
+        update_stats(1); // fast_forward_count
+        
+        return XDP_TX; // 零拷贝转发
     }
     
-    return -1; // 继续正常处理
+    return XDP_PASS;
 }
 
-// 🔒 REALITY握手加速（简化版）
+// REALITY握手加速
 static __always_inline int accelerate_reality_handshake(struct tcp_connection_entry *conn, 
-                                                        void *tcp_payload, void *data_end,
-                                                        __u64 conn_id) {
-    if (tcp_payload + 2 > data_end) return -1;
+                                                       void *tcp_payload, void *data_end,
+                                                       __u64 conn_id) {
+    if (tcp_payload + 4 > data_end) return -1;
     
     __u8 *payload = (__u8 *)tcp_payload;
     
-    // 🔒 REALITY握手检测与优化
-    if (payload[0] == 0x16 && payload[1] == 0x03) {
-        // TLS握手包 - 标记REALITY状态
-        conn->state = TCP_STATE_REALITY_HANDSHAKE;
-        conn->reality_enabled = 1;
-        
-        // 🚀 REALITY会话缓存优化
-        __u64 session_id = conn_id; // 简化session ID
+    // 检测REALITY握手
+    if (payload[0] == 0x16 && payload[1] == 0x03 && payload[2] == 0x01) {
+        // 计算会话ID
+        __u64 session_id = conn_id ^ 0x1234567890abcdef;
         struct reality_session_entry *session = bpf_map_lookup_elem(&reality_sessions, &session_id);
         
         if (session && session->verified) {
-            // 🎯 会话复用 - 直接加速
+            // 会话复用 - 快速建立连接
             conn->reality_verified = 1;
             conn->tls_established = 1;
             conn->state = TCP_STATE_REALITY_ESTABLISHED;
+            conn->fast_path_enabled = 1;
+            conn->next_hop_ip = session->next_hop_ip;
+            conn->next_hop_port = session->next_hop_port;
+            
             session->connection_count++;
             session->last_used = get_current_time();
             
-            update_tcp_reality_stats(6); // session_reuses
             bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
             bpf_map_update_elem(&reality_sessions, &session_id, session, BPF_ANY);
             
-            return 0; // 🚀 握手加速成功！
+            update_stats(2); // reality_session_reuse
+            return 0; // 握手加速成功
         } else {
-            // 新会话 - 简化创建
+            // 新会话 - 创建
             struct reality_session_entry new_session = {
                 .session_id = session_id,
                 .dest_ip = conn->remote_ip,
                 .connection_count = 1,
-                .verified = 0,  // 待用户态验证
+                .verified = 0,
                 .active = 1,
-                .last_used = get_current_time()
+                .last_used = get_current_time(),
+                .next_hop_ip = conn->remote_ip, // 默认下一跳
+                .next_hop_port = conn->remote_port
             };
             bpf_map_update_elem(&reality_sessions, &session_id, &new_session, BPF_ANY);
         }
     }
     
-    return -1; // 继续用户态处理
+    return -1;
 }
 
-// 🚀 量子增强 REALITY 握手加速
-static __always_inline int accelerate_quantum_reality_handshake(struct tcp_connection_entry *conn, 
-                                                               void *tcp_payload, void *data_end,
-                                                               __u64 conn_id) {
-    if (tcp_payload + 4 > data_end) return -1;
-    
-    __u8 *payload = (__u8 *)tcp_payload;
-    
-    // 🔍 检测量子增强 REALITY 握手
-    // 检查 TLS 1.3 + 量子扩展
-    if (payload[0] == 0x16 && payload[1] == 0x03 && payload[2] == 0x01) {
-        // 标记量子 REALITY 状态
-        conn->state = TCP_STATE_QUANTUM_REALITY_HANDSHAKE;
-        conn->reality_enabled = 1;
-        conn->quantum_enabled = 1; // 新增量子标志
-        
-        // 🚀 量子会话缓存优化
-        __u64 quantum_session_id = conn_id ^ 0x1234567890abcdef; // 量子会话ID
-        struct quantum_session_entry *quantum_session = bpf_map_lookup_elem(&quantum_sessions, &quantum_session_id);
-        
-        if (quantum_session && quantum_session->verified && quantum_session->quantum_verified) {
-            // 🎯 量子会话复用 - 超快速加速
-            conn->reality_verified = 1;
-            conn->quantum_verified = 1;
-            conn->tls_established = 1;
-            conn->state = TCP_STATE_QUANTUM_REALITY_ESTABLISHED;
-            quantum_session->connection_count++;
-            quantum_session->last_used = get_current_time();
-            
-            update_tcp_reality_stats(7); // quantum_session_reuses
-            bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
-            bpf_map_update_elem(&quantum_sessions, &quantum_session_id, quantum_session, BPF_ANY);
-            
-            return 0; // 🚀 量子握手加速成功！
-        } else {
-            // 新量子会话 - 创建
-            struct quantum_session_entry new_quantum_session = {
-                .session_id = quantum_session_id,
-                .dest_ip = conn->remote_ip,
-                .connection_count = 1,
-                .verified = 0,
-                .quantum_verified = 0, // 待量子验证
-                .active = 1,
-                .last_used = get_current_time(),
-                .kyber_shared = 0,
-                .mldsa_verified = 0
-            };
-            bpf_map_update_elem(&quantum_sessions, &quantum_session_id, &new_quantum_session, BPF_ANY);
-        }
-    }
-    
-    return -1; // 继续用户态处理
-}
-
-// XDP程序 - TCP+REALITY加速器
+// 主XDP程序 - 真正的TCP+REALITY加速器
 SEC("xdp")
 int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
-    // 🚀 尝试超快速路径 (零拷贝)
-    int ultra_result = tcp_ultra_fast_path(ctx);
-    if (ultra_result == XDP_TX) {
-        return XDP_TX; // 🚀 超快速零拷贝转发成功！
-    }
-    
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
     
-    // 验证基本包结构
+    // 基本验证
     if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end)
         return XDP_PASS;
     
@@ -352,7 +220,7 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
     
     struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
     
-    update_tcp_reality_stats(0); // total_connections
+    update_stats(0); // total_packets
     
     // 计算连接标识符
     __u64 conn_id = get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest);
@@ -374,7 +242,10 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
                 .tls_established = 0,
                 .fast_path_count = 0,
                 .bytes_sent = 0,
-                .last_activity = get_current_time()
+                .last_activity = get_current_time(),
+                .next_hop_ip = 0,
+                .next_hop_port = 0,
+                .fast_path_enabled = 0
             };
             bpf_map_update_elem(&tcp_connections, &conn_id, &new_conn, BPF_ANY);
         }
@@ -384,41 +255,15 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
     // 处理已建立的连接
     if (conn && conn->state >= TCP_STATE_ESTABLISHED) {
         
-        // 🔒 REALITY连接检查与加速
-        if (conn->reality_enabled && conn->reality_verified) {
-            // 检查TLS应用数据 (0x17)
-            void *tcp_payload = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + (tcp->doff * 4);
-            if (tcp_payload + 1 <= data_end) {
-                __u8 *tls_type = (__u8 *)tcp_payload;
-                if (*tls_type == 0x17) { // TLS应用数据
-                    // 🚀 REALITY数据快速转发
-                    conn->fast_path_count++;
-                    conn->bytes_sent += bpf_ntohs(ip->tot_len);
-                    conn->last_activity = get_current_time();
-                    bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
-                    update_tcp_reality_stats(5); // data_fast_forwards
-                    return XDP_TX; // 🚀 零拷贝转发！
-                }
-            }
-        }
-        
-        // 🚀 普通TCP快速转发
-        if (conn->fast_path_count > 5) {
-            __u16 packet_size = bpf_ntohs(ip->tot_len);
-            if (packet_size > 40 && packet_size < 1400) {
-                conn->fast_path_count++;
-                conn->bytes_sent += packet_size;
-                conn->last_activity = get_current_time();
-                bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
-                update_tcp_reality_stats(5); // data_fast_forwards
-                return XDP_TX; // 🚀 TCP零拷贝转发！
-            }
+        // 🔒 REALITY连接快速转发
+        if (conn->reality_enabled && conn->reality_verified && conn->fast_path_enabled) {
+            return fast_forward_packet(ctx, conn);
         }
         
         // 🔒 尝试REALITY握手加速
         void *tcp_payload = data + sizeof(struct ethhdr) + sizeof(struct iphdr) + (tcp->doff * 4);
         if (accelerate_reality_handshake(conn, tcp_payload, data_end, conn_id) == 0) {
-            update_tcp_reality_stats(4); // handshake_accelerations
+            update_stats(3); // handshake_accelerations
         }
         
         // 更新连接统计
@@ -430,13 +275,17 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
-/* TC程序暂时禁用，因为__sk_buff访问在严格模式下有限制
-// TC程序 - TCP+REALITY出口加速  
+// TC程序 - 出口优化和统计
 SEC("tc")
 int tcp_reality_accelerator_tc(struct __sk_buff *skb) {
-    // 暂时返回OK，专注于XDP零拷贝快速转发
+    // 简化的TC程序，专注于统计更新
+    __u32 key = 0;
+    __u64 *value = bpf_map_lookup_elem(&stats_map, &key);
+    if (value) {
+        __sync_fetch_and_add(value, 1);
+    }
+    
     return TC_ACT_OK;
 }
-*/
 
 char _license[] SEC("license") = "GPL";

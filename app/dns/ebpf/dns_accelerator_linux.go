@@ -6,6 +6,7 @@ package ebpf
 import (
 	"context"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -141,11 +142,14 @@ type DNSPerfMetrics struct {
 func NewDNSAccelerator() (*DNSAccelerator, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// 检查是否启用eBPF
+	enabled := os.Getenv("XRAY_EBPF") == "1" || os.Getenv("XRAY_EBPF") == "true"
+
 	accelerator := &DNSAccelerator{
-		enabled:          true,
-		cacheEnabled:     true,
-		filterEnabled:    true,
-		rateLimitEnabled: true,
+		enabled:          enabled,
+		cacheEnabled:     enabled,
+		filterEnabled:    enabled,
+		rateLimitEnabled: enabled,
 		dnsServers:       make([]*DNSServerInfo, 0),
 		maliciousDomains: make(map[string]*MaliciousDomainEntry),
 		maps:             make(map[string]interface{}),
@@ -154,7 +158,7 @@ func NewDNSAccelerator() (*DNSAccelerator, error) {
 		cleanupInterval:  time.Minute * 5,
 		cacheSize:        100000,
 		cacheTTL:         time.Minute * 5,
-		prefetchEnabled:  true,
+		prefetchEnabled:  enabled,
 	}
 
 	// 初始化eBPF程序

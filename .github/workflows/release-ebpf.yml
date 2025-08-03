@@ -48,21 +48,21 @@ jobs:
             linux-headers-$(uname -r) \
             make \
             gcc \
-            pkg-config \
-            bpftool
+            pkg-config
+          
+          # Install bpftool manually
+          echo "Installing bpftool manually..."
+          wget -q https://github.com/libbpf/bpftool/releases/latest/download/bpftool-v7.3.0-amd64.tar.gz
+          tar -xzf bpftool-v7.3.0-amd64.tar.gz
+          sudo cp bpftool /usr/local/bin/
+          sudo chmod +x /usr/local/bin/bpftool
+          rm bpftool-v7.3.0-amd64.tar.gz
 
       - name: Verify eBPF Environment
         run: |
           clang --version
-          which bpftool || echo "bpftool not found, installing manually"
-          if ! which bpftool; then
-            # Fallback to manual bpftool installation
-            wget https://github.com/libbpf/bpftool/releases/latest/download/bpftool-v7.3.0-amd64.tar.gz
-            tar -xzf bpftool-v7.3.0-amd64.tar.gz
-            sudo cp bpftool /usr/local/bin/
-            sudo chmod +x /usr/local/bin/bpftool
-          fi
           bpftool version
+          echo "eBPF environment verified successfully"
 
       - name: Create Build Directory
         run: |

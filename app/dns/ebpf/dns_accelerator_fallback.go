@@ -1,12 +1,12 @@
 //go:build !linux || !amd64
+// +build !linux !amd64
 
 package ebpf
-
-// +build ignore
 
 import (
 	"context"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -159,11 +159,14 @@ type DNSResult struct {
 func NewDNSAccelerator() (*DNSAccelerator, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// 检查是否启用eBPF
+	enabled := os.Getenv("XRAY_EBPF") == "1" || os.Getenv("XRAY_EBPF") == "true"
+
 	accelerator := &DNSAccelerator{
-		enabled:          true,
-		cacheEnabled:     true,
-		filterEnabled:    true,
-		rateLimitEnabled: true,
+		enabled:          enabled,
+		cacheEnabled:     enabled,
+		filterEnabled:    enabled,
+		rateLimitEnabled: enabled,
 		dnsServers:       make([]*DNSServerInfo, 0),
 		maliciousDomains: make(map[string]*MaliciousDomainEntry),
 		cache:            make(map[string]*CacheEntry),
@@ -172,7 +175,7 @@ func NewDNSAccelerator() (*DNSAccelerator, error) {
 		cleanupInterval:  time.Minute * 5,
 		cacheSize:        10000, // 较小的缓存大小
 		cacheTTL:         time.Minute * 5,
-		prefetchEnabled:  false, // fallback模式禁用预取
+		prefetchEnabled:  enabled, // 根据eBPF状态启用预取
 	}
 
 	// 启动后台维护任务
@@ -239,7 +242,7 @@ func (da *DNSAccelerator) UpdateMaliciousDomains(domains map[string]*MaliciousDo
 	return nil
 }
 
-// LookupIP 实现DNS查询接口  
+// LookupIP 实现DNS查询接口
 func (da *DNSAccelerator) LookupIP(domain string, option IPOption) ([]net.IP, uint32, error) {
 	result, err := da.QueryDomain(domain, DNSTypeA)
 	if err != nil {
