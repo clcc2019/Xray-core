@@ -55,14 +55,24 @@ errorgen
 # Certificates
 *.crt
 *.key
-tools/build-quantum-generator.sh
-tools/generate-quantum-config.sh
-tools/quantum-config-generator
-tools/quantum-config-generator.go
-tools/README-quantum-config.md
-tools/simple-quantum-generator.go
-.gitignore
-tools/configs/client-quantum.yaml
-.gitignore
-tools/configs/server-quantum.yaml
-tools/quantum-snippet-generator
+
+# Temporary files
+*.tmp
+*.temp
+test-build
+
+# Log files
+*.log
+
+# Backup files
+*.backup
+*.bak
+
+# Cache files
+.cache/
+*.cache
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
