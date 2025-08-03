@@ -104,11 +104,12 @@ static __always_inline __u8 match_ipv4_geoip(__u32 ip) {
         entry = bpf_map_lookup_elem(&cidr_v4_map, &network);
         if (entry && entry->prefix_len == prefix_len) {
             // 更新统计信息
-            __u64 *count = bpf_map_lookup_elem(&geoip_stats, &entry->country_code);
+            __u8 country_code = entry->country_code;
+            __u64 *count = bpf_map_lookup_elem(&geoip_stats, &country_code);
             if (count) {
                 (*count)++;
             }
-            return entry->country_code;
+            return country_code;
         }
     }
     
@@ -121,11 +122,12 @@ static __always_inline __u8 match_ipv6_geoip(const __u64 *ip) {
     struct geoip_v6_entry *entry = bpf_map_lookup_elem(&geoip_v6_map, &ip[0]);
     if (entry && entry->low == ip[1]) {
         // 更新统计信息
-        __u64 *count = bpf_map_lookup_elem(&geoip_stats, &entry->country_code);
+        __u8 country_code = entry->country_code;
+        __u64 *count = bpf_map_lookup_elem(&geoip_stats, &country_code);
         if (count) {
             (*count)++;
         }
-        return entry->country_code;
+        return country_code;
     }
     
     return 0; // 未匹配
