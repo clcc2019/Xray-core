@@ -1,0 +1,13 @@
+# 🚀 eBPF 和量子加速环境变量
+# 自动生成时间: 2025-08-03 14:27:41
+
+# 在启动 Xray 前设置以下环境变量:
+
+export XRAY_EBPF=1
+export XRAY_QUANTUM=1
+export XRAY_HYBRID=1
+
+# 或者添加到 /etc/environment:
+# XRAY_EBPF=1
+# XRAY_QUANTUM=1
+# XRAY_HYBRID=1

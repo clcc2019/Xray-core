@@ -1,0 +1,27 @@
+# 🚀 客户端量子增强配置片段
+# 自动生成时间: 2025-08-03 14:27:41
+# 量子算法: Kyber-1024 + MLDSA-65
+
+# 将以下配置添加到 REALITY 的 realitySettings 部分:
+
+        # 🚀 量子增强配置
+        kyber_enabled: true
+        kyber_public_key: "LC4WvYcnNLn7w/c+noDvN6AnuPU0yKANl4W9DdTGN+A="
+        quantum_acceleration: true
+        quantum_session_cache_size: 10000
+        hybrid_mode: true
+        # 🔧 客户端量子配置
+        client_quantum_enabled: true
+        client_kyber_public_key: "LC4WvYcnNLn7w/c+noDvN6AnuPU0yKANl4W9DdTGN+A="
+        client_mldsa_public_key: "12SUhDLSucjk9ByeN9X+E3n/j1SvWHDCOCWDPc1/l3A="
+        client_quantum_fallback: true
+        client_quantum_timeout: 30
+        # 📊 量子性能配置
+        quantum_stats_enabled: true
+        quantum_max_sessions: 50000
+        quantum_session_timeout: 3600
+
+# 🔑 密钥信息:
+# Kyber 公钥: LC4WvYcnNLn7w/c+noDvN6AnuPU0yKANl4W9DdTGN+A=
+# MLDSA 公钥: 12SUhDLSucjk9ByeN9X+E3n/j1SvWHDCOCWDPc1/l3A=
+# UUID: 03eee0b0-1f71-e1e5-0fce-814db4f0b282
