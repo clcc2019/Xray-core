@@ -211,14 +211,30 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     
     struct ethhdr *eth = data;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    if ((void*)(eth + 1) > data_end)
+        return XDP_PASS;
+    
+    // 安全地访问以太网头部
+    __u16 eth_proto;
+    if (bpf_xdp_load_bytes(ctx, 12, &eth_proto, sizeof(eth_proto)) < 0)
+        return XDP_PASS;
+    if (eth_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
     
     struct iphdr *ip = data + sizeof(struct ethhdr);
-    if (ip->protocol != IPPROTO_TCP)
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    
+    // 安全地访问IP协议字段
+    __u8 ip_proto;
+    if (bpf_xdp_load_bytes(ctx, 14 + 9, &ip_proto, sizeof(ip_proto)) < 0)
+        return XDP_PASS;
+    if (ip_proto != IPPROTO_TCP)
         return XDP_PASS;
     
     struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
+    if ((void*)(tcp + 1) > data_end)
+        return XDP_PASS;
     
     update_stats(0); // total_packets
     

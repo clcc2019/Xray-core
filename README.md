@@ -53,10 +53,10 @@ export XRAY_EBPF=1
 ### **Verify Installation**
 ```bash
 # Check eBPF programs
-bpftool prog list | grep xray
+bpftool prog list | grep xdp
 
 # Check eBPF maps
-bpftool map list | grep xray
+bpftool map list | grep xdp
 
 # Check service status
 systemctl status xray

@@ -282,7 +282,7 @@ load_ebpf() {
     
     # TCP+REALITY
     load_program "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp" "xdp" "tcp_connections reality_sessions hot_connections tcp_reality_stats_map"
-    load_program "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_tc" "classifier" ""
+    load_program "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc" "classifier" "tcp_connections_tc stats_map_tc"
     
     # Proxy
     load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp" "xdp" "proxy_connections tls_sessions proxy_stats_map"
