@@ -327,6 +327,9 @@ setup_permissions() {
     log_info "设置权限..."
     chmod +x xray-linux-amd64-ebpf
     setcap cap_bpf+ep ./xray-linux-amd64-ebpf 2>/dev/null || true
+    systemctl stop xray
+    cp xray-linux-amd64-ebpf /usr/local/bin/xray
+    systemctl start xray
     log_success "权限设置完成"
 }
 
