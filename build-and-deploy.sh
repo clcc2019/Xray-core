@@ -294,7 +294,7 @@ load_ebpf() {
     
     # TCP拥塞控制
     load_program "transport/internet/tcp/ebpf/tcp_congestion_control.o" "tcp_congestion_control_xdp" "xdp" "tcp_congestion_states congestion_statistics"
-    load_program "transport/internet/tcp/ebpf/tcp_stats_tc.o" "tcp_stats_tc" "classifier" "tc_stats"
+    load_program "transport/internet/tcp/ebpf/tcp_congestion_control.o" "tcp_congestion_control_tc" "classifier" "tcp_congestion_states_tc congestion_statistics_tc"
 }
 
 # 设置权限

@@ -147,17 +147,42 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     
     struct ethhdr *eth = data;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    if ((void*)(eth + 1) > data_end)
+        return XDP_PASS;
+    
+    // 安全地访问以太网头部
+    __u16 eth_proto;
+    if (bpf_xdp_load_bytes(ctx, 12, &eth_proto, sizeof(eth_proto)) < 0)
+        return XDP_PASS;
+    if (eth_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
     
     struct iphdr *ip = (void *)(eth + 1);
-    if (ip->protocol != IPPROTO_TCP)
+    if ((void*)(ip + 1) > data_end)
+        return XDP_PASS;
+    
+    // 安全地访问IP协议字段
+    __u8 ip_proto;
+    if (bpf_xdp_load_bytes(ctx, 14 + 9, &ip_proto, sizeof(ip_proto)) < 0)
+        return XDP_PASS;
+    if (ip_proto != IPPROTO_TCP)
         return XDP_PASS;
     
     struct tcphdr *tcp = (void *)(ip + 1);
     
-    __u64 conn_id = calc_connection_id(ip->saddr, bpf_ntohs(tcp->source), 
-                                      ip->daddr, bpf_ntohs(tcp->dest));
+    // 安全地访问IP和TCP头部字段
+    __u32 saddr, daddr;
+    __u16 sport, dport;
+    
+    if (bpf_xdp_load_bytes(ctx, 14 + 12, &saddr, sizeof(saddr)) < 0 ||
+        bpf_xdp_load_bytes(ctx, 14 + 16, &daddr, sizeof(daddr)) < 0 ||
+        bpf_xdp_load_bytes(ctx, 14 + 20 + 0, &sport, sizeof(sport)) < 0 ||
+        bpf_xdp_load_bytes(ctx, 14 + 20 + 2, &dport, sizeof(dport)) < 0) {
+        return XDP_PASS;
+    }
+    
+    __u64 conn_id = calc_connection_id(saddr, bpf_ntohs(sport), 
+                                      daddr, bpf_ntohs(dport));
     
     struct tcp_congestion_state *state = bpf_map_lookup_elem(&tcp_congestion_states, &conn_id);
     if (!state) {
@@ -179,8 +204,17 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
     __u64 current_time = bpf_ktime_get_ns() / 1000;
     __u32 mss = 1460;
     
-    if (tcp->ack && !tcp->syn && !tcp->fin && !tcp->rst) {
-        __u32 ack_seq = bpf_ntohl(tcp->ack_seq);
+    // 安全地访问TCP标志位
+    __u8 tcp_flags;
+    __u32 ack_seq;
+    
+    if (bpf_xdp_load_bytes(ctx, 14 + 20 + 13, &tcp_flags, sizeof(tcp_flags)) < 0 ||
+        bpf_xdp_load_bytes(ctx, 14 + 20 + 8, &ack_seq, sizeof(ack_seq)) < 0) {
+        return XDP_PASS;
+    }
+    
+    if ((tcp_flags & 0x10) && !(tcp_flags & 0x02) && !(tcp_flags & 0x01) && !(tcp_flags & 0x04)) {
+        ack_seq = bpf_ntohl(ack_seq);
         
         if (ack_seq == state->last_ack) {
             state->dup_ack_count++;
@@ -216,26 +250,30 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
         }
     }
     
-    if (tcp->syn && !tcp->ack) {
+    if (tcp_flags & 0x02 && !(tcp_flags & 0x10)) {
         state->state = 0;
         state->cwnd = mss;
         state->ssthresh = 65535;
         update_congestion_stats(1);
     }
     
-    if (tcp->rst) {
+    if (tcp_flags & 0x04) {
         bpf_map_delete_elem(&tcp_congestion_states, &conn_id);
         return XDP_PASS;
     }
     
     if (state->ecn_enabled) {
-        __u8 ecn_bits = (ip->tos & 0x03);
-        handle_ecn(state, ecn_bits);
+        __u8 tos;
+        if (bpf_xdp_load_bytes(ctx, 14 + 1, &tos, sizeof(tos)) >= 0) {
+            __u8 ecn_bits = (tos & 0x03);
+            handle_ecn(state, ecn_bits);
+        }
     }
     
     state->last_update = current_time;
     
-    struct congestion_stats *stats = bpf_map_lookup_elem(&congestion_statistics, &(int){0});
+    __u32 key = 0;
+    struct congestion_stats *stats = bpf_map_lookup_elem(&congestion_statistics, &key);
     if (stats) {
         stats->avg_cwnd = (stats->avg_cwnd + state->cwnd) / 2;
         stats->avg_rtt = (stats->avg_rtt + state->rtt) / 2;
