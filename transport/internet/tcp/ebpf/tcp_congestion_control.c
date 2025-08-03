@@ -97,34 +97,40 @@ static __always_inline void congestion_avoidance_algorithm(struct tcp_congestion
     state->cwnd += (mss * mss) / state->cwnd;
 }
 
-// BBR算法
+// 简化的BBR算法
 static __always_inline void bbr_algorithm(struct tcp_congestion_state *state, __u32 mss, __u32 rtt) {
     if (!state->bbr_enabled) return;
     
+    // 更新最小RTT
     if (state->bbr_min_rtt == 0 || rtt < state->bbr_min_rtt) {
         state->bbr_min_rtt = rtt;
     }
     
-    if (rtt > 0) {
-        __u32 new_bw = (state->cwnd * 1000000) / rtt;
+    // 简化的带宽估计（避免复杂除法）
+    if (rtt > 0 && rtt < 1000000) { // 限制RTT范围避免溢出
+        __u32 new_bw = state->cwnd * 1000 / rtt;
         if (new_bw > state->bbr_bw) {
             state->bbr_bw = new_bw;
         }
     }
     
-    __u32 bbr_cwnd = state->bbr_bw * state->bbr_min_rtt / 1000000;
-    if (bbr_cwnd < state->cwnd) {
-        state->cwnd = bbr_cwnd;
+    // 简化的拥塞窗口调整
+    if (state->bbr_bw > 0 && state->bbr_min_rtt > 0) {
+        __u32 bbr_cwnd = state->bbr_bw * state->bbr_min_rtt / 1000000;
+        if (bbr_cwnd > 0 && bbr_cwnd < state->cwnd) {
+            state->cwnd = bbr_cwnd;
+        }
     }
 }
 
-// ECN处理
+// 简化的ECN处理
 static __always_inline void handle_ecn(struct tcp_congestion_state *state, __u8 ecn_bits) {
     if (!state->ecn_enabled) return;
     
     if (ecn_bits & 0x03) {
-        update_congestion_stats(4);
+        // 简化的拥塞响应
         state->cwnd = state->cwnd * 3 / 4;
+        if (state->cwnd < 1460) state->cwnd = 1460;
         
         if (state->ssthresh > state->cwnd) {
             state->ssthresh = state->cwnd;
@@ -132,7 +138,6 @@ static __always_inline void handle_ecn(struct tcp_congestion_state *state, __u8 
         
         if (state->state == 0) {
             state->state = 1;
-            update_congestion_stats(2);
         }
     }
 }
@@ -220,8 +225,6 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
             state->dup_ack_count++;
             
             if (state->dup_ack_count >= 3) {
-                state->retransmit_count++;
-                update_congestion_stats(3);
                 state->dup_ack_count = 0;
                 state->cwnd = state->cwnd / 2;
                 if (state->cwnd < mss) state->cwnd = mss;
@@ -230,21 +233,26 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
             state->dup_ack_count = 0;
             state->last_ack = ack_seq;
             
+            // 简化的RTT计算
             if (current_time > state->last_update) {
                 __u32 rtt = (__u32)(current_time - state->last_update);
-                if (state->rtt_min == 0 || rtt < state->rtt_min) {
-                    state->rtt_min = rtt;
+                if (rtt < 1000000) { // 限制RTT范围
+                    if (state->rtt_min == 0 || rtt < state->rtt_min) {
+                        state->rtt_min = rtt;
+                    }
+                    state->rtt = rtt;
                 }
-                state->rtt = rtt;
             }
             
+            // 简化的拥塞控制
             if (state->state == 0) {
                 slow_start_algorithm(state, mss);
             } else if (state->state == 1) {
                 congestion_avoidance_algorithm(state, mss);
             }
             
-            if (state->bbr_enabled) {
+            // 简化的BBR
+            if (state->bbr_enabled && state->rtt > 0) {
                 bbr_algorithm(state, mss, state->rtt);
             }
         }
@@ -254,7 +262,6 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
         state->state = 0;
         state->cwnd = mss;
         state->ssthresh = 65535;
-        update_congestion_stats(1);
     }
     
     if (tcp_flags & 0x04) {
@@ -272,11 +279,14 @@ int tcp_congestion_control_xdp(struct xdp_md *ctx) {
     
     state->last_update = current_time;
     
+    // 简化的统计更新
     __u32 key = 0;
     struct congestion_stats *stats = bpf_map_lookup_elem(&congestion_statistics, &key);
-    if (stats) {
+    if (stats && state->cwnd > 0) {
         stats->avg_cwnd = (stats->avg_cwnd + state->cwnd) / 2;
-        stats->avg_rtt = (stats->avg_rtt + state->rtt) / 2;
+        if (state->rtt > 0) {
+            stats->avg_rtt = (stats->avg_rtt + state->rtt) / 2;
+        }
     }
     
     return XDP_PASS;

@@ -293,8 +293,7 @@ load_ebpf() {
     load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc" "classifier" ""
     
     # TCP拥塞控制
-    load_program "transport/internet/tcp/ebpf/tcp_congestion_control.o" "tcp_congestion_control_xdp" "xdp" "tcp_congestion_states congestion_statistics"
-    load_program "transport/internet/tcp/ebpf/tcp_congestion_control.o" "tcp_congestion_control_tc" "classifier" "tcp_congestion_states_tc congestion_statistics_tc"
+    load_program "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp" "xdp" "tcp_basic_states basic_stats_map"
 }
 
 # 设置权限
