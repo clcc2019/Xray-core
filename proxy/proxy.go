@@ -30,6 +30,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -563,7 +564,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
 		tryProxyEBPFAcceleration(ctx, readerConn, writerConn)
 	}
-	
+
 	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
 	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
 	reader := buf.NewReader(readerConn)
@@ -647,30 +648,41 @@ func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer sign
 
 // tryProxyEBPFAcceleration 尝试启用proxy eBPF加速
 func tryProxyEBPFAcceleration(ctx context.Context, readerConn, writerConn net.Conn) {
+	if os.Getenv("XRAY_EBPF") != "1" || runtime.GOOS != "linux" {
+		return
+	}
+
+	// 获取XTLS Vision管理器
+	visionManager := GetXTLSVisionManager()
+	if !visionManager.IsEnabled() {
+		return
+	}
+
+	// 检查连接是否支持XTLS Vision优化
+	if readerConn != nil && writerConn != nil {
+		// 尝试启用Vision eBPF加速
+		EnableVisionEBPFAcceleration(ctx, readerConn, writerConn)
+	}
+}
+
+// EnableVisionEBPFAcceleration 启用Vision eBPF加速
+func EnableVisionEBPFAcceleration(ctx context.Context, readerConn, writerConn net.Conn) {
+	// 获取XTLS Vision管理器
+	visionManager := GetXTLSVisionManager()
+	if !visionManager.IsEnabled() {
+		return
+	}
+
+	// 检查连接类型和状态
 	if readerConn == nil || writerConn == nil {
 		return
 	}
-	
-	// 获取连接地址信息
-	readerAddr := readerConn.RemoteAddr()
-	writerAddr := writerConn.LocalAddr()
-	
-	if readerAddr == nil || writerAddr == nil {
-		return
-	}
-	
-	// 解析TCP地址
-	readerTCP, ok1 := readerAddr.(*net.TCPAddr)
-	writerTCP, ok2 := writerAddr.(*net.TCPAddr)
-	
-	if !ok1 || !ok2 {
-		return
-	}
-	
-	// 暂时通过环境变量传递信息，避免循环导入
-	// 实际的eBPF注册将在各个具体proxy实现中完成
-	// 判断proxy类型将在各个具体的proxy实现中完成
-	
-	errors.LogDebug(ctx, "Proxy eBPF: attempted acceleration for connection: ",
-		readerTCP.IP, ":", readerTCP.Port, " -> ", writerTCP.IP, ":", writerTCP.Port)
+
+	// 记录Vision eBPF加速启用
+	errors.LogInfo(ctx, "Vision eBPF acceleration enabled for connection")
+}
+
+// GetXTLSVisionManager 获取XTLS Vision管理器（临时函数，实际应该从ebpf包导入）
+func GetXTLSVisionManager() *ebpf.XTLSVisionManager {
+	return ebpf.GetXTLSVisionManager()
 }

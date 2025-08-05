@@ -117,17 +117,30 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 }
 
 func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
-	// 🚀 首先尝试REALITY 0-RTT握手
-	if conn, is0RTT, err := TryZeroRTTHandshake(c, config, ctx, dest); err == nil {
-		if is0RTT {
-			errors.LogInfo(ctx, "🚀 REALITY 0-RTT handshake completed successfully")
+	return UClientWithZeroRTT(c, config, ctx, dest, true)
+}
+
+func UClientWithZeroRTT(c net.Conn, config *Config, ctx context.Context, dest net.Destination, enableZeroRTT bool) (net.Conn, error) {
+	// 🔥 0-RTT 暂时完全禁用以避免握手问题
+	// TODO: 重新启用并完善 0-RTT 实现
+	enableZeroRTT = false
+	errors.LogDebug(ctx, "🔥 0-RTT completely disabled, using regular handshake")
+
+	/* 原始 0-RTT 逻辑 - 暂时注释
+	// 🚀 首先尝试REALITY 0-RTT握手（如果启用）
+	if enableZeroRTT {
+		if conn, is0RTT, err := TryZeroRTTHandshake(c, config, ctx, dest); err == nil {
+			if is0RTT {
+				errors.LogInfo(ctx, "🚀 REALITY 0-RTT handshake completed successfully")
+				return conn, nil
+			}
+			// 非0-RTT但握手成功，直接返回
 			return conn, nil
 		}
-		// 非0-RTT但握手成功，直接返回
-		return conn, nil
 	}
+	*/
 
-	// 0-RTT失败，执行标准REALITY握手
+	// 0-RTT失败或未启用，执行标准REALITY握手
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
 		Config: config,

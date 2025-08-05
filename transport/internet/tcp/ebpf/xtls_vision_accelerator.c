@@ -28,6 +28,11 @@ struct xtls_vision_inbound {
     __u64 last_activity;     // 最后活动时间
     __u32 dest_ip;           // 目标IP（用于REALITY）
     __u16 dest_port;         // 目标端口（用于REALITY）
+    __u8 user_uuid[16];      // 用户UUID
+    __u8 command;            // 当前命令
+    __u16 content_len;       // 内容长度
+    __u16 padding_len;       // 填充长度
+    __u8 parsing_state;      // 解析状态
 } __attribute__((packed));
 
 // XTLS Vision统计信息
@@ -41,6 +46,9 @@ struct xtls_vision_stats {
     __u64 total_bytes_received;
     __u64 total_bytes_sent;
     __u64 avg_handshake_time;
+    __u64 zero_copy_packets;
+    __u64 padding_optimized;
+    __u64 command_parsed;
 };
 
 // 映射表定义
@@ -66,6 +74,14 @@ struct {
     __type(value, __u64);  // 访问时间
 } hot_connections SEC(".maps");
 
+// 用户UUID白名单
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1000);
+    __type(key, __u64);    // UUID哈希
+    __type(value, __u8);   // 是否有效
+} user_uuid_whitelist SEC(".maps");
+
 // 获取当前时间戳
 static __always_inline __u64 get_current_time() {
     return bpf_ktime_get_ns() / 1000000000; // 转换为秒
@@ -74,6 +90,16 @@ static __always_inline __u64 get_current_time() {
 // 计算连接ID
 static __always_inline __u64 get_connection_id(__u32 saddr, __u16 sport, __u32 daddr, __u16 dport) {
     return ((__u64)saddr << 32) | ((__u64)daddr) | ((__u64)sport << 48) | ((__u64)dport << 32);
+}
+
+// 计算UUID哈希
+static __always_inline __u64 get_uuid_hash(const __u8 *uuid) {
+    __u64 hash = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        hash = hash * 31 + uuid[i];
+    }
+    return hash;
 }
 
 // 更新统计信息
@@ -104,6 +130,15 @@ static __always_inline void update_stats(__u32 stat_type) {
                 break;
             case 5: // vision_packets
                 stats->vision_packets++;
+                break;
+            case 6: // zero_copy_packets
+                stats->zero_copy_packets++;
+                break;
+            case 7: // padding_optimized
+                stats->padding_optimized++;
+                break;
+            case 8: // command_parsed
+                stats->command_parsed++;
                 break;
         }
     }
@@ -152,15 +187,51 @@ static __always_inline int detect_xtls_vision(const void *data, const void *data
     
     // 检查数据长度
     __u16 length = bpf_ntohs(*(__u16*)(ptr + 3));
-    if (length < 5) return 0;
+    if (length < 21) return 0; // Vision协议至少需要21字节
     
-    // 检查XTLS Vision特征字节
-    if (data + 9 > data_end) return 0;
+    // 检查Vision协议格式
+    if (data + 21 > data_end) return 0;
     
-    // Vision通常有特定的数据模式
-    if (ptr[5] == 0x01 && ptr[6] == 0x00) return 1; // Vision命令
+    // 检查命令字节 (第17字节)
+    __u8 command = ptr[16];
+    if (command == 0x00 || command == 0x01 || command == 0x02) {
+        return 1; // Vision命令
+    }
     
     return 0;
+}
+
+// 解析Vision协议头部
+static __always_inline int parse_vision_header(const void *data, const void *data_end, 
+                                             struct xtls_vision_inbound *conn) {
+    if (data + 21 > data_end) return 0;
+    
+    const unsigned char *ptr = data;
+    
+    // 提取UserUUID (前16字节)
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        conn->user_uuid[i] = ptr[i];
+    }
+    
+    // 提取命令字节
+    conn->command = ptr[16];
+    
+    // 提取内容长度 (2字节，大端序)
+    conn->content_len = (ptr[17] << 8) | ptr[18];
+    
+    // 提取填充长度 (2字节，大端序)
+    conn->padding_len = (ptr[19] << 8) | ptr[20];
+    
+    // 验证UUID是否在白名单中
+    __u64 uuid_hash = get_uuid_hash(conn->user_uuid);
+    __u8 *valid = bpf_map_lookup_elem(&user_uuid_whitelist, &uuid_hash);
+    if (!valid || *valid != 1) {
+        return 0; // UUID不在白名单中
+    }
+    
+    update_stats(8); // command_parsed
+    return 1;
 }
 
 // 优化入站XTLS Vision数据包
@@ -180,11 +251,33 @@ static __always_inline int optimize_inbound_vision_packet(struct xdp_md *ctx,
         conn->vision_packets++;
         conn->last_activity = get_current_time();
         
+        // 解析Vision协议头部
+        if (parse_vision_header(tcp + 1, data_end, conn)) {
+            // 根据命令类型进行优化
+            switch (conn->command) {
+                case 0x00: // CommandPaddingContinue
+                    // 继续填充，保持当前状态
+                    break;
+                case 0x01: // CommandPaddingEnd
+                    // 结束填充，可以优化后续数据包
+                    conn->parsing_state = 1;
+                    update_stats(7); // padding_optimized
+                    break;
+                case 0x02: // CommandPaddingDirect
+                    // 直接复制模式，启用零拷贝
+                    conn->parsing_state = 2;
+                    update_stats(6); // zero_copy_packets
+                    return XDP_TX; // 零拷贝转发
+                default:
+                    break;
+            }
+        }
+        
         // 更新统计
         update_stats(5); // vision_packets
         
-        // 对于Vision数据包，启用零拷贝优化
-        if (conn->state == 3) { // vision_active
+        // 对于已建立的Vision连接，启用零拷贝优化
+        if (conn->state == 3 && conn->parsing_state == 2) { // vision_active + direct_copy
             conn->splice_count++;
             update_stats(4); // splice_count
             
@@ -248,7 +341,11 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
                 .vision_packets = 0,
                 .last_activity = get_current_time(),
                 .dest_ip = 0,
-                .dest_port = 0
+                .dest_port = 0,
+                .command = 0,
+                .content_len = 0,
+                .padding_len = 0,
+                .parsing_state = 0
             };
             bpf_map_update_elem(&xtls_inbound_connections, &conn_id, &new_conn, BPF_ANY);
             update_stats(0); // total_inbound_connections
@@ -308,12 +405,14 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
 // TC程序 - 入站出口优化
 SEC("tc/ingress")
 int xtls_vision_inbound_accelerator_tc(struct __sk_buff *skb) {
-    // 简化的TC程序，只更新基本统计
     __u32 key = 0;
     struct xtls_vision_stats *stats = bpf_map_lookup_elem(&xtls_stats, &key);
     if (stats) {
-        // 可以在这里添加更详细的统计信息
+        // 更新总字节计数
+        stats->total_bytes_received += skb->len;
     }
     
     return TC_ACT_OK;
-} 
+}
+
+char _license[] SEC("license") = "GPL"; 

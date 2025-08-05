@@ -7,138 +7,292 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 )
 
-// XTLSVisionInboundAccelerator XTLS Vision入站eBPF加速器
-type XTLSVisionInboundAccelerator struct {
-	enabled bool
+// XTLSVisionIntegration XTLS Vision集成接口
+type XTLSVisionIntegration struct {
+	mu          sync.RWMutex
+	enabled     bool
+	manager     *XTLSVisionManager
+	connections map[string]*VisionConnection
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
-// NewXTLSVisionInboundAccelerator 创建新的XTLS Vision入站eBPF加速器
-func NewXTLSVisionInboundAccelerator() *XTLSVisionInboundAccelerator {
-	enabled := os.Getenv("XRAY_EBPF") == "1"
-	return &XTLSVisionInboundAccelerator{
-		enabled: enabled,
+// VisionConnection Vision连接信息
+type VisionConnection struct {
+	ID            string
+	UserUUID      []byte
+	ClientIP      string
+	ServerIP      string
+	ClientPort    uint16
+	ServerPort    uint16
+	State         uint8
+	VisionEnabled bool
+	HandshakeTime time.Time
+	LastActivity  time.Time
+	BytesSent     uint64
+	BytesReceived uint64
+	SpliceCount   uint32
+	VisionPackets uint32
+}
+
+var (
+	globalVisionIntegration   *XTLSVisionIntegration
+	initVisionIntegrationOnce sync.Once
+)
+
+// GetVisionIntegration 获取全局Vision集成实例
+func GetVisionIntegration() *XTLSVisionIntegration {
+	initVisionIntegrationOnce.Do(func() {
+		globalVisionIntegration = &XTLSVisionIntegration{
+			connections: make(map[string]*VisionConnection),
+		}
+		if err := globalVisionIntegration.init(); err != nil {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Warning,
+				Content:  "Failed to initialize Vision integration: " + err.Error(),
+			})
+		}
+	})
+	return globalVisionIntegration
+}
+
+// init 初始化Vision集成
+func (xvi *XTLSVisionIntegration) init() error {
+	xvi.ctx, xvi.cancel = context.WithCancel(context.Background())
+
+	// 获取Vision管理器
+	xvi.manager = GetXTLSVisionManager()
+	xvi.enabled = xvi.manager.IsEnabled()
+
+	if xvi.enabled {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  "XTLS Vision integration initialized",
+		})
 	}
+
+	return nil
 }
 
-// IsEnabled 检查XTLS Vision入站eBPF加速是否启用
-func (x *XTLSVisionInboundAccelerator) IsEnabled() bool {
-	return x.enabled
+// RegisterConnection 注册Vision连接
+func (xvi *XTLSVisionIntegration) RegisterConnection(conn *VisionConnection) error {
+	if !xvi.enabled {
+		return fmt.Errorf("Vision integration not enabled")
+	}
+
+	xvi.mu.Lock()
+	defer xvi.mu.Unlock()
+
+	// 添加到用户空间连接表
+	xvi.connections[conn.ID] = conn
+
+	// 添加用户UUID到eBPF白名单
+	if err := xvi.manager.AddUserUUID(conn.UserUUID); err != nil {
+		return fmt.Errorf("failed to add user UUID to whitelist: %w", err)
+	}
+
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("Vision connection registered: %s", conn.ID),
+	})
+
+	return nil
 }
 
-// EnableXTLSVisionInboundAcceleration 启用XTLS Vision入站eBPF加速
-func (x *XTLSVisionInboundAccelerator) EnableXTLSVisionInboundAcceleration(ctx context.Context, clientAddr net.Addr, serverAddr net.Addr) error {
-	if !x.enabled {
+// UnregisterConnection 注销Vision连接
+func (xvi *XTLSVisionIntegration) UnregisterConnection(connID string) error {
+	if !xvi.enabled {
 		return nil
 	}
 
-	// 获取客户端地址
+	xvi.mu.Lock()
+	defer xvi.mu.Unlock()
+
+	conn, exists := xvi.connections[connID]
+	if !exists {
+		return fmt.Errorf("connection not found: %s", connID)
+	}
+
+	// 从用户空间连接表移除
+	delete(xvi.connections, connID)
+
+	// 从eBPF白名单移除用户UUID
+	if err := xvi.manager.RemoveUserUUID(conn.UserUUID); err != nil {
+		return fmt.Errorf("failed to remove user UUID from whitelist: %w", err)
+	}
+
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Debug,
+		Content:  fmt.Sprintf("Vision connection unregistered: %s", connID),
+	})
+
+	return nil
+}
+
+// GetConnection 获取连接信息
+func (xvi *XTLSVisionIntegration) GetConnection(connID string) (*VisionConnection, bool) {
+	xvi.mu.RLock()
+	defer xvi.mu.RUnlock()
+
+	conn, exists := xvi.connections[connID]
+	return conn, exists
+}
+
+// UpdateConnectionStats 更新连接统计
+func (xvi *XTLSVisionIntegration) UpdateConnectionStats(connID string, bytesSent, bytesReceived uint64) {
+	if !xvi.enabled {
+		return
+	}
+
+	xvi.mu.Lock()
+	defer xvi.mu.Unlock()
+
+	if conn, exists := xvi.connections[connID]; exists {
+		conn.BytesSent += bytesSent
+		conn.BytesReceived += bytesReceived
+		conn.LastActivity = time.Now()
+	}
+}
+
+// GetStats 获取统计信息
+func (xvi *XTLSVisionIntegration) GetStats() *XTLSVisionStats {
+	if !xvi.enabled {
+		return &XTLSVisionStats{}
+	}
+
+	return xvi.manager.GetStats()
+}
+
+// EnableVision 启用Vision优化
+func (xvi *XTLSVisionIntegration) EnableVision(connID string) error {
+	if !xvi.enabled {
+		return fmt.Errorf("Vision integration not enabled")
+	}
+
+	xvi.mu.Lock()
+	defer xvi.mu.Unlock()
+
+	if conn, exists := xvi.connections[connID]; exists {
+		conn.VisionEnabled = true
+		conn.HandshakeTime = time.Now()
+
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("Vision enabled for connection: %s", connID),
+		})
+
+		return nil
+	}
+
+	return fmt.Errorf("connection not found: %s", connID)
+}
+
+// DisableVision 禁用Vision优化
+func (xvi *XTLSVisionIntegration) DisableVision(connID string) error {
+	if !xvi.enabled {
+		return nil
+	}
+
+	xvi.mu.Lock()
+	defer xvi.mu.Unlock()
+
+	if conn, exists := xvi.connections[connID]; exists {
+		conn.VisionEnabled = false
+
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Info,
+			Content:  fmt.Sprintf("Vision disabled for connection: %s", connID),
+		})
+
+		return nil
+	}
+
+	return fmt.Errorf("connection not found: %s", connID)
+}
+
+// IsEnabled 检查是否启用
+func (xvi *XTLSVisionIntegration) IsEnabled() bool {
+	return xvi.enabled
+}
+
+// Close 关闭Vision集成
+func (xvi *XTLSVisionIntegration) Close() error {
+	xvi.mu.Lock()
+	defer xvi.mu.Unlock()
+
+	if xvi.cancel != nil {
+		xvi.cancel()
+	}
+
+	// 清理所有连接
+	for connID := range xvi.connections {
+		if err := xvi.UnregisterConnection(connID); err != nil {
+			errors.LogWarning(context.Background(), "Failed to unregister connection during cleanup: ", err)
+		}
+	}
+
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Info,
+		Content:  "XTLS Vision integration closed",
+	})
+
+	return nil
+}
+
+// GenerateConnectionID 生成连接ID
+func GenerateConnectionID(clientIP, serverIP string, clientPort, serverPort uint16) string {
+	return fmt.Sprintf("%s:%d-%s:%d", clientIP, clientPort, serverIP, serverPort)
+}
+
+// EnableXTLSVisionInboundEBPFAcceleration 启用XTLS Vision入站eBPF加速
+func EnableXTLSVisionInboundEBPFAcceleration(ctx context.Context, clientAddr net.Addr, serverAddr net.Addr) error {
+	integration := GetVisionIntegration()
+	if !integration.IsEnabled() {
+		return nil
+	}
+
+	// 解析地址
 	clientTCPAddr, ok := clientAddr.(*net.TCPAddr)
 	if !ok {
-		return errors.New("client address is not TCP address")
+		return fmt.Errorf("client address is not TCP address")
 	}
 
-	// 获取服务端地址
 	serverTCPAddr, ok := serverAddr.(*net.TCPAddr)
 	if !ok {
-		return errors.New("server address is not TCP address")
+		return fmt.Errorf("server address is not TCP address")
 	}
 
-	// 计算连接ID
-	connID := calculateConnectionID(clientTCPAddr.IP, uint16(clientTCPAddr.Port), serverTCPAddr.IP, uint16(serverTCPAddr.Port))
+	// 生成连接ID
+	connID := GenerateConnectionID(
+		clientTCPAddr.IP.String(),
+		serverTCPAddr.IP.String(),
+		uint16(clientTCPAddr.Port),
+		uint16(serverTCPAddr.Port),
+	)
 
-	// 尝试注册入站连接到eBPF
-	err := x.registerInboundConnection(connID, clientTCPAddr, serverTCPAddr)
-	if err != nil {
-		log.Record(&log.GeneralMessage{
-			Severity: log.Severity_Debug,
-			Content:  fmt.Sprintf("XTLS Vision inbound eBPF acceleration registration failed: %v", err),
-		})
-		return err
+	// 创建Vision连接
+	conn := &VisionConnection{
+		ID:           connID,
+		ClientIP:     clientTCPAddr.IP.String(),
+		ServerIP:     serverTCPAddr.IP.String(),
+		ClientPort:   uint16(clientTCPAddr.Port),
+		ServerPort:   uint16(serverTCPAddr.Port),
+		State:        0, // init
+		LastActivity: time.Now(),
 	}
 
-	log.Record(&log.GeneralMessage{
-		Severity: log.Severity_Debug,
-		Content:  fmt.Sprintf("XTLS Vision inbound eBPF acceleration enabled for %s->%s", clientTCPAddr, serverTCPAddr),
-	})
+	// 注册连接
+	if err := integration.RegisterConnection(conn); err != nil {
+		return fmt.Errorf("failed to register Vision connection: %w", err)
+	}
 
+	errors.LogInfo(ctx, "XTLS Vision inbound eBPF acceleration enabled for connection: ", connID)
 	return nil
-}
-
-// registerInboundConnection 注册入站连接到eBPF映射表
-func (x *XTLSVisionInboundAccelerator) registerInboundConnection(connID uint64, clientAddr, serverAddr *net.TCPAddr) error {
-	// 简化版本：只记录连接信息，不直接操作eBPF映射表
-	// 实际的eBPF映射表操作由内核程序自动处理
-
-	log.Record(&log.GeneralMessage{
-		Severity: log.Severity_Debug,
-		Content:  fmt.Sprintf("XTLS Vision inbound connection registered: %s->%s (ID: %d)", clientAddr, serverAddr, connID),
-	})
-
-	return nil
-}
-
-// GetXTLSVisionInboundStats 获取XTLS Vision入站统计信息
-func (x *XTLSVisionInboundAccelerator) GetXTLSVisionInboundStats() (map[string]uint64, error) {
-	if !x.enabled {
-		return nil, errors.New("XTLS Vision inbound eBPF acceleration is not enabled")
-	}
-
-	// 这里可以实现从eBPF映射表读取统计信息的逻辑
-	// 由于eBPF映射表访问需要特殊权限，这里返回模拟数据
-	stats := map[string]uint64{
-		"total_inbound_connections": 0,
-		"reality_connections":       0,
-		"vision_connections":        0,
-		"handshake_count":           0,
-		"splice_count":              0,
-		"vision_packets":            0,
-		"total_bytes_received":      0,
-		"total_bytes_sent":          0,
-		"avg_handshake_time":        0,
-	}
-
-	return stats, nil
-}
-
-// 辅助函数
-func calculateConnectionID(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort uint16) uint64 {
-	localIPInt := ipToUint32(localIP)
-	remoteIPInt := ipToUint32(remoteIP)
-	return (uint64(localIPInt) << 32) | uint64(remoteIPInt) | (uint64(localPort) << 48) | (uint64(remotePort) << 32)
-}
-
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
-}
-
-func getCurrentTime() uint64 {
-	return uint64(time.Now().Unix())
-}
-
-// 全局XTLS Vision入站加速器实例
-var globalXTLSVisionInboundAccelerator *XTLSVisionInboundAccelerator
-
-// GetXTLSVisionInboundAccelerator 获取全局XTLS Vision入站加速器实例
-func GetXTLSVisionInboundAccelerator() *XTLSVisionInboundAccelerator {
-	if globalXTLSVisionInboundAccelerator == nil {
-		globalXTLSVisionInboundAccelerator = NewXTLSVisionInboundAccelerator()
-	}
-	return globalXTLSVisionInboundAccelerator
-}
-
-// EnableXTLSVisionInboundEBPFAcceleration 启用XTLS Vision入站eBPF加速的便捷函数
-func EnableXTLSVisionInboundEBPFAcceleration(ctx context.Context, clientAddr net.Addr, serverAddr net.Addr) error {
-	accelerator := GetXTLSVisionInboundAccelerator()
-	return accelerator.EnableXTLSVisionInboundAcceleration(ctx, clientAddr, serverAddr)
 }

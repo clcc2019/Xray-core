@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +67,13 @@ func (c *ZeroRTTSessionCache) GetZeroRTTSession(serverName, shortId string) *Zer
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	key := serverName + ":" + shortId
+	// 使用strings.Builder避免栈溢出
+	var keyBuilder strings.Builder
+	keyBuilder.WriteString(serverName)
+	keyBuilder.WriteString(":")
+	keyBuilder.WriteString(shortId)
+	key := keyBuilder.String()
+
 	session, exists := c.sessions[key]
 	if !exists {
 		return nil
@@ -96,7 +103,13 @@ func (c *ZeroRTTSessionCache) StoreZeroRTTSession(session *ZeroRTTSession) error
 		c.evictOldestSession()
 	}
 
-	key := session.ServerName + ":" + string(session.ShortId[:])
+	// 使用strings.Builder避免栈溢出
+	var keyBuilder strings.Builder
+	keyBuilder.WriteString(session.ServerName)
+	keyBuilder.WriteString(":")
+	keyBuilder.Write(session.ShortId[:])
+	key := keyBuilder.String()
+
 	c.sessions[key] = session
 
 	return nil
@@ -160,7 +173,13 @@ func (c *ZeroRTTSessionCache) UpdateSessionStatus(serverName, shortId string, su
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	key := serverName + ":" + shortId
+	// 使用strings.Builder避免栈溢出
+	var keyBuilder strings.Builder
+	keyBuilder.WriteString(serverName)
+	keyBuilder.WriteString(":")
+	keyBuilder.WriteString(shortId)
+	key := keyBuilder.String()
+
 	session, exists := c.sessions[key]
 	if !exists {
 		return

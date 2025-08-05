@@ -27,6 +27,12 @@ type ZeroRTTConnection struct {
 
 // TryZeroRTTHandshake 尝试0-RTT握手
 func TryZeroRTTHandshake(c net.Conn, config *Config, ctx context.Context, dest xnet.Destination) (net.Conn, bool, error) {
+	// 🔥 暂时禁用 0-RTT 以避免复杂的握手问题
+	// TODO: 重新启用并完善 0-RTT 实现
+	errors.LogDebug(ctx, "🔥 0-RTT temporarily disabled, using regular handshake")
+	return performRegularHandshakeAndCache(c, config, ctx, dest)
+
+	/* 原始 0-RTT 逻辑 - 暂时注释
 	serverName := config.ServerName
 	if serverName == "" {
 		serverName = dest.Address.String()
@@ -59,10 +65,33 @@ func TryZeroRTTHandshake(c net.Conn, config *Config, ctx context.Context, dest x
 
 	errors.LogInfo(ctx, "🚀 REALITY 0-RTT handshake successful, RTT: ", rtt)
 	return conn, true, nil
+	*/
 }
 
 // performZeroRTTHandshake 执行0-RTT握手
 func performZeroRTTHandshake(c net.Conn, config *Config, session *ZeroRTTSession, ctx context.Context, dest xnet.Destination) (net.Conn, bool, error) {
+	// 🔍 检查输入参数
+	if c == nil {
+		errors.LogError(ctx, "REALITY: net.Conn is nil")
+		return nil, false, errors.New("REALITY: net.Conn is nil")
+	}
+	if config == nil {
+		errors.LogError(ctx, "REALITY: config is nil")
+		return nil, false, errors.New("REALITY: config is nil")
+	}
+	if session == nil {
+		errors.LogError(ctx, "REALITY: session is nil")
+		return nil, false, errors.New("REALITY: session is nil")
+	}
+	if session.ServerName == "" {
+		errors.LogError(ctx, "REALITY: session.ServerName is empty")
+		return nil, false, errors.New("REALITY: session.ServerName is empty")
+	}
+	if len(session.AuthKey) == 0 {
+		errors.LogError(ctx, "REALITY: session.AuthKey is empty")
+		return nil, false, errors.New("REALITY: session.AuthKey is empty")
+	}
+
 	// 🔧 创建支持0-RTT的TLS配置
 	utlsConfig := &utls.Config{
 		ServerName:             session.ServerName,
@@ -74,10 +103,15 @@ func performZeroRTTHandshake(c net.Conn, config *Config, session *ZeroRTTSession
 	// 🎭 创建伪装的TLS连接
 	fingerprint := tls.GetFingerprint(config.Fingerprint)
 	if fingerprint == nil {
+		errors.LogError(ctx, "REALITY: failed to get fingerprint")
 		return nil, false, errors.New("REALITY: failed to get fingerprint")
 	}
 
 	uConn := utls.UClient(c, utlsConfig, *fingerprint)
+	if uConn == nil {
+		errors.LogError(ctx, "REALITY: utls.UClient returned nil")
+		return nil, false, errors.New("REALITY: utls.UClient returned nil")
+	}
 
 	// 🚀 尝试发送Early Data
 	zrttConn := &ZeroRTTConnection{
@@ -90,12 +124,25 @@ func performZeroRTTHandshake(c net.Conn, config *Config, session *ZeroRTTSession
 
 	// 构建带Early Data的ClientHello
 	if err := zrttConn.buildZeroRTTClientHello(); err != nil {
+		errors.LogError(ctx, "Failed to build 0-RTT ClientHello: ", err)
 		return nil, false, errors.New("Failed to build 0-RTT ClientHello").Base(err)
 	}
 
-	// 执行握手
-	if err := uConn.HandshakeContext(ctx); err != nil {
-		return nil, false, errors.New("0-RTT handshake failed").Base(err)
+	// 执行握手 - 使用 recover 捕获 panic
+	var handshakeErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errors.LogError(ctx, "REALITY: panic during handshake: ", r)
+				handshakeErr = errors.New("REALITY: panic during handshake")
+			}
+		}()
+		handshakeErr = uConn.HandshakeContext(ctx)
+	}()
+
+	if handshakeErr != nil {
+		errors.LogError(ctx, "0-RTT handshake failed: ", handshakeErr)
+		return nil, false, errors.New("0-RTT handshake failed").Base(handshakeErr)
 	}
 
 	// 🎉 握手成功（简化版本，不检查Early Data状态）
@@ -105,7 +152,20 @@ func performZeroRTTHandshake(c net.Conn, config *Config, session *ZeroRTTSession
 
 // buildZeroRTTClientHello 构建支持0-RTT的ClientHello
 func (z *ZeroRTTConnection) buildZeroRTTClientHello() error {
-	uConn := z.Conn.(*utls.UConn)
+	if z == nil {
+		return errors.New("ZeroRTTConnection is nil")
+	}
+	if z.Conn == nil {
+		return errors.New("ZeroRTTConnection.Conn is nil")
+	}
+	if z.session == nil {
+		return errors.New("ZeroRTTConnection.session is nil")
+	}
+
+	uConn, ok := z.Conn.(*utls.UConn)
+	if !ok || uConn == nil {
+		return errors.New("Conn is not a valid utls.UConn")
+	}
 
 	// 🔧 构建握手状态
 	if err := uConn.BuildHandshakeState(); err != nil {
@@ -113,11 +173,24 @@ func (z *ZeroRTTConnection) buildZeroRTTClientHello() error {
 	}
 
 	hello := uConn.HandshakeState.Hello
+	if hello == nil {
+		return errors.New("HandshakeState.Hello is nil")
+	}
 
 	// 🎭 伪装成正常的REALITY握手
 	// 保持REALITY的SessionId格式以维持防检测特性
 	hello.SessionId = make([]byte, 32)
+
+	// 检查 Raw 长度，避免越界
+	if len(hello.Raw) < 39+32 {
+		return errors.New("Hello.Raw is too short")
+	}
 	copy(hello.Raw[39:], hello.SessionId)
+
+	// 检查 ShortId 长度
+	if len(z.session.ShortId) < 8 {
+		return errors.New("session.ShortId is too short")
+	}
 
 	// 使用缓存的会话信息
 	copy(hello.SessionId[8:16], z.session.ShortId[:])
@@ -155,8 +228,8 @@ func (z *ZeroRTTConnection) applyRealityAuth(hello interface{}) error {
 
 // performRegularHandshakeAndCache 执行常规握手并缓存结果
 func performRegularHandshakeAndCache(c net.Conn, config *Config, ctx context.Context, dest xnet.Destination) (net.Conn, bool, error) {
-	// 🔄 执行标准REALITY握手
-	conn, err := UClient(c, config, ctx, dest)
+	// 🔄 执行标准REALITY握手（禁用0-RTT以避免递归）
+	conn, err := UClientWithZeroRTT(c, config, ctx, dest, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -198,7 +271,7 @@ func cacheHandshakeResult(conn net.Conn, config *Config, ctx context.Context) er
 	session.SNI = serverName
 
 	// 提取ALPN信息
-	if connState := conn.(*utls.UConn).ConnectionState(); len(connState.NegotiatedProtocol) > 0 {
+	if connState := uConn.UConn.ConnectionState(); len(connState.NegotiatedProtocol) > 0 {
 		session.ALPN = []string{connState.NegotiatedProtocol}
 	}
 
