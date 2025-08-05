@@ -292,7 +292,7 @@ static __always_inline int optimize_inbound_vision_packet(struct xdp_md *ctx,
     return XDP_PASS;
 }
 
-// 主XDP程序 - XTLS Vision入站加速器
+// 主XDP程序 - XTLS Vision入站加速器（仅服务端）
 SEC("xdp")
 int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -312,7 +312,7 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
     
     struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
     
-    // 只处理目标端口443的流量（REALITY服务）
+    // 只处理目标端口443的流量（REALITY服务端入站）
     if (tcp->dest != bpf_htons(443))
         return XDP_PASS;
     

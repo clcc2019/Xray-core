@@ -125,11 +125,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		conn = auth.Client(conn)
 	}
 
-	// 为连接启用eBPF加速
-	if err := ebpf.AccelerateDialedConnection(ctx, conn, streamSettings); err != nil {
-		errors.LogDebug(ctx, "Failed to enable eBPF acceleration: ", err)
-		// 不影响正常连接，继续执行
-	}
+	// 客户端出站eBPF优化已禁用，专注于服务端入站优化
+	// 保持代码结构不变，但跳过客户端优化
 
 	return stat.Connection(conn), nil
 }

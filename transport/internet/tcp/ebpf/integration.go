@@ -42,65 +42,26 @@ func InitAccelerator(ctx context.Context) error {
 }
 
 // AccelerateDialedConnection 为已拨号的连接启用加速
+// 注意：根据项目要求，eBPF优化主要针对服务端入站，客户端出站优化已禁用
 func AccelerateDialedConnection(ctx context.Context, conn net.Conn, streamSettings *internet.MemoryStreamConfig) error {
-	accelerator := GetGlobalAccelerator()
-	if !accelerator.IsEnabled() {
-		return nil // 静默跳过，不影响正常功能
-	}
-
-	// 检查是否启用了REALITY
-	realityEnabled := false
-	if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
-		realityEnabled = true
-		errors.LogInfo(ctx, "TCP connection to ", conn.RemoteAddr().String(), " using REALITY encryption")
-	}
-
-	// 为连接启用eBPF加速
-	if err := accelerator.AccelerateConnection(conn, realityEnabled); err != nil {
-		errors.LogDebug(ctx, "Failed to accelerate connection: ", err)
-		return nil // 不影响正常连接
-	}
-
-	// TCP拥塞控制优化已移除，专注于REALITY优化
-
-	if realityEnabled {
-		errors.LogInfo(ctx, "TCP+REALITY eBPF acceleration enabled for ", conn.RemoteAddr().String())
-	} else {
-		errors.LogDebug(ctx, "TCP eBPF acceleration enabled for ", conn.RemoteAddr().String(), " (without REALITY)")
-	}
+	// 客户端出站eBPF优化已禁用，专注于服务端入站优化
+	// 保持函数接口不变，但内部实现为空，避免影响现有代码
 	return nil
 }
 
 // OptimizeRealityHandshake 优化REALITY握手过程
+// 注意：根据项目要求，eBPF优化主要针对服务端入站，客户端出站优化已禁用
 func OptimizeRealityHandshake(ctx context.Context, conn net.Conn, config interface{}) error {
-	accelerator := GetGlobalAccelerator()
-	if !accelerator.IsEnabled() {
-		return nil
-	}
-
-	if err := accelerator.OptimizeHandshake(conn, config); err != nil {
-		errors.LogDebug(ctx, "Failed to optimize REALITY handshake: ", err)
-		return nil // 不影响正常握手
-	}
-
-	errors.LogDebug(ctx, "REALITY handshake optimized for ", conn.RemoteAddr().String())
+	// 客户端出站eBPF优化已禁用，专注于服务端入站优化
+	// 保持函数接口不变，但内部实现为空，避免影响现有代码
 	return nil
 }
 
 // MarkRealityHandshakeComplete 标记REALITY握手完成 🔒
-// 这个方法应该在REALITY握手成功验证后调用
+// 注意：根据项目要求，eBPF优化主要针对服务端入站，客户端出站优化已禁用
 func MarkRealityHandshakeComplete(ctx context.Context, conn net.Conn) error {
-	accelerator := GetGlobalAccelerator()
-	if !accelerator.IsEnabled() {
-		return nil
-	}
-
-	if err := accelerator.MarkRealityVerified(conn); err != nil {
-		errors.LogDebug(ctx, "Failed to mark REALITY handshake as verified: ", err)
-		return nil // 不影响正常连接
-	}
-
-	errors.LogInfo(ctx, "🔒 REALITY handshake marked as verified for ", conn.RemoteAddr().String())
+	// 客户端出站eBPF优化已禁用，专注于服务端入站优化
+	// 保持函数接口不变，但内部实现为空，避免影响现有代码
 	return nil
 }
 
