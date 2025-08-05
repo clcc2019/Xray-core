@@ -5,7 +5,6 @@ package ebpf
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"sync"
 	"time"
