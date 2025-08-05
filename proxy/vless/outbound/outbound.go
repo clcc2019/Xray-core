@@ -28,7 +28,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
