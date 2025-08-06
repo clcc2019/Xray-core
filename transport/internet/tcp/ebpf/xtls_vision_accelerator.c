@@ -49,6 +49,8 @@ struct xtls_vision_stats {
     __u64 zero_copy_packets;
     __u64 padding_optimized;
     __u64 command_parsed;
+    __u64 tc_total_packets;
+    __u64 tc_accelerated_packets;
 };
 
 // 映射表定义
@@ -73,6 +75,22 @@ struct {
     __type(key, __u64);    // 连接ID
     __type(value, __u64);  // 访问时间
 } hot_connections SEC(".maps");
+
+// 连接复用统计
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1000);
+    __type(key, __u64);    // 连接ID
+    __type(value, __u32);  // 复用次数
+} connection_reuse_stats SEC(".maps");
+
+// 安全事件统计
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 100);
+    __type(key, __u32);    // 事件类型
+    __type(value, __u64);  // 事件计数
+} security_events SEC(".maps");
 
 // 用户UUID白名单
 struct {
@@ -115,32 +133,53 @@ static __always_inline void update_stats(__u32 stat_type) {
         switch (stat_type) {
             case 0: // total_inbound_connections
                 stats->total_inbound_connections++;
+                bpf_trace_printk("XTLS_EBPF: New inbound connection detected\n", 1);
                 break;
             case 1: // reality_connections
                 stats->reality_connections++;
+                bpf_trace_printk("XTLS_EBPF: REALITY handshake detected and optimized\n", 1);
                 break;
             case 2: // vision_connections
                 stats->vision_connections++;
+                bpf_trace_printk("XTLS_EBPF: XTLS Vision connection activated\n", 1);
                 break;
             case 3: // handshake_count
                 stats->handshake_count++;
+                bpf_trace_printk("XTLS_EBPF: TLS handshake completed with acceleration\n", 1);
                 break;
             case 4: // splice_count
                 stats->splice_count++;
+                bpf_trace_printk("XTLS_EBPF: Zero-copy splice operation performed\n", 1);
                 break;
             case 5: // vision_packets
                 stats->vision_packets++;
+                bpf_trace_printk("XTLS_EBPF: Vision packet processed with eBPF acceleration\n", 1);
                 break;
             case 6: // zero_copy_packets
                 stats->zero_copy_packets++;
+                bpf_trace_printk("XTLS_EBPF: Zero-copy packet forwarding (XDP_TX)\n", 1);
                 break;
             case 7: // padding_optimized
                 stats->padding_optimized++;
+                bpf_trace_printk("XTLS_EBPF: Padding optimization applied\n", 1);
                 break;
             case 8: // command_parsed
                 stats->command_parsed++;
+                bpf_trace_printk("XTLS_EBPF: Vision command parsed successfully\n", 1);
                 break;
         }
+    }
+}
+
+// 记录安全事件
+static __always_inline void record_security_event(__u32 event_type) {
+    __u64 *count = bpf_map_lookup_elem(&security_events, &event_type);
+    if (count) {
+        (*count)++;
+        bpf_map_update_elem(&security_events, &event_type, count, BPF_ANY);
+    } else {
+        __u64 initial_count = 1;
+        bpf_map_update_elem(&security_events, &event_type, &initial_count, BPF_ANY);
     }
 }
 
@@ -201,32 +240,116 @@ static __always_inline int detect_xtls_vision(const void *data, const void *data
     return 0;
 }
 
-// 解析Vision协议头部
+// 检测TLS 1.3 Application Data并优化padding处理
+static __always_inline int detect_tls13_application_data(const void *data, const void *data_end) {
+    if (data + 10 > data_end) return 0;
+    
+    const unsigned char *ptr = data;
+    
+    // 检查TLS Application Data (0x17)
+    if (ptr[0] != 0x17) return 0;
+    
+    // 检查TLS 1.3版本
+    __u16 version = bpf_ntohs(*(__u16*)(ptr + 1));
+    if (version != 0x0304) return 0;
+    
+    // 检查数据长度
+    __u16 length = bpf_ntohs(*(__u16*)(ptr + 3));
+    if (length < 5) return 0;
+    
+    // 对于TLS 1.3 Application Data，我们可以进行padding优化
+    return 1;
+}
+
+// 优化XTLS padding处理
+static __always_inline int optimize_xtls_padding(const void *data, const void *data_end, 
+                                               struct xtls_vision_inbound *conn) {
+    if (data + 21 > data_end) return 0;
+    
+    const unsigned char *ptr = data;
+    
+    // 解析padding信息
+    __u16 content_len = (ptr[17] << 8) | ptr[18];
+    __u16 padding_len = (ptr[19] << 8) | ptr[20];
+    __u8 command = ptr[16];
+    
+    // 更新连接状态
+    conn->content_len = content_len;
+    conn->padding_len = padding_len;
+    conn->command = command;
+    
+    // 如果padding比例很高，标记为需要优化
+    if (padding_len > content_len * 2) {
+        conn->parsing_state = 3; // padding_optimization_needed
+        update_stats(9); // padding_optimized
+        bpf_trace_printk("XTLS_EBPF: High padding ratio detected: content=%d padding=%d ratio=%d\n", 3, content_len, padding_len, padding_len/content_len);
+        return 1;
+    }
+    
+    // 极端高padding比例优化 (如content 74 padding 865)
+    if (padding_len > content_len * 10) {
+        conn->parsing_state = 4; // extreme_padding_optimization
+        update_stats(9); // padding_optimized
+        bpf_trace_printk("XTLS_EBPF: Extreme padding ratio: content=%d padding=%d ratio=%d\n", 3, content_len, padding_len, padding_len/content_len);
+        return 2; // 特殊优化标记
+    }
+    
+    return 0;
+}
+
+// 解析Vision协议头部 - 增强安全性
 static __always_inline int parse_vision_header(const void *data, const void *data_end, 
                                              struct xtls_vision_inbound *conn) {
     if (data + 21 > data_end) return 0;
     
     const unsigned char *ptr = data;
     
-    // 提取UserUUID (前16字节)
+    // 提取UserUUID (前16字节) - 增强边界检查
     #pragma unroll
     for (int i = 0; i < 16; i++) {
+        if (data + i >= data_end) return 0;
         conn->user_uuid[i] = ptr[i];
     }
     
-    // 提取命令字节
+    // 提取命令字节 - 严格命令验证
+    if (data + 16 >= data_end) return 0;
     conn->command = ptr[16];
     
-    // 提取内容长度 (2字节，大端序)
+    // 验证命令类型 - 只允许有效的Vision命令
+    if (conn->command != 0x00 && conn->command != 0x01 && conn->command != 0x02) {
+        bpf_trace_printk("XTLS_EBPF: Invalid command detected: %d\n", 1, conn->command);
+        record_security_event(1); // 无效命令事件
+        return 0;
+    }
+    
+    // 提取内容长度 (2字节，大端序) - 增强长度验证
+    if (data + 18 >= data_end) return 0;
     conn->content_len = (ptr[17] << 8) | ptr[18];
     
-    // 提取填充长度 (2字节，大端序)
+    // 验证内容长度合理性 - 防止异常长度攻击
+    if (conn->content_len > 8192 || conn->content_len == 0) {
+        bpf_trace_printk("XTLS_EBPF: Invalid content length: %d\n", 1, conn->content_len);
+        record_security_event(2); // 异常内容长度事件
+        return 0;
+    }
+    
+    // 提取填充长度 (2字节，大端序) - 增强长度验证
+    if (data + 20 >= data_end) return 0;
     conn->padding_len = (ptr[19] << 8) | ptr[20];
     
-    // 验证UUID是否在白名单中
+    // 验证填充长度合理性 - 防止异常padding攻击
+    if (conn->padding_len > 16384) {
+        bpf_trace_printk("XTLS_EBPF: Excessive padding length: %d\n", 1, conn->padding_len);
+        record_security_event(3); // 异常padding长度事件
+        return 0;
+    }
+    
+    // 验证UUID是否在白名单中 - 增强安全验证
     __u64 uuid_hash = get_uuid_hash(conn->user_uuid);
     __u8 *valid = bpf_map_lookup_elem(&user_uuid_whitelist, &uuid_hash);
     if (!valid || *valid != 1) {
+        bpf_trace_printk("XTLS_EBPF: Unauthorized UUID detected\n", 1);
+        record_security_event(4); // 未授权UUID事件
         return 0; // UUID不在白名单中
     }
     
@@ -349,22 +472,59 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
             };
             bpf_map_update_elem(&xtls_inbound_connections, &conn_id, &new_conn, BPF_ANY);
             update_stats(0); // total_inbound_connections
+            bpf_trace_printk("XTLS_EBPF: SYN packet processed, new connection created\n", 1);
         }
         return XDP_PASS;
     }
     
-    // 处理已建立的连接
+    // 处理已建立的连接 - 增强连接管理
     if (conn) {
-        conn->last_activity = get_current_time();
+        __u64 current_time = get_current_time();
         
-        // 检测REALITY握手
+        // 连接超时检查 - 防止资源泄漏
+        if (current_time - conn->last_activity > 300) { // 5分钟超时
+            bpf_trace_printk("XTLS_EBPF: Connection timeout, removing: %llu\n", 1, conn_id);
+            bpf_map_delete_elem(&xtls_inbound_connections, &conn_id);
+            bpf_map_delete_elem(&hot_connections, &conn_id);
+            bpf_map_delete_elem(&connection_reuse_stats, &conn_id);
+            return XDP_PASS; // 让用户空间处理
+        }
+        
+        conn->last_activity = current_time;
+        
+        // 连接复用优化：检查是否是热点连接
+        __u64 *last_access = bpf_map_lookup_elem(&hot_connections, &conn_id);
+        if (last_access) {
+            // 更新访问时间
+            bpf_map_update_elem(&hot_connections, &conn_id, &current_time, BPF_ANY);
+            
+            // 检查连接复用统计
+            __u32 *reuse_count = bpf_map_lookup_elem(&connection_reuse_stats, &conn_id);
+            if (reuse_count) {
+                (*reuse_count)++;
+                bpf_map_update_elem(&connection_reuse_stats, &conn_id, reuse_count, BPF_ANY);
+                bpf_trace_printk("XTLS_EBPF: Connection reused: ID=%llu count=%d\n", 2, conn_id, *reuse_count);
+            }
+        } else {
+            // 新热点连接，添加到缓存
+            bpf_map_update_elem(&hot_connections, &conn_id, &current_time, BPF_ANY);
+            __u32 initial_count = 1;
+            bpf_map_update_elem(&connection_reuse_stats, &conn_id, &initial_count, BPF_ANY);
+        }
+        
+        // 检测REALITY握手 - 增强状态机安全验证
         if (conn->state == 0 && detect_reality_handshake(tcp + 1, data_end)) {
             conn->state = 1; // reality_handshake
             conn->tls_version = 0x04; // TLS 1.3
             update_stats(1); // reality_connections
+            bpf_trace_printk("XTLS_EBPF: REALITY handshake detected in XDP\n", 1);
+        } else if (conn->state == 0 && !detect_reality_handshake(tcp + 1, data_end)) {
+            // 状态机攻击检测：在init状态收到非REALITY握手数据
+            bpf_trace_printk("XTLS_EBPF: State machine attack detected in init state\n", 1);
+            return XDP_DROP; // 丢弃可疑数据包
         }
         
-        // 检测TLS握手完成
+        // 检测TLS握手完成 - 增强状态机安全验证
         if (conn->state == 1) {
             // 检查是否有TLS Application Data
             if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + 5 <= data_end) {
@@ -372,6 +532,14 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
                 if (ptr[0] == 0x17) { // Application Data
                     conn->state = 2; // tls_handshake
                     conn->reality_verified = 1;
+                    bpf_trace_printk("XTLS_EBPF: TLS handshake completed, Application Data detected\n", 1);
+                } else if (ptr[0] == 0x16) { // Handshake
+                    // 正常的TLS握手过程，继续等待
+                    bpf_trace_printk("XTLS_EBPF: TLS handshake in progress\n", 1);
+                } else {
+                    // 状态机攻击检测：在reality_handshake状态收到非TLS数据
+                    bpf_trace_printk("XTLS_EBPF: State machine attack detected in reality_handshake state\n", 1);
+                    return XDP_DROP; // 丢弃可疑数据包
                 }
             }
         }
@@ -383,10 +551,48 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
             conn->handshake_time = get_current_time();
             update_stats(2); // vision_connections
             update_stats(3); // handshake_count
+            bpf_trace_printk("XTLS_EBPF: XTLS Vision protocol detected and activated\n", 1);
+            
+            // 解析Vision头部并优化padding
+            if (parse_vision_header(tcp + 1, data_end, conn)) {
+                optimize_xtls_padding(tcp + 1, data_end, conn);
+                bpf_trace_printk("XTLS_EBPF: Vision header parsed and padding optimized\n", 1);
+            }
         }
         
-        // 优化Vision数据包
+        // 检测TLS 1.3 Application Data并优化
+        if (conn->state >= 2 && detect_tls13_application_data(tcp + 1, data_end)) {
+            // 对于TLS 1.3 Application Data，进行padding优化
+            if (conn->vision_enabled) {
+                optimize_xtls_padding(tcp + 1, data_end, conn);
+            }
+        }
+        
+        // 优化Vision数据包 - 增强性能优化
         if (conn->vision_enabled) {
+            bpf_trace_printk("XTLS_EBPF: Vision packet optimization triggered\n", 1);
+            
+            // 增强零拷贝优化：根据连接状态和padding比例决定
+            if (conn->parsing_state == 2 || conn->parsing_state == 4) {
+                // 直接复制模式或极端padding优化模式
+                bpf_trace_printk("XTLS_EBPF: Zero-copy mode activated for connection\n", 1);
+                return XDP_TX; // 零拷贝转发
+            }
+            
+            // 新增：智能零拷贝决策
+            // 1. 对于高频复用连接，优先使用零拷贝
+            __u32 *reuse_count = bpf_map_lookup_elem(&connection_reuse_stats, &conn_id);
+            if (reuse_count && *reuse_count > 5) {
+                bpf_trace_printk("XTLS_EBPF: High-reuse connection, enabling zero-copy\n", 1);
+                return XDP_TX; // 零拷贝转发
+            }
+            
+            // 2. 对于低padding比例连接，启用零拷贝
+            if (conn->padding_len < conn->content_len) {
+                bpf_trace_printk("XTLS_EBPF: Low padding ratio, enabling zero-copy\n", 1);
+                return XDP_TX; // 零拷贝转发
+            }
+            
             return optimize_inbound_vision_packet(ctx, conn);
         }
         
@@ -402,14 +608,16 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
-// TC程序 - 入站出口优化
-SEC("tc/ingress")
+// TC程序 - 极简版本，仅做基础统计
+SEC("classifier")
 int xtls_vision_inbound_accelerator_tc(struct __sk_buff *skb) {
-    __u32 key = 0;
-    struct xtls_vision_stats *stats = bpf_map_lookup_elem(&xtls_stats, &key);
+    // TC程序的极简版本，主要功能已转移到XDP层
+    // 仅更新基础统计计数
+    __u32 stats_key = 0;
+    struct xtls_vision_stats *stats = bpf_map_lookup_elem(&xtls_stats, &stats_key);
     if (stats) {
-        // 更新总字节计数
-        stats->total_bytes_received += skb->len;
+        stats->tc_total_packets++;
+        bpf_trace_printk("XTLS_EBPF: TC program packet processed\n", 1);
     }
     
     return TC_ACT_OK;

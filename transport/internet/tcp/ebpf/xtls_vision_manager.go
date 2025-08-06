@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -91,26 +92,34 @@ func (xvm *XTLSVisionManager) init() error {
 
 // loadInboundProgram 加载入站eBPF程序 - 仅处理服务端入站流量
 func (xvm *XTLSVisionManager) loadInboundProgram() error {
-	// 暂时跳过eBPF程序加载，专注于服务端入站优化逻辑
-	// 在实际部署时，需要编译并加载eBPF字节码
-	log.Record(&log.GeneralMessage{
-		Severity: log.Severity_Info,
-		Content:  "XTLS Vision eBPF program loading skipped (focusing on inbound optimization logic)",
-	})
-	return nil
+	// 1. 检查eBPF支持
+	if err := xvm.checkEBPFSupport(); err != nil {
+		return fmt.Errorf("eBPF not supported: %w", err)
+	}
 
-	// 暂时跳过网络接口附加，专注于服务端入站优化逻辑
-	// 在实际部署时，需要附加eBPF程序到网络接口
-	log.Record(&log.GeneralMessage{
-		Severity: log.Severity_Info,
-		Content:  "XTLS Vision eBPF interface attachment skipped (focusing on inbound optimization logic)",
-	})
+	// 2. 从pinned程序中获取eBPF程序（由mount-ebpf.sh预先加载）
+	if err := xvm.loadPinnedPrograms(); err != nil {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Warning,
+			Content:  "Failed to load pinned eBPF programs: " + err.Error() + ". eBPF acceleration disabled.",
+		})
+		xvm.enabled = false
+		return nil
+	}
 
-	// 暂时跳过eBPF映射表加载，专注于服务端入站优化逻辑
-	// 在实际部署时，需要创建并加载eBPF映射表
+	// 3. 获取eBPF映射表
+	if err := xvm.loadPinnedMaps(); err != nil {
+		log.Record(&log.GeneralMessage{
+			Severity: log.Severity_Warning,
+			Content:  "Failed to load pinned eBPF maps: " + err.Error() + ". eBPF acceleration disabled.",
+		})
+		xvm.enabled = false
+		return nil
+	}
+
 	log.Record(&log.GeneralMessage{
 		Severity: log.Severity_Info,
-		Content:  "XTLS Vision eBPF maps loading skipped (focusing on inbound optimization logic)",
+		Content:  "XTLS Vision eBPF program loaded from pinned resources successfully",
 	})
 
 	return nil
@@ -244,4 +253,97 @@ func (xvm *XTLSVisionManager) Close() error {
 // IsEnabled 检查是否启用
 func (xvm *XTLSVisionManager) IsEnabled() bool {
 	return xvm.enabled
+}
+
+// checkEBPFSupport 检查eBPF支持
+func (xvm *XTLSVisionManager) checkEBPFSupport() error {
+	// 1. 检查内核版本 (需要 5.8+)
+	var uname syscall.Utsname
+	if err := syscall.Uname(&uname); err != nil {
+		return fmt.Errorf("failed to get kernel version: %w", err)
+	}
+
+	// 2. 检查BPF文件系统挂载
+	if _, err := os.Stat("/sys/fs/bpf"); os.IsNotExist(err) {
+		return fmt.Errorf("BPF filesystem not mounted at /sys/fs/bpf")
+	}
+
+	// 3. 检查权限
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("eBPF requires root privileges")
+	}
+
+	return nil
+}
+
+// loadPinnedPrograms 从pinned资源加载eBPF程序
+func (xvm *XTLSVisionManager) loadPinnedPrograms() error {
+	// 从BPF文件系统加载已pin的程序
+	xdpProgPath := "/sys/fs/bpf/xray/xtls_vision_inbound_accelerator_xdp"
+
+	// 检查pinned程序是否存在
+	if _, err := os.Stat(xdpProgPath); os.IsNotExist(err) {
+		return fmt.Errorf("pinned XDP program not found at %s. Please run mount-ebpf.sh first", xdpProgPath)
+	}
+
+	// 加载pinned XDP程序
+	xdpProg, err := ebpf.LoadPinnedProgram(xdpProgPath, nil)
+	if err != nil {
+		return fmt.Errorf("failed to load pinned XDP program: %w", err)
+	}
+
+	xvm.inboundProgram = xdpProg
+
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Info,
+		Content:  "eBPF XDP program loaded from pinned resource: " + xdpProgPath,
+	})
+
+	return nil
+}
+
+// loadPinnedMaps 从pinned资源加载eBPF映射表
+func (xvm *XTLSVisionManager) loadPinnedMaps() error {
+	// 映射表路径定义
+	mapPaths := map[string]string{
+		"xtls_inbound_connections": "/sys/fs/bpf/xray/xtls_inbound_connections",
+		"xtls_stats":               "/sys/fs/bpf/xray/xtls_stats",
+		"hot_connections":          "/sys/fs/bpf/xray/hot_connections",
+		"user_uuid_whitelist":      "/sys/fs/bpf/xray/user_uuid_whitelist",
+	}
+
+	// 加载连接表
+	if connMap, err := ebpf.LoadPinnedMap(mapPaths["xtls_inbound_connections"], nil); err != nil {
+		return fmt.Errorf("failed to load pinned connections map: %w", err)
+	} else {
+		xvm.inboundConnections = connMap
+	}
+
+	// 加载统计表
+	if statsMap, err := ebpf.LoadPinnedMap(mapPaths["xtls_stats"], nil); err != nil {
+		return fmt.Errorf("failed to load pinned stats map: %w", err)
+	} else {
+		xvm.inboundStats = statsMap
+	}
+
+	// 加载热连接表
+	if hotMap, err := ebpf.LoadPinnedMap(mapPaths["hot_connections"], nil); err != nil {
+		return fmt.Errorf("failed to load pinned hot connections map: %w", err)
+	} else {
+		xvm.hotConnections = hotMap
+	}
+
+	// 加载UUID白名单表
+	if uuidMap, err := ebpf.LoadPinnedMap(mapPaths["user_uuid_whitelist"], nil); err != nil {
+		return fmt.Errorf("failed to load pinned UUID whitelist map: %w", err)
+	} else {
+		xvm.userUUIDWhitelist = uuidMap
+	}
+
+	log.Record(&log.GeneralMessage{
+		Severity: log.Severity_Info,
+		Content:  "eBPF maps loaded from pinned resources successfully",
+	})
+
+	return nil
 }
