@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/common/xudp"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
@@ -199,6 +200,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
+		if d, ok := tcpinfo.DetectRTT(iConn); ok && d > 30*time.Millisecond {
+			bufferWriter.SetFlushThreshold(32 * 1024)
+		} else {
+			bufferWriter.SetFlushThreshold(16 * 1024)
+		}
 		if err := encoding.EncodeRequestHeader(bufferWriter, request, requestAddons); err != nil {
 			return errors.New("failed to encode request header").Base(err).AtWarning()
 		}

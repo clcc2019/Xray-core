@@ -8,10 +8,8 @@ package proxy
 import (
 	"bytes"
 	"context"
-    "encoding/binary"
-	"crypto/rand"
+	"encoding/binary"
 	"io"
-	"math/big"
 	"os"
 	"runtime"
 	"strconv"
@@ -112,6 +110,8 @@ type TrafficState struct {
 	RemainingServerHello   int32
 	Inbound                InboundState
 	Outbound               OutboundState
+	// padding RNG state (per-connection), used to avoid heavy crypto/rand in padding path
+	padRand uint64
 }
 
 type InboundState struct {
@@ -172,6 +172,34 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 	}
 }
 
+// seedPaddingRand initializes the per-connection padding RNG using a lightweight hash
+func (t *TrafficState) seedPaddingRand() {
+	if t.padRand != 0 {
+		return
+	}
+	var h uint64 = uint64(time.Now().UnixNano())
+	for _, b := range t.UserUUID {
+		h ^= uint64(b) + 0x9e3779b97f4a7c15 + (h << 6) + (h >> 2)
+	}
+	if h == 0 {
+		h = 0x106689d45497fdb3 // non-zero seed
+	}
+	t.padRand = h
+}
+
+// nextRand32 returns a fast pseudo-random 32-bit number (xorshift64*)
+func (t *TrafficState) nextRand32() uint32 {
+	if t.padRand == 0 {
+		t.seedPaddingRand()
+	}
+	x := t.padRand
+	x ^= x >> 12
+	x ^= x << 25
+	x ^= x >> 27
+	t.padRand = x
+	return uint32((x * 2685821657736338717) >> 32)
+}
+
 // VisionReader is used to read xtls vision protocol
 // Note Vision probably only make sense as the inner most layer of reader, since it need assess traffic state from origin proxy traffic
 type VisionReader struct {
@@ -228,28 +256,28 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			} else if *currentCommand == 2 {
 				*withinPaddingBuffers = false
 				*switchToDirectCopy = true
-                // 同步直拷提示到 eBPF（仅 Linux 且 XRAY_EBPF=1）
-                if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
-                    if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
-                        rawConn, _, _ := UnwrapRawConn(inbound.Conn)
-                        if rawConn != nil {
-                            if raddr, rok := rawConn.RemoteAddr().(*net.TCPAddr); rok {
-                                if laddr, lok := rawConn.LocalAddr().(*net.TCPAddr); lok {
-                                    rip4 := raddr.IP.To4()
-                                    lip4 := laddr.IP.To4()
-                                    if rip4 != nil && lip4 != nil {
-                                        saddr := binary.BigEndian.Uint32(rip4)
-                                        daddr := binary.BigEndian.Uint32(lip4)
-                                        sport := uint16(raddr.Port)
-                                        dport := uint16(laddr.Port)
-                                        // 写入直拷 hint
-                                        ebpf.GetXTLSVisionManager().SetDirectCopyHintIPv4(saddr, sport, daddr, dport, true)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+				// 同步直拷提示到 eBPF（仅 Linux 且 XRAY_EBPF=1）
+				if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
+					if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
+						rawConn, _, _ := UnwrapRawConn(inbound.Conn)
+						if rawConn != nil {
+							if raddr, rok := rawConn.RemoteAddr().(*net.TCPAddr); rok {
+								if laddr, lok := rawConn.LocalAddr().(*net.TCPAddr); lok {
+									rip4 := raddr.IP.To4()
+									lip4 := laddr.IP.To4()
+									if rip4 != nil && lip4 != nil {
+										saddr := binary.BigEndian.Uint32(rip4)
+										daddr := binary.BigEndian.Uint32(lip4)
+										sport := uint16(raddr.Port)
+										dport := uint16(laddr.Port)
+										// 写入直拷 hint
+										ebpf.GetXTLSVisionManager().SetDirectCopyHintIPv4(saddr, sport, daddr, dport, true)
+									}
+								}
+							}
+						}
+					}
+				}
 			} else {
 				errors.LogInfo(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
 			}
@@ -298,7 +326,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	if *isPadding {
 		if len(mb) == 1 && mb[0] == nil {
-			mb[0] = XtlsPadding(nil, CommandPaddingContinue, &w.writeOnceUserUUID, true, w.ctx) // we do a long padding to hide vless header
+			mb[0] = XtlsPadding(nil, CommandPaddingContinue, &w.writeOnceUserUUID, true, w.ctx, w.trafficState) // we do a long padding to hide vless header
 			return w.Writer.WriteMultiBuffer(mb)
 		}
 		mb = ReshapeMultiBuffer(w.ctx, mb)
@@ -315,13 +343,13 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 						command = CommandPaddingDirect
 					}
 				}
-				mb[i] = XtlsPadding(b, command, &w.writeOnceUserUUID, true, w.ctx)
+				mb[i] = XtlsPadding(b, command, &w.writeOnceUserUUID, true, w.ctx, w.trafficState)
 				*isPadding = false // padding going to end
 				longPadding = false
 				continue
 			} else if !w.trafficState.IsTLS12orAbove && w.trafficState.NumberOfPacketToFilter <= 1 { // For compatibility with earlier vision receiver, we finish padding 1 packet early
 				*isPadding = false
-				mb[i] = XtlsPadding(b, CommandPaddingEnd, &w.writeOnceUserUUID, longPadding, w.ctx)
+				mb[i] = XtlsPadding(b, CommandPaddingEnd, &w.writeOnceUserUUID, longPadding, w.ctx, w.trafficState)
 				break
 			}
 			var command byte = CommandPaddingContinue
@@ -331,7 +359,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					command = CommandPaddingDirect
 				}
 			}
-			mb[i] = XtlsPadding(b, command, &w.writeOnceUserUUID, longPadding, w.ctx)
+			mb[i] = XtlsPadding(b, command, &w.writeOnceUserUUID, longPadding, w.ctx, w.trafficState)
 		}
 	}
 	return w.Writer.WriteMultiBuffer(mb)
@@ -373,24 +401,38 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 }
 
 // XtlsPadding add padding to eliminate length signature during tls handshake
-func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool, ctx context.Context) *buf.Buffer {
+func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool, ctx context.Context, ts *TrafficState) *buf.Buffer {
 	var contentLen int32 = 0
 	var paddingLen int32 = 0
 	if b != nil {
 		contentLen = b.Len()
 	}
+	// Lightweight per-connection RNG (provided by caller)
+	// Fallback small jitter if unavailable
+	var r uint32 = 137
+	if ts != nil {
+		r = ts.nextRand32()
+	}
 	if contentLen < 900 && longPadding {
-		l, err := rand.Int(rand.Reader, big.NewInt(500))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
+		// Push small records to ~900 bytes with slight jitter
+		jitter := int32(r % 128) // 0..127
+		paddingLen = (900 - contentLen)
+		if paddingLen < 0 {
+			paddingLen = 0
 		}
-		paddingLen = int32(l.Int64()) + 900 - contentLen
+		paddingLen += jitter
 	} else {
-		l, err := rand.Int(rand.Reader, big.NewInt(256))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
+		// Small random pad
+		paddingLen = int32(r % 256)
+		// Softly nudge towards 4KiB boundary occasionally
+		total := contentLen + 5 + paddingLen // include padding header (5 bytes)
+		if r%16 == 0 {
+			const bucket = 4096
+			rem := int32(bucket - (total % bucket))
+			if rem > 0 && rem <= 128 {
+				paddingLen += rem
+			}
 		}
-		paddingLen = int32(l.Int64())
 	}
 	if paddingLen > buf.Size-21-contentLen {
 		paddingLen = buf.Size - 21 - contentLen

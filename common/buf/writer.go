@@ -78,14 +78,17 @@ type BufferedWriter struct {
 	writer   Writer
 	buffer   *Buffer
 	buffered bool
+	// flushThreshold if >0, triggers flush when buffer length reaches or exceeds this size.
+	flushThreshold int32
 }
 
 // NewBufferedWriter creates a new BufferedWriter.
 func NewBufferedWriter(writer Writer) *BufferedWriter {
 	return &BufferedWriter{
-		writer:   writer,
-		buffer:   New(),
-		buffered: true,
+		writer:         writer,
+		buffer:         New(),
+		buffered:       true,
+		flushThreshold: 0,
 	}
 }
 
@@ -120,7 +123,7 @@ func (w *BufferedWriter) Write(b []byte) (int, error) {
 		if err != nil {
 			return totalBytes, err
 		}
-		if !w.buffered || w.buffer.IsFull() {
+		if !w.buffered || w.buffer.IsFull() || (w.flushThreshold > 0 && w.buffer.Len() >= w.flushThreshold) {
 			if err := w.flushInternal(); err != nil {
 				return totalBytes, err
 			}
@@ -154,7 +157,7 @@ func (w *BufferedWriter) WriteMultiBuffer(b MultiBuffer) error {
 			w.buffer = New()
 		}
 		common.Must2(w.buffer.ReadFrom(&reader))
-		if w.buffer.IsFull() {
+		if w.buffer.IsFull() || (w.flushThreshold > 0 && w.buffer.Len() >= w.flushThreshold) {
 			if err := w.flushInternal(); err != nil {
 				return err
 			}
@@ -199,6 +202,14 @@ func (w *BufferedWriter) SetBuffered(f bool) error {
 		return w.flushInternal()
 	}
 	return nil
+}
+
+// SetFlushThreshold sets a soft flush threshold in bytes (e.g., 16384 or 32768) to smooth TLS record sizes.
+// Set to 0 to disable. This is a best-effort trigger in addition to buffer full.
+func (w *BufferedWriter) SetFlushThreshold(bytes int32) {
+	w.Lock()
+	w.flushThreshold = bytes
+	w.Unlock()
 }
 
 // ReadFrom implements io.ReaderFrom.

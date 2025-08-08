@@ -22,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	feature_inbound "github.com/xtls/xray-core/features/inbound"
@@ -567,6 +568,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))
+		// 自适应阈值：高RTT用32KiB，低RTT用16KiB
+		if d, ok := tcpinfo.DetectRTT(iConn); ok && d > 30*time.Millisecond {
+			bufferWriter.SetFlushThreshold(32 * 1024)
+		} else {
+			bufferWriter.SetFlushThreshold(16 * 1024)
+		}
 		if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
 			return errors.New("failed to encode response header").Base(err).AtWarning()
 		}

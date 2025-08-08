@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/tcpinfo"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/transport"
@@ -105,6 +106,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
+		if d, ok := tcpinfo.DetectRTT(conn); ok && d > 30*time.Millisecond {
+			bufferWriter.SetFlushThreshold(32 * 1024)
+		} else {
+			bufferWriter.SetFlushThreshold(16 * 1024)
+		}
 
 		connWriter := &ConnWriter{
 			Writer:  bufferWriter,

@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/common/xudp"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
@@ -86,7 +87,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination().NetAddr())
-	
+
 	// 启用VMess eBPF加速
 	EnableVMessEBPFAcceleration(ctx, conn, target)
 
@@ -164,6 +165,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
 		writer := buf.NewBufferedWriter(buf.NewWriter(conn))
+		if d, ok := tcpinfo.DetectRTT(conn); ok && d > 30*time.Millisecond {
+			writer.SetFlushThreshold(32 * 1024)
+		} else {
+			writer.SetFlushThreshold(16 * 1024)
+		}
 		if err := session.EncodeRequestHeader(request, writer); err != nil {
 			return errors.New("failed to encode request").Base(err).AtWarning()
 		}

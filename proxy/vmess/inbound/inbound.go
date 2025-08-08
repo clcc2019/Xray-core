@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	feature_inbound "github.com/xtls/xray-core/features/inbound"
@@ -305,6 +306,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		writer := buf.NewBufferedWriter(buf.NewWriter(connection))
+		if d, ok := tcpinfo.DetectRTT(iConn); ok && d > 30*time.Millisecond {
+			writer.SetFlushThreshold(32 * 1024)
+		} else {
+			writer.SetFlushThreshold(16 * 1024)
+		}
 		defer writer.Flush()
 
 		response := &protocol.ResponseHeader{
