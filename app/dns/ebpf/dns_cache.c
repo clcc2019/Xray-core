@@ -8,6 +8,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifndef __maybe_unused
+#define __maybe_unused __attribute__((unused))
+#endif
+
 // DNS A 记录缓存条目（IPv4）
 struct dns_response_v4 {
     __u32 ip;              // IPv4 地址（网络序）
@@ -64,7 +68,7 @@ static __always_inline char lower_char(char c) {
 }
 
 // FNV-1a 32 位哈希（小缓冲）
-static __always_inline __u32 fnv1a32(const char *buf, int len) {
+static __always_inline __maybe_unused __u32 fnv1a32(const char *buf, int len) {
     const __u32 FNV_PRIME = 16777619U;
     __u32 hash = 2166136261U;
     for (int i = 0; i < len && i < 128; i++) {

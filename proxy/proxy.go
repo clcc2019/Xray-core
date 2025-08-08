@@ -8,6 +8,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+    "encoding/binary"
 	"crypto/rand"
 	"io"
 	"math/big"
@@ -227,6 +228,28 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			} else if *currentCommand == 2 {
 				*withinPaddingBuffers = false
 				*switchToDirectCopy = true
+                // 同步直拷提示到 eBPF（仅 Linux 且 XRAY_EBPF=1）
+                if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
+                    if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
+                        rawConn, _, _ := UnwrapRawConn(inbound.Conn)
+                        if rawConn != nil {
+                            if raddr, rok := rawConn.RemoteAddr().(*net.TCPAddr); rok {
+                                if laddr, lok := rawConn.LocalAddr().(*net.TCPAddr); lok {
+                                    rip4 := raddr.IP.To4()
+                                    lip4 := laddr.IP.To4()
+                                    if rip4 != nil && lip4 != nil {
+                                        saddr := binary.BigEndian.Uint32(rip4)
+                                        daddr := binary.BigEndian.Uint32(lip4)
+                                        sport := uint16(raddr.Port)
+                                        dport := uint16(laddr.Port)
+                                        // 写入直拷 hint
+                                        ebpf.GetXTLSVisionManager().SetDirectCopyHintIPv4(saddr, sport, daddr, dport, true)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 			} else {
 				errors.LogInfo(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
 			}

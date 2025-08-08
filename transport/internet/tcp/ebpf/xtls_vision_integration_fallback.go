@@ -73,6 +73,16 @@ func (xvm *XTLSVisionManager) IsEnabled() bool {
 	return false // 非Linux平台始终返回false
 }
 
+// SetDirectCopyHintIPv4 设置/清除直拷提示（非Linux平台fallback：no-op）
+func (xvm *XTLSVisionManager) SetDirectCopyHintIPv4(srcIP uint32, srcPort uint16, dstIP uint32, dstPort uint16, enabled bool) error {
+	return nil
+}
+
+// IsDirectCopyEnabledIPv4 查询直拷提示（非Linux平台fallback：恒为false）
+func (xvm *XTLSVisionManager) IsDirectCopyEnabledIPv4(srcIP uint32, srcPort uint16, dstIP uint32, dstPort uint16) bool {
+	return false
+}
+
 // AddUserUUID 添加用户UUID（非Linux平台fallback）
 func (xvm *XTLSVisionManager) AddUserUUID(uuid []byte) error {
 	return nil // 非Linux平台不做任何操作

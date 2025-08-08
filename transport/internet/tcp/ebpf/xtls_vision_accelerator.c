@@ -609,9 +609,10 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
         } else {
             conn->bytes_sent += packet_size;
         }
+        // 结束 IPv4 分支
     }
     // IPv6 分支（基础支持：识别并统计，保持转发）
-    else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
         struct ipv6hdr *ip6 = data + sizeof(struct ethhdr);
         if ((void *)ip6 + sizeof(*ip6) > data_end) return XDP_PASS;
         if (ip6->nexthdr != IPPROTO_TCP) return XDP_PASS;

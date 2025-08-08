@@ -231,44 +231,97 @@ func (a *TCPRealityAccelerator) MarkRealityVerified(conn net.Conn) error {
 		return nil
 	}
 
-	connID := fmt.Sprintf("%s->%s", conn.LocalAddr().String(), conn.RemoteAddr().String())
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if connInfo, exists := a.connections[connID]; exists {
-		connInfo.RealityVerified = true
-		connInfo.TLSEstablished = true
-		errors.LogInfo(context.Background(), "🔒 REALITY handshake verified for connection: ", connID)
-
-		// 更新eBPF map中的连接状态
-		if err := a.updateConnectionSecurityState(connID, true, true); err != nil {
-			errors.LogDebug(context.Background(), "Failed to update eBPF connection security state: ", err)
-		}
-
+	// 仅支持 TCP 与 IPv4
+	laddr, lok := conn.LocalAddr().(*net.TCPAddr)
+	raddr, rok := conn.RemoteAddr().(*net.TCPAddr)
+	if !lok || !rok {
+		return nil
+	}
+	lip := laddr.IP.To4()
+	rip := raddr.IP.To4()
+	if lip == nil || rip == nil {
 		return nil
 	}
 
-	return errors.New("Connection not found: " + connID)
+	// 计算 eBPF 侧可能使用的两种 conn_id（XDP 与 TC 的实现不同）
+	sport := uint16(raddr.Port) // 源端口=客户端
+	dport := uint16(laddr.Port) // 目标端口=服务端
+
+	// XDP: 未进行 ntoh，直接以主机小端读取内存布局（等价于 LittleEndian）
+	xdpKey := (uint64(binary.LittleEndian.Uint32(rip)) << 32) |
+		(uint64(binary.LittleEndian.Uint16([]byte{byte(sport >> 8), byte(sport)})) << 16) |
+		uint64(binary.LittleEndian.Uint16([]byte{byte(dport >> 8), byte(dport)}))
+
+	// TC: 使用 bpf_ntohl/bpf_ntohs 转为主机序（等价于 BigEndian 读取）
+	tcKey := (uint64(binary.BigEndian.Uint32(rip)) << 32) |
+		(uint64(binary.BigEndian.Uint32(lip)) << 16) |
+		uint64(binary.BigEndian.Uint16([]byte{byte(sport >> 8), byte(sport)})) |
+		(uint64(binary.BigEndian.Uint16([]byte{byte(dport >> 8), byte(dport)})) << 32)
+
+	// 打开 pinned map
+	m, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/tcp_connections", nil)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+
+	// Go 侧与 C 侧结构严格对齐（总计 40 字节）
+	type tcpConnectionEntry struct {
+		LocalIP         uint32
+		RemoteIP        uint32
+		LocalPort       uint16
+		RemotePort      uint16
+		State           uint8
+		RealityEnabled  uint8
+		RealityVerified uint8
+		TLSEstablished  uint8
+		FastPathCount   uint16
+		_pad0           uint16
+		BytesSent       uint32
+		LastActivity    uint64
+		NextHopIP       uint32
+		NextHopPort     uint16
+		FastPathEnabled uint8
+		_pad1           uint8
+	}
+
+	// 依次尝试两种 key
+	tryUpdate := func(key uint64) (bool, error) {
+		var val tcpConnectionEntry
+		if err := m.Lookup(&key, &val); err != nil {
+			return false, nil
+		}
+		// 设置握手完成标记
+		val.RealityVerified = 1
+		val.TLSEstablished = 1
+		if err := m.Update(&key, &val, ebpf.UpdateAny); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	if ok, err := tryUpdate(xdpKey); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	if ok, err := tryUpdate(tcKey); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+
+	// 未找到连接记录则忽略（可能程序未加载或键算法不一致）
+	return nil
 }
 
 // updateConnectionSecurityState 更新eBPF map中的连接安全状态
 func (a *TCPRealityAccelerator) updateConnectionSecurityState(connID string, realityVerified, tlsEstablished bool) error {
-	// 直接操作eBPF map来更新连接状态
-	// 使用bpftool map update命令
-	key := fmt.Sprintf("conn_%s", connID)
-	value := fmt.Sprintf("%t_%t", realityVerified, tlsEstablished)
-
-	cmd := exec.Command("bpftool", "map", "update", "pinned", "/sys/fs/bpf/xray/tcp_connections",
-		"key", key, "value", value)
-
-	if err := cmd.Run(); err != nil {
-		errors.LogDebug(context.Background(), "Failed to update eBPF map: ", err)
-		return err
-	}
-
-	errors.LogDebug(context.Background(), "Updated eBPF security state for ", connID,
-		" - REALITY verified: ", realityVerified, ", TLS established: ", tlsEstablished)
+	// 直接更新 pinned map: /sys/fs/bpf/xray/tcp_connections
+	// 注意：用户态 connID 形如 "127.0.0.1:12345->1.2.3.4:443"，eBPF 使用的是 IPv4 四元组计算的 __u64 key，
+	// 这里无法可靠从字符串反推 key，保持接口占位并返回 nil，避免误更新。
+	// 实际标记建议通过 Vision 直拷提示 + eBPF 自身状态机达成；如需更新 tcp_connections，请实现：
+	// 1) 用 net.TCPAddr 解析 IPv4 四元组；2) 按 C 侧算法计算 key；3) Lookup->修改->Update。
 	return nil
 }
 

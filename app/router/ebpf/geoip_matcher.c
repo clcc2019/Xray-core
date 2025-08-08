@@ -74,8 +74,8 @@ struct {
     __type(value, __u32);  // policy_id
 } route_geoip_v4_hint SEC(".maps");
 
-// 简单的字符串哈希函数
-static __always_inline __u32 hash_string(const char *str, int len) {
+// 简单的字符串哈希函数（可能未使用）
+static __always_inline __attribute__((unused)) __u32 hash_string(const char *str, int len) {
     __u32 hash = 5381;
     for (int i = 0; i < len && i < 32; i++) {
         hash = ((hash << 5) + hash) + str[i];
@@ -83,14 +83,14 @@ static __always_inline __u32 hash_string(const char *str, int len) {
     return hash;
 }
 
-// 检查IPv4地址是否在CIDR范围内
-static __always_inline int check_ipv4_cidr(__u32 ip, __u32 network, __u8 prefix_len) {
+// 检查IPv4地址是否在CIDR范围内（可能未使用）
+static __always_inline __attribute__((unused)) int check_ipv4_cidr(__u32 ip, __u32 network, __u8 prefix_len) {
     __u32 mask = 0xFFFFFFFF << (32 - prefix_len);
     return (ip & mask) == (network & mask);
 }
 
-// 检查IPv6地址是否在CIDR范围内
-static __always_inline int check_ipv6_cidr(const __u64 *ip, const __u64 *network, __u8 prefix_len) {
+// 检查IPv6地址是否在CIDR范围内（可能未使用）
+static __always_inline __attribute__((unused)) int check_ipv6_cidr(const __u64 *ip, const __u64 *network, __u8 prefix_len) {
     if (prefix_len <= 64) {
         __u64 mask = 0xFFFFFFFFFFFFFFFFULL << (64 - prefix_len);
         return (ip[0] & mask) == (network[0] & mask);
@@ -132,8 +132,8 @@ static __always_inline __u8 match_ipv4_geoip(__u32 ip) {
     return 0; // 未匹配
 }
 
-// IPv6 GeoIP匹配
-static __always_inline __u8 match_ipv6_geoip(const __u64 *ip) {
+// IPv6 GeoIP匹配（可能未使用）
+static __always_inline __attribute__((unused)) __u8 match_ipv6_geoip(const __u64 *ip) {
     // 检查IPv6映射表
     struct geoip_v6_entry *entry = bpf_map_lookup_elem(&geoip_v6_map, &ip[0]);
     if (entry && entry->low == ip[1]) {

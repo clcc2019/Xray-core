@@ -467,3 +467,18 @@ func (xvm *XTLSVisionManager) IsDirectCopyEnabledIPv4(srcIP uint32, srcPort uint
 	}
 	return false
 }
+
+// SetDirectCopyHintIPv4 设置/清除指定 IPv4 四元组的直拷提示（与 eBPF 侧 conn_id 一致）
+// enabled=true 时写入 1，false 时删除 key。
+func (xvm *XTLSVisionManager) SetDirectCopyHintIPv4(srcIP uint32, srcPort uint16, dstIP uint32, dstPort uint16, enabled bool) error {
+	if !xvm.enabled || xvm.directCopyHint == nil {
+		return nil
+	}
+	// 与 eBPF 侧保持一致的 conn_id 计算
+	connID := (uint64(srcIP) << 32) | uint64(dstIP) | (uint64(srcPort) << 48) | (uint64(dstPort) << 32)
+	if enabled {
+		one := uint8(1)
+		return xvm.directCopyHint.Update(&connID, &one, ebpf.UpdateAny)
+	}
+	return xvm.directCopyHint.Delete(&connID)
+}
