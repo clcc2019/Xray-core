@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
+	transportebpf "github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 )
 
 var cmdRun = &base.Command{
@@ -81,6 +82,9 @@ func executeRun(cmd *base.Command, args []string) {
 		// Configuration error. Exit with a special value to prevent systemd from restarting.
 		os.Exit(23)
 	}
+
+	// Initialize TCP CC eBPF policy (Linux only; no-op elsewhere)
+	_ = transportebpf.InitDefaultTCPCCPolicy()
 
 	if *test {
 		fmt.Println("Configuration OK.")

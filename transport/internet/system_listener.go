@@ -12,6 +12,7 @@ import (
 
 	"github.com/pires/go-proxyproto"
 	"github.com/sagernet/sing/common/control"
+	ebpfhooks "github.com/xtls/xray-core/common/ebpfhooks"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 )
@@ -168,6 +169,10 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 	}
 
 	l, err = callback(lc.Listen(ctx, network, address))
+	// Register listen port to Socket Direct BPF (best-effort on Linux)
+	if err == nil {
+		ebpfhooks.HookListen(addr)
+	}
 	if err == nil && sockopt != nil && sockopt.AcceptProxyProtocol {
 		policyFunc := func(upstream net.Addr) (proxyproto.Policy, error) { return proxyproto.REQUIRE, nil }
 		l = &proxyproto.Listener{Listener: l, Policy: policyFunc}
