@@ -173,7 +173,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
-	
+
 	// 启用eBPF加速
 	EnableEBPFAcceleration(ctx, conn)
 
@@ -221,18 +221,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to process request").Base(err)
-		}
-
-		// 记录Cilium eBPF统计
+		// 在复制前启动 eBPF 统计，覆盖完整请求阶段
 		if os.Getenv("XRAY_EBPF") == "1" {
 			if accelerator := ebpf.GetProxyAccelerator(); accelerator != nil && accelerator.IsEnabled() {
 				if tcpConn, ok := conn.(*net.TCPConn); ok {
-					// 启动Cilium统计记录
 					go recordConnectionStats(ctx, tcpConn, accelerator)
 				}
 			}
+		}
+
+		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+			return errors.New("failed to process request").Base(err)
 		}
 
 		return nil
@@ -249,6 +248,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			if !isTLSConn(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 				return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
+			} else {
+				// TLS 场景，通知加速器用于统计/策略
+				if os.Getenv("XRAY_EBPF") == "1" {
+					if accelerator := ebpf.GetProxyAccelerator(); accelerator != nil && accelerator.IsEnabled() {
+						sni := ""
+						if destination.Address.Family().IsDomain() {
+							sni = destination.Address.String()
+						} else {
+							sni = destination.String()
+						}
+						_ = accelerator.EnableTLSOptimization(conn, sni)
+					}
+				}
 			}
 		}
 		var reader buf.Reader

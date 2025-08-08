@@ -13,7 +13,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	tcpEbpf "github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -121,13 +120,7 @@ func (v *Listener) keepAccepting() {
 			if v.authConfig != nil {
 				conn = v.authConfig.Server(conn)
 			}
-			// 入站连接注册到 sockmap（最佳努力，不影响连接）
-			if sm := tcpEbpf.GetSockmapManager(); sm != nil && sm.IsEnabled() {
-				if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-					sid := uint64(uint32(time.Now().UnixNano()))<<32 | uint64(uint16(tcpAddr.Port))
-					_ = sm.RegisterPair(conn, sid, 1)
-				}
-			}
+
 			v.addConn(stat.Connection(conn))
 		}()
 	}

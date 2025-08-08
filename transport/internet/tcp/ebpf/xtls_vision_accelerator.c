@@ -4,6 +4,7 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
 #include <linux/string.h>
 #include <linux/pkt_cls.h>
@@ -62,8 +63,8 @@ struct {
 } xtls_inbound_connections SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1000);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
     __type(key, __u32);    // 统计ID (0)
     __type(value, struct xtls_vision_stats);
 } xtls_stats SEC(".maps");
@@ -91,6 +92,27 @@ struct {
     __type(key, __u32);    // 事件类型
     __type(value, __u64);  // 事件计数
 } security_events SEC(".maps");
+
+// 事件 RingBuf（用于用户态消费关键事件）
+struct xtls_event {
+    __u32 type;   // 1: reality_handshake, 2: tls_complete, 3: vision_active
+    __u64 conn_id;
+    __u64 ts_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20); // 1MB ring buffer
+} xtls_vision_events SEC(".maps");
+
+static __always_inline void emit_xtls_event(__u32 type, __u64 conn_id) {
+    struct xtls_event *e = bpf_ringbuf_reserve(&xtls_vision_events, sizeof(*e), 0);
+    if (!e) return;
+    e->type = type;
+    e->conn_id = conn_id;
+    e->ts_ns = bpf_ktime_get_ns();
+    bpf_ringbuf_submit(e, 0);
+}
 
 // 用户UUID白名单
 struct {
@@ -124,48 +146,34 @@ static __always_inline __u64 get_uuid_hash(const __u8 *uuid) {
 static __always_inline void update_stats(__u32 stat_type) {
     __u32 key = 0;
     struct xtls_vision_stats *stats = bpf_map_lookup_elem(&xtls_stats, &key);
-    if (!stats) {
-        struct xtls_vision_stats new_stats = {0};
-        bpf_map_update_elem(&xtls_stats, &key, &new_stats, BPF_ANY);
-        stats = bpf_map_lookup_elem(&xtls_stats, &key);
-    }
     if (stats) {
         switch (stat_type) {
             case 0: // total_inbound_connections
                 stats->total_inbound_connections++;
-                bpf_trace_printk("XTLS_EBPF: New inbound connection detected\n", 1);
                 break;
             case 1: // reality_connections
                 stats->reality_connections++;
-                bpf_trace_printk("XTLS_EBPF: REALITY handshake detected and optimized\n", 1);
                 break;
             case 2: // vision_connections
                 stats->vision_connections++;
-                bpf_trace_printk("XTLS_EBPF: XTLS Vision connection activated\n", 1);
                 break;
             case 3: // handshake_count
                 stats->handshake_count++;
-                bpf_trace_printk("XTLS_EBPF: TLS handshake completed with acceleration\n", 1);
                 break;
             case 4: // splice_count
                 stats->splice_count++;
-                bpf_trace_printk("XTLS_EBPF: Zero-copy splice operation performed\n", 1);
                 break;
             case 5: // vision_packets
                 stats->vision_packets++;
-                bpf_trace_printk("XTLS_EBPF: Vision packet processed with eBPF acceleration\n", 1);
                 break;
             case 6: // zero_copy_packets
                 stats->zero_copy_packets++;
-                bpf_trace_printk("XTLS_EBPF: Zero-copy packet forwarding (XDP_TX)\n", 1);
                 break;
             case 7: // padding_optimized
                 stats->padding_optimized++;
-                bpf_trace_printk("XTLS_EBPF: Padding optimization applied\n", 1);
                 break;
             case 8: // command_parsed
                 stats->command_parsed++;
-                bpf_trace_printk("XTLS_EBPF: Vision command parsed successfully\n", 1);
                 break;
         }
     }
@@ -426,24 +434,21 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     
     struct ethhdr *eth = data;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return XDP_PASS;
+
+    // IPv4 分支
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr *ip = data + sizeof(struct ethhdr);
+        if ((void *)ip + sizeof(*ip) > data_end) return XDP_PASS;
+        if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+        struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+        if ((void *)tcp + sizeof(*tcp) > data_end) return XDP_PASS;
+        if (tcp->dest != bpf_htons(443)) return XDP_PASS;
     
-    struct iphdr *ip = data + sizeof(struct ethhdr);
-    if (ip->protocol != IPPROTO_TCP)
-        return XDP_PASS;
+        // 计算连接标识符
+        __u64 conn_id = get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest);
     
-    struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
-    
-    // 只处理目标端口443的流量（REALITY服务端入站）
-    if (tcp->dest != bpf_htons(443))
-        return XDP_PASS;
-    
-    // 计算连接标识符
-    __u64 conn_id = get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest);
-    
-    // 查找连接状态
-    struct xtls_vision_inbound *conn = bpf_map_lookup_elem(&xtls_inbound_connections, &conn_id);
+        // 查找连接状态
+        struct xtls_vision_inbound *conn = bpf_map_lookup_elem(&xtls_inbound_connections, &conn_id);
     
     // 处理SYN包 - 创建新入站连接
     if (tcp->syn && !tcp->ack) {
@@ -527,18 +532,16 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
         // 检测TLS握手完成 - 增强状态机安全验证
         if (conn->state == 1) {
             // 检查是否有TLS Application Data
-            if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + 5 <= data_end) {
+            if ((void *)(tcp + 1) + 5 <= data_end) {
                 const unsigned char *ptr = (const unsigned char*)(tcp + 1);
                 if (ptr[0] == 0x17) { // Application Data
                     conn->state = 2; // tls_handshake
                     conn->reality_verified = 1;
-                    bpf_trace_printk("XTLS_EBPF: TLS handshake completed, Application Data detected\n", 1);
+                    emit_xtls_event(2, conn_id);
                 } else if (ptr[0] == 0x16) { // Handshake
                     // 正常的TLS握手过程，继续等待
-                    bpf_trace_printk("XTLS_EBPF: TLS handshake in progress\n", 1);
                 } else {
                     // 状态机攻击检测：在reality_handshake状态收到非TLS数据
-                    bpf_trace_printk("XTLS_EBPF: State machine attack detected in reality_handshake state\n", 1);
                     return XDP_DROP; // 丢弃可疑数据包
                 }
             }
@@ -551,12 +554,12 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
             conn->handshake_time = get_current_time();
             update_stats(2); // vision_connections
             update_stats(3); // handshake_count
-            bpf_trace_printk("XTLS_EBPF: XTLS Vision protocol detected and activated\n", 1);
+            emit_xtls_event(3, conn_id);
             
             // 解析Vision头部并优化padding
             if (parse_vision_header(tcp + 1, data_end, conn)) {
                 optimize_xtls_padding(tcp + 1, data_end, conn);
-                bpf_trace_printk("XTLS_EBPF: Vision header parsed and padding optimized\n", 1);
+            // padding 优化事件无需频繁打印
             }
         }
         
@@ -570,12 +573,9 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
         
         // 优化Vision数据包 - 增强性能优化
         if (conn->vision_enabled) {
-            bpf_trace_printk("XTLS_EBPF: Vision packet optimization triggered\n", 1);
-            
             // 增强零拷贝优化：根据连接状态和padding比例决定
             if (conn->parsing_state == 2 || conn->parsing_state == 4) {
                 // 直接复制模式或极端padding优化模式
-                bpf_trace_printk("XTLS_EBPF: Zero-copy mode activated for connection\n", 1);
                 return XDP_TX; // 零拷贝转发
             }
             
@@ -583,13 +583,11 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
             // 1. 对于高频复用连接，优先使用零拷贝
             __u32 *reuse_count = bpf_map_lookup_elem(&connection_reuse_stats, &conn_id);
             if (reuse_count && *reuse_count > 5) {
-                bpf_trace_printk("XTLS_EBPF: High-reuse connection, enabling zero-copy\n", 1);
                 return XDP_TX; // 零拷贝转发
             }
             
             // 2. 对于低padding比例连接，启用零拷贝
             if (conn->padding_len < conn->content_len) {
-                bpf_trace_printk("XTLS_EBPF: Low padding ratio, enabling zero-copy\n", 1);
                 return XDP_TX; // 零拷贝转发
             }
             
@@ -603,6 +601,18 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
         } else {
             conn->bytes_sent += packet_size;
         }
+    }
+    // IPv6 分支（基础支持：识别并统计，保持转发）
+    else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        struct ipv6hdr *ip6 = data + sizeof(struct ethhdr);
+        if ((void *)ip6 + sizeof(*ip6) > data_end) return XDP_PASS;
+        if (ip6->nexthdr != IPPROTO_TCP) return XDP_PASS;
+        struct tcphdr *tcp6 = (void *)ip6 + sizeof(*ip6);
+        if ((void *)tcp6 + sizeof(*tcp6) > data_end) return XDP_PASS;
+        if (tcp6->dest != bpf_htons(443)) return XDP_PASS;
+
+        update_stats(5); // 计一次 vision_packets，作为基础统计
+        return XDP_PASS;
     }
     
     return XDP_PASS;
