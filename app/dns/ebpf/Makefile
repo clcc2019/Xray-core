@@ -9,12 +9,14 @@ INCLUDES = -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu
 DNS_CACHE_TARGET = dns_cache.o
 DNS_ACCELERATOR_TARGET = dns_accelerator.o
 DNS_ACCELERATOR_SIMPLE_TARGET = dns_accelerator_simple.o
-TARGETS = $(DNS_CACHE_TARGET) $(DNS_ACCELERATOR_TARGET) $(DNS_ACCELERATOR_SIMPLE_TARGET)
+DNS_ROUTER_TC_TARGET = dns_router_tc.o
+TARGETS = $(DNS_CACHE_TARGET) $(DNS_ACCELERATOR_TARGET) $(DNS_ACCELERATOR_SIMPLE_TARGET) $(DNS_ROUTER_TC_TARGET)
 
 # 源文件
 DNS_CACHE_SOURCES = dns_cache.c
 DNS_ACCELERATOR_SOURCES = dns_accelerator.c
 DNS_ACCELERATOR_SIMPLE_SOURCES = dns_accelerator_simple.c
+DNS_ROUTER_TC_SOURCES = dns_router_tc.c
 
 # 默认目标
 all: $(TARGETS)
@@ -37,6 +39,11 @@ $(DNS_ACCELERATOR_TARGET): $(DNS_ACCELERATOR_SOURCES)
 $(DNS_ACCELERATOR_SIMPLE_TARGET): $(DNS_ACCELERATOR_SIMPLE_SOURCES)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $<
 	@echo "✅ DNS Accelerator Simple eBPF program compiled successfully"
+
+# 编译 DNS TC 路由/异常检测程序
+$(DNS_ROUTER_TC_TARGET): $(DNS_ROUTER_TC_SOURCES)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $<
+	@echo "✅ DNS Router TC eBPF program compiled successfully"
 
 # 生成Go代码（需要bpf2go工具）
 generate:

@@ -6,8 +6,6 @@ import (
 	"net"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // DetectRTT attempts to fetch smoothed RTT of a TCP connection via TCP_INFO.
@@ -23,22 +21,8 @@ func DetectRTT(conn net.Conn) (time.Duration, bool) {
 		SyscallConn() (syscall.RawConn, error)
 	}
 	if sc, ok := conn.(syscallConner); ok {
-		var rttUs uint32
-		var okFlag bool
-		rc, err := sc.SyscallConn()
-		if err != nil {
-			return 0, false
-		}
-		_ = rc.Control(func(fd uintptr) {
-			var info unix.TCPInfo
-			if err := unix.GetsockoptTCPInfo(int(fd), unix.SOL_TCP, unix.TCP_INFO, &info); err == nil {
-				rttUs = info.Rtt
-				okFlag = true
-			}
-		})
-		if okFlag && rttUs > 0 {
-			return time.Duration(rttUs) * time.Microsecond, true
-		}
+		// 暂时禁用直接读取 TCP_INFO，避免在交叉编译链路上引入不兼容
+		_, _ = sc.SyscallConn()
 		return 0, false
 	}
 

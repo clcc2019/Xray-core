@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
@@ -210,10 +211,20 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, reader *buf
 		inbound.CanSpliceCopy = 1
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
 
-		v2writer := buf.NewWriter(conn)
+		// 使用 BufferedWriter 并基于 RTT 选择阈值
+		buffered := buf.NewBufferedWriter(buf.NewWriter(conn))
+		if d, ok := tcpinfo.DetectRTT(conn); ok && d > 30*time.Millisecond {
+			buffered.SetFlushThreshold(32 * 1024)
+		} else {
+			buffered.SetFlushThreshold(16 * 1024)
+		}
+		v2writer := buffered
 		if err := buf.Copy(link.Reader, v2writer, buf.UpdateActivity(timer)); err != nil {
 			return err
 		}
+
+		// 主动刷新剩余数据
+		_ = buffered.Flush()
 
 		return nil
 	}

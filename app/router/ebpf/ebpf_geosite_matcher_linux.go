@@ -33,18 +33,20 @@ type EBpfGeoSiteMatcher struct {
 	maps        map[string]interface{}
 
 	// 域名缓存（动态模式下只缓存热点域名）
-	domainCache map[string]uint8
+	domainCache     map[string]uint8
+	maxCacheEntries int
 }
 
 // NewEBpfGeoSiteMatcher 创建新的eBPF GeoSite匹配器（Linux专用）
 func NewEBpfGeoSiteMatcher(countryCode string, dynamicMode bool) (*EBpfGeoSiteMatcher, error) {
 	matcher := &EBpfGeoSiteMatcher{
-		countryCode:  countryCode,
-		reverseMatch: false, // 动态模式下默认不反向匹配
-		dynamicMode:  dynamicMode,
-		enabled:      false,
-		maps:         make(map[string]interface{}),
-		domainCache:  make(map[string]uint8),
+		countryCode:     countryCode,
+		reverseMatch:    false, // 动态模式下默认不反向匹配
+		dynamicMode:     dynamicMode,
+		enabled:         false,
+		maps:            make(map[string]interface{}),
+		domainCache:     make(map[string]uint8),
+		maxCacheEntries: 20000,
 	}
 
 	// 根据模式选择不同的eBPF程序
@@ -83,15 +85,15 @@ func (m *EBpfGeoSiteMatcher) AddDomain(domain string, siteCode uint8) error {
 	m.Lock()
 	defer m.Unlock()
 
-	// 动态模式下不预加载规则，只在运行时学习
+	// 动态模式下不预加载规则：但保留一次性预热能力（填入内存缓存），便于快速验证
 	if m.dynamicMode {
-		// 动态模式：不预加载，静默忽略
+		m.putCache(strings.ToLower(domain), siteCode)
 		return nil
 	}
 
 	// 传统模式：在真正的实现中，这里会更新eBPF map
 	// 简化实现：使用内存缓存
-	m.domainCache[strings.ToLower(domain)] = siteCode
+	m.putCache(strings.ToLower(domain), siteCode)
 
 	errors.LogDebug(context.Background(), "Added domain rule: ", domain, " -> ", siteCode)
 	return nil
@@ -149,15 +151,15 @@ func (m *EBpfGeoSiteMatcher) MatchDomain(domain string) (bool, error) {
 	m.totalQueries++
 	domain = strings.ToLower(domain)
 
-	// 检查缓存
+	// 检查缓存（正/负缓存）
 	if siteCode, exists := m.domainCache[domain]; exists {
 		m.cacheHitCount++
-		// 在这里应该根据countryCode和reverseMatch进行判断
-		// 简化实现：假设匹配成功
 		if siteCode > 0 {
 			m.domainMatchCount++
 			return !m.reverseMatch, nil
 		}
+		// 负缓存命中：视为未匹配
+		return m.reverseMatch, nil
 	}
 
 	m.cacheMissCount++
@@ -167,9 +169,13 @@ func (m *EBpfGeoSiteMatcher) MatchDomain(domain string) (bool, error) {
 	matched := m.simpleMatch(domain)
 	if matched {
 		m.domainMatchCount++
+		// 学习：正缓存
+		m.putCache(domain, 1)
 		return !m.reverseMatch, nil
 	}
 
+	// 学习：负缓存
+	m.putCache(domain, 0)
 	return m.reverseMatch, nil
 }
 
@@ -192,6 +198,23 @@ func (m *EBpfGeoSiteMatcher) simpleMatch(domain string) bool {
 	default:
 		return false
 	}
+}
+
+// putCache 写入缓存，带简单容量保护（近似 LRU：溢出时随机删若干项）
+func (m *EBpfGeoSiteMatcher) putCache(domain string, siteCode uint8) {
+	// 容量保护
+	if len(m.domainCache) >= m.maxCacheEntries {
+		// 随机移除 ~0.5% 项，避免全表扫描
+		evict := 1 + m.maxCacheEntries/200
+		for d := range m.domainCache {
+			delete(m.domainCache, d)
+			evict--
+			if evict <= 0 {
+				break
+			}
+		}
+	}
+	m.domainCache[domain] = siteCode
 }
 
 // IsEnabled 检查eBPF是否启用

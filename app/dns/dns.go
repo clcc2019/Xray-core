@@ -191,9 +191,8 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		return nil, 0, errors.New("empty domain name")
 	}
 
-	// 🚀 DNS eBPF加速查询
+	// 🚀 DNS eBPF加速查询（仅在启用时快速路径）
 	if dnsAccelerator, err := ebpf.NewDNSAccelerator(); err == nil && dnsAccelerator.IsEnabled() {
-		// 尝试从eBPF缓存快速获取
 		if result, err := dnsAccelerator.QueryDomain(domain, ebpf.DNSTypeA); err == nil && result.CacheHit {
 			errors.LogDebug(s.ctx, "DNS eBPF cache hit for domain: ", domain)
 			return result.IPs, result.TTL, nil
@@ -251,15 +250,7 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 				ttl = 1
 			}
 
-			// 🚀 缓存DNS响应到eBPF
-			if dnsAccelerator, err := ebpf.NewDNSAccelerator(); err == nil && dnsAccelerator.IsEnabled() {
-				// 异步缓存，不阻塞查询
-				go func() {
-					if _, err := dnsAccelerator.QueryDomain(domain, ebpf.DNSTypeA); err == nil {
-						errors.LogDebug(s.ctx, "DNS response cached for domain: ", domain)
-					}
-				}()
-			}
+			// 🚀 可选：将结果写回 eBPF 缓存（占坑，真实写回需 map 写接口）。
 
 			return ips, ttl, nil
 		}

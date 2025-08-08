@@ -92,14 +92,15 @@ done
 
 # 复制eBPF源文件
 log_info "复制eBPF源文件..."
-mkdir -p $BUILD_DIR/{app/{dns,router,stats},transport/internet/tcp,proxy}
+mkdir -p $BUILD_DIR/app/dns $BUILD_DIR/app/router $BUILD_DIR/app/stats $BUILD_DIR/transport/internet $BUILD_DIR/transport/internet/tcp $BUILD_DIR/proxy
 
-    cp -r app/dns/ebpf $BUILD_DIR/app/dns/
-    cp -r app/router/ebpf $BUILD_DIR/app/router/
-    cp -r app/stats/ebpf $BUILD_DIR/app/stats/
-    cp -r transport/internet/ebpf $BUILD_DIR/transport/internet/
-    cp -r transport/internet/tcp/ebpf $BUILD_DIR/transport/internet/tcp/
-    cp -r proxy/ebpf $BUILD_DIR/proxy/
+# 分别拷贝（不存在则跳过，不中断）
+[ -d app/dns/ebpf ] && cp -r app/dns/ebpf $BUILD_DIR/app/dns/ || true
+[ -d app/router/ebpf ] && cp -r app/router/ebpf $BUILD_DIR/app/router/ || true
+[ -d app/stats/ebpf ] && cp -r app/stats/ebpf $BUILD_DIR/app/stats/ || true
+[ -d transport/internet/ebpf ] && cp -r transport/internet/ebpf $BUILD_DIR/transport/internet/ || true
+[ -d transport/internet/tcp/ebpf ] && cp -r transport/internet/tcp/ebpf $BUILD_DIR/transport/internet/tcp/ || true
+[ -d proxy/ebpf ] && cp -r proxy/ebpf $BUILD_DIR/proxy/ || true
 
 # 创建优化的eBPF挂载脚本
 log_info "创建eBPF挂载脚本..."
@@ -139,20 +140,17 @@ fi
 # 清理函数
 cleanup_ebpf() {
     log_info "清理历史eBPF程序..."
-    
+    mkdir -p $BPF_ROOT
+    # 尝试卸载 tc 过滤器
+    if command -v tc >/dev/null 2>&1; then
+      IFACES=$(ip -o link show | awk -F': ' '{print $2}')
+      for IF in $IFACES; do
+        tc filter del dev "$IF" ingress 2>/dev/null || true
+        tc qdisc del dev "$IF" clsact 2>/dev/null || true
+      done
+    fi
     # 清理pinned文件
     rm -rf $BPF_ROOT/* 2>/dev/null || true
-    
-    # 清理程序
-    for pattern in "xray" "dns" "geo" "tcp" "proxy" "congestion"; do
-        bpftool prog show 2>/dev/null | grep "$pattern" | awk '{print $1}' | sed 's/://' | while read id; do
-            if [ -n "$id" ] && [ "$id" != "0" ]; then
-                bpftool prog unload id "$id" 2>/dev/null || true
-            fi
-        done
-    done
-    
-    mkdir -p $BPF_ROOT
     log_success "历史eBPF程序清理完成"
 }
 
@@ -171,7 +169,7 @@ check_dependencies() {
     
     # 检查必要工具
     local missing_deps=""
-    for tool in clang llvm-config make bpftool; do
+    for tool in clang llvm-config make bpftool tc ip; do
         if ! command -v $tool >/dev/null 2>&1; then
             missing_deps="$missing_deps $tool"
         fi
@@ -185,56 +183,44 @@ check_dependencies() {
         log_warning "需要安装依赖: $missing_deps"
         apt update
         apt install -y clang llvm make gcc-multilib libc6-dev-i386 \
-            linux-headers-$(uname -r) libbpf-dev
+            linux-headers-$(uname -r) libbpf-dev iproute2
     fi
     
     touch "$CACHE_FILE"
     log_success "依赖检查完成"
 }
 
-# 编译eBPF程序
+# 编译eBPF程序（按目录通配）
 compile_ebpf() {
     log_info "编译eBPF程序..."
-    
     local build_root=$(pwd)
     local success_count=0
     local total_count=0
-    
-    # 编译函数
     compile_program() {
         local dir=$1
-        local pattern=$2
-        local name=$3
-        
         if [ -d "$dir" ]; then
             cd "$dir"
-            make clean 2>/dev/null || true
-            
-            for file in $pattern; do
-                if [ -f "$file" ]; then
-                    total_count=$((total_count + 1))
-                    if clang -O2 -g -Wall -target bpf -c -fno-stack-protector \
-                        -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o "${file%.c}.o" "$file" 2>/dev/null; then
-                        log_success "$name 编译成功"
-                        success_count=$((success_count + 1))
-                    else
-                        log_warning "$name 编译失败"
-                    fi
+            make -s clean 2>/dev/null || true
+            for file in *.c; do
+                [ -f "$file" ] || continue
+                total_count=$((total_count + 1))
+                if clang -O2 -g -Wall -target bpf -c -fno-stack-protector \
+                    -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o "${file%.c}.o" "$file" 2>/dev/null; then
+                    log_success "$dir/$file 编译成功"
+                    success_count=$((success_count + 1))
+                else
+                    log_warning "$dir/$file 编译失败"
                 fi
             done
             cd "$build_root"
         fi
     }
-    
-    # 编译各模块
-    compile_program "app/dns/ebpf" "*.c" "DNS eBPF程序"
-    compile_program "app/router/ebpf" "*.c" "路由eBPF程序"
-    compile_program "app/stats/ebpf" "*.c" "统计eBPF程序"
-    compile_program "transport/internet/ebpf" "*.c" "传输层eBPF程序"
-    compile_program "transport/internet/tcp/ebpf" "*.c" "TCP eBPF程序"
-
-    compile_program "proxy/ebpf" "*.c" "Proxy eBPF程序"
-    
+    compile_program "app/dns/ebpf"
+    compile_program "app/router/ebpf"
+    compile_program "app/stats/ebpf"
+    compile_program "transport/internet/ebpf"
+    compile_program "transport/internet/tcp/ebpf"
+    compile_program "proxy/ebpf"
     log_success "eBPF编译完成: $success_count/$total_count 成功"
 }
 
@@ -301,25 +287,69 @@ load_ebpf() {
     
     log_info "使用网络接口: $interface_name"
     
+    # 通用加载：XDP 使用 prog load + ip link；TC 使用 prog loadall 并 pin maps，然后 attach_tc 使用 pinned
+    load_xdp() {
+      local obj=$1; local pinned_name=$2
+      if [ -f "$obj" ]; then
+        if bpftool prog load "$obj" "$BPF_ROOT/$pinned_name" type xdp 2>/dev/null; then
+          log_success "$pinned_name 加载成功 (XDP)"
+          if ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" 2>/dev/null; then
+            log_success "$pinned_name 附加到 $interface_name 成功 (原生XDP)"
+          elif ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" mode skb 2>/dev/null; then
+            log_success "$pinned_name 附加到 $interface_name 成功 (通用XDP)"
+          else
+            log_warning "$pinned_name 附加到 $interface_name 失败"
+          fi
+        else
+          log_warning "$pinned_name 加载失败 (XDP)"
+        fi
+      fi
+    }
+
+    attach_tc() {
+      local obj_or_pinned=$1
+      local ifname=$2
+      local prio=${3:-60}
+      local handle=${4:-60}
+      local use_pinned=${5:-0}
+      tc qdisc add dev "$ifname" clsact 2>/dev/null || true
+      tc filter del dev "$ifname" ingress prio "$prio" 2>/dev/null || true
+      if [ "$use_pinned" = "1" ]; then
+        tc filter replace dev "$ifname" ingress prio "$prio" handle "$handle" bpf da pinned "$obj_or_pinned"
+      else
+        tc filter replace dev "$ifname" ingress prio "$prio" handle "$handle" bpf da obj "$obj_or_pinned" sec classifier
+      fi
+    }
+
+    load_tc_with_pinmaps() {
+      local obj=$1; local pinned_name=$2
+      if [ -f "$obj" ]; then
+        if bpftool prog loadall "$obj" "$BPF_ROOT/$pinned_name" pinmaps "$BPF_ROOT" 2>/dev/null; then
+          log_success "$pinned_name 加载成功 (TC, 已 pin maps)"
+          attach_tc "$BPF_ROOT/$pinned_name" "$interface_name" 60 60 1
+        else
+          log_warning "$pinned_name 加载失败 (TC)"
+        fi
+      fi
+    }
+
     # 加载各模块
-    load_program "app/dns/ebpf/dns_cache.o" "dns_cache_prog" "xdp" "" "$interface_name"
-    load_program "app/router/ebpf/geoip_matcher.o" "geoip_matcher" "xdp" "" "$interface_name"
-    load_program "app/router/ebpf/geosite_matcher.o" "geosite_matcher" "xdp" "" "$interface_name"
-    
-    # TCP+REALITY - 最重要的优化
-    load_program "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp" "xdp" "tcp_connections reality_sessions hot_connections tcp_reality_stats_map" "$interface_name"
-    load_program "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc" "classifier" "tcp_connections_tc stats_map_tc" ""
-    
-    # Proxy
-    load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp" "xdp" "proxy_connections tls_sessions proxy_stats_map" "$interface_name"
-    load_program "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_tc" "classifier" "" ""
-    
-    # XTLS Vision
-    load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_xdp" "xdp" "xtls_inbound_connections xtls_stats xtls_hot_connections" "$interface_name"
-    load_program "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc" "classifier" "" ""
-    
-    # TCP拥塞控制（简化版）
-    load_program "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp" "xdp" "tcp_basic_states basic_stats_map" "$interface_name"
+    load_xdp "app/dns/ebpf/dns_cache.o" "dns_cache_prog"
+    load_tc_with_pinmaps "app/dns/ebpf/dns_router_tc.o" "dns_router_tc"
+
+    load_xdp "app/router/ebpf/geoip_matcher.o" "geoip_matcher"
+    load_xdp "app/router/ebpf/geosite_matcher.o" "geosite_matcher"
+
+    load_xdp "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp"
+    load_tc_with_pinmaps "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc"
+
+    load_xdp "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp"
+    load_tc_with_pinmaps "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_tc"
+
+    load_xdp "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_xdp"
+    load_tc_with_pinmaps "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc"
+
+    load_xdp "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp"
 }
 
 # 设置权限
@@ -336,13 +366,12 @@ setup_permissions() {
 # 显示状态
 show_status() {
     log_info "eBPF程序状态:"
-    echo "   bpftool prog list | grep xray"
-    echo "   bpftool map list | grep xray"
+    bpftool prog list | grep -E "dns|xray|tcp|xtls|proxy" || true
+    bpftool map list | grep -E "dns|xray|tcp|xtls|proxy" || true
     
     log_info "部署命令:"
-    echo "   systemctl stop xray"
-    echo "   cp xray-linux-amd64-ebpf /usr/local/bin/xray"
-    echo "   systemctl start xray"
+    echo "   ip rule add fwmark 0x1 lookup 100; ip route add default via <DNS1-GW> table 100"
+    echo "   ip rule add fwmark 0x2 lookup 200; ip route add default via <DNS2-GW> table 200"
 }
 
 # 主流程

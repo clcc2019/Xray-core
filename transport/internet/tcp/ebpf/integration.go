@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/transport/internet"
 )
 
 var (
@@ -40,13 +39,7 @@ func InitAccelerator(ctx context.Context) error {
 	return nil
 }
 
-// AccelerateDialedConnection 为已拨号的连接启用加速
-// 注意：根据项目要求，eBPF优化主要针对服务端入站，客户端出站优化已禁用
-func AccelerateDialedConnection(ctx context.Context, conn net.Conn, streamSettings *internet.MemoryStreamConfig) error {
-	// 客户端出站eBPF优化已禁用，专注于服务端入站优化
-	// 保持函数接口不变，但内部实现为空，避免影响现有代码
-	return nil
-}
+// 注意：客户端出站 eBPF 优化已禁用，此处移除对 transport/internet 的依赖以避免导入环。
 
 // OptimizeRealityHandshake 优化REALITY握手过程
 // 注意：根据项目要求，eBPF优化主要针对服务端入站，客户端出站优化已禁用
