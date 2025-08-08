@@ -361,6 +361,11 @@ main "$@"
 EOF
 
 chmod +x $BUILD_DIR/mount-ebpf.sh
+# 覆盖为仓库中的增强版本，确保你对 build/mount-ebpf.sh 的修改生效
+if [ -f build/mount-ebpf.sh ]; then
+    cp build/mount-ebpf.sh $BUILD_DIR/mount-ebpf.sh
+    chmod +x $BUILD_DIR/mount-ebpf.sh
+fi
 
 # 创建部署脚本
 log_info "创建部署脚本..."

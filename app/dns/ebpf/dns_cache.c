@@ -8,26 +8,42 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// 简化的DNS响应数据结构
-struct dns_response {
-    __u32 ip;              // 单个IP地址
-    __u32 ttl;             // TTL值
-    __u64 expire_time;     // 过期时间戳
+// DNS A 记录缓存条目（IPv4）
+struct dns_response_v4 {
+    __u32 ip;              // IPv4 地址（网络序）
+    __u32 ttl;             // TTL（秒）
+    __u64 expire_time;     // 过期时间（秒）
 } __attribute__((packed));
 
-// DNS缓存映射表
+// DNS AAAA 记录缓存条目（IPv6）
+struct dns_response_v6 {
+    __u64 ip_high;         // IPv6 高 64 位（网络序）
+    __u64 ip_low;          // IPv6 低 64 位（网络序）
+    __u32 ttl;             // TTL（秒）
+    __u64 expire_time;     // 过期时间（秒）
+} __attribute__((packed));
+
+// DNS缓存映射表（IPv4，名称与用户态保持兼容）
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10000);
-    __type(key, __u32);    // 简化的域名哈希
-    __type(value, struct dns_response);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 50000);
+    __type(key, __u32);    // 域名哈希（FNV-1a 32bit）
+    __type(value, struct dns_response_v4);
 } dns_cache SEC(".maps");
 
-// DNS查询统计映射表
+// DNS缓存映射表（IPv6）
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 25000);
+    __type(key, __u32);    // 域名哈希（FNV-1a 32bit）
+    __type(value, struct dns_response_v6);
+} dns_cache_v6 SEC(".maps");
+
+// DNS查询统计映射表（按域名哈希计数）
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 5000);
-    __type(key, __u32);    // 简化的域名哈希
+    __uint(max_entries, 20000);
+    __type(key, __u32);    // 域名哈希
     __type(value, __u32);  // 查询次数
 } dns_stats SEC(".maps");
 
@@ -41,84 +57,86 @@ struct dns_header {
     __u16 arcount;
 };
 
-// 极简的字符串哈希函数 - 只处理前4个字节
-static __always_inline __u32 simple_hash(const char *str, int len) {
-    __u32 hash = 0;
-    int max_len = len > 4 ? 4 : len;
-    
-    // 手动展开，避免循环
-    if (max_len >= 1) hash = (hash << 8) | str[0];
-    if (max_len >= 2) hash = (hash << 8) | str[1];
-    if (max_len >= 3) hash = (hash << 8) | str[2];
-    if (max_len >= 4) hash = (hash << 8) | str[3];
-    
+// tolower（仅 A-Z）
+static __always_inline char lower_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c + 32;
+    return c;
+}
+
+// FNV-1a 32 位哈希（小缓冲）
+static __always_inline __u32 fnv1a32(const char *buf, int len) {
+    const __u32 FNV_PRIME = 16777619U;
+    __u32 hash = 2166136261U;
+    for (int i = 0; i < len && i < 128; i++) {
+        hash ^= (unsigned char)buf[i];
+        hash *= FNV_PRIME;
+    }
     return hash;
 }
 
-// 极简的DNS查询解析 - 只提取前16个字节作为域名标识
-static __always_inline int parse_dns_simple(const void *data, const void *data_end, 
-                                          char *domain, int max_len) {
-    const struct dns_header *dns = data;
-    if ((void*)(dns + 1) > data_end) {
-        return -1;
+// 仅计算 QNAME 的 FNV-1a 哈希，并读取 QTYPE（避免使用可变偏移栈访问）
+static __always_inline int parse_qname_hash_qtype(struct xdp_md *ctx, __u32 dns_start_off,
+                                                 __u32 *hash_out, __u16 *qtype_out) {
+    const __u32 FNV_PRIME = 16777619U;
+    __u32 hash = 2166136261U;
+    __u32 pos = 12;         // QNAME 相对 DNS 头起始偏移
+    __u32 limit = 160;      // 最大解析范围保护
+
+    // 最多解析 10 个 label，每个 label 最多读取 32 字节
+    #pragma clang loop unroll(disable)
+    for (int lbl = 0; lbl < 10; lbl++) {
+        if (pos + 1 > limit) return -1;
+        unsigned char labellen = 0;
+        if (bpf_xdp_load_bytes(ctx, dns_start_off + pos, &labellen, 1) < 0) return -1;
+        pos += 1;
+        if (labellen == 0) {
+            // 读取 QTYPE（网络序）
+            __u16 qtype_be = 0;
+            if (bpf_xdp_load_bytes(ctx, dns_start_off + pos, &qtype_be, sizeof(qtype_be)) < 0) return -1;
+            *qtype_out = (__u16)((qtype_be >> 8) | (qtype_be << 8));
+            *hash_out = hash;
+            return 0;
+        }
+        if (pos + labellen > limit) return -1;
+        #pragma clang loop unroll(disable)
+        for (int i = 0; i < 32; i++) {
+            if (i >= labellen) break;
+            unsigned char ch = 0;
+            if (bpf_xdp_load_bytes(ctx, dns_start_off + pos + i, &ch, 1) < 0) return -1;
+            char lc = lower_char((char)ch);
+            hash ^= (unsigned char)lc;
+            hash *= FNV_PRIME;
+        }
+        pos += labellen;
     }
-    
-    const unsigned char *ptr = (const unsigned char*)(dns + 1);
-    int domain_len = 0;
-    
-    // 只复制前16个字节，避免复杂解析
-    int copy_len = 16;
-    if (copy_len > max_len - 1) copy_len = max_len - 1;
-    
-    // 手动展开复制，避免循环
-    if (copy_len >= 1 && (void*)(ptr + 1) <= data_end) domain[domain_len++] = ptr[0];
-    if (copy_len >= 2 && (void*)(ptr + 2) <= data_end) domain[domain_len++] = ptr[1];
-    if (copy_len >= 3 && (void*)(ptr + 3) <= data_end) domain[domain_len++] = ptr[2];
-    if (copy_len >= 4 && (void*)(ptr + 4) <= data_end) domain[domain_len++] = ptr[3];
-    if (copy_len >= 5 && (void*)(ptr + 5) <= data_end) domain[domain_len++] = ptr[4];
-    if (copy_len >= 6 && (void*)(ptr + 6) <= data_end) domain[domain_len++] = ptr[5];
-    if (copy_len >= 7 && (void*)(ptr + 7) <= data_end) domain[domain_len++] = ptr[6];
-    if (copy_len >= 8 && (void*)(ptr + 8) <= data_end) domain[domain_len++] = ptr[7];
-    if (copy_len >= 9 && (void*)(ptr + 9) <= data_end) domain[domain_len++] = ptr[8];
-    if (copy_len >= 10 && (void*)(ptr + 10) <= data_end) domain[domain_len++] = ptr[9];
-    if (copy_len >= 11 && (void*)(ptr + 11) <= data_end) domain[domain_len++] = ptr[10];
-    if (copy_len >= 12 && (void*)(ptr + 12) <= data_end) domain[domain_len++] = ptr[11];
-    if (copy_len >= 13 && (void*)(ptr + 13) <= data_end) domain[domain_len++] = ptr[12];
-    if (copy_len >= 14 && (void*)(ptr + 14) <= data_end) domain[domain_len++] = ptr[13];
-    if (copy_len >= 15 && (void*)(ptr + 15) <= data_end) domain[domain_len++] = ptr[14];
-    if (copy_len >= 16 && (void*)(ptr + 16) <= data_end) domain[domain_len++] = ptr[15];
-    
-    // 确保以null结尾
-    if (domain_len < max_len) {
-        domain[domain_len] = '\0';
-    }
-    
-    return domain_len;
+    return -1;
 }
 
 // 检查DNS缓存
-static __always_inline int check_dns_cache(const char *domain, int domain_len) {
-    __u32 domain_hash = simple_hash(domain, domain_len);
-    
-    // 查找DNS缓存
-    struct dns_response *response = bpf_map_lookup_elem(&dns_cache, &domain_hash);
-    if (!response) {
+static __always_inline int check_dns_cache_v4_hash(__u32 key) {
+    struct dns_response_v4 *resp = bpf_map_lookup_elem(&dns_cache, &key);
+    if (!resp) return -1;
+    __u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+    if (now > resp->expire_time) {
+        bpf_map_delete_elem(&dns_cache, &key);
         return -1;
     }
-    
-    // 检查是否过期
-    __u64 current_time = bpf_ktime_get_ns() / 1000000000; // 转换为秒
-    if (current_time > response->expire_time) {
-        bpf_map_delete_elem(&dns_cache, &domain_hash);
+    return 0;
+}
+
+static __always_inline int check_dns_cache_v6_hash(__u32 key) {
+    struct dns_response_v6 *resp = bpf_map_lookup_elem(&dns_cache_v6, &key);
+    if (!resp) return -1;
+    __u64 now = bpf_ktime_get_ns() / 1000000000ULL;
+    if (now > resp->expire_time) {
+        bpf_map_delete_elem(&dns_cache_v6, &key);
         return -1;
     }
-    
-    return 0; // 缓存命中
+    return 0;
 }
 
 // 更新DNS统计信息
-static __always_inline void update_dns_stats(const char *domain, int domain_len) {
-    __u32 domain_hash = simple_hash(domain, domain_len);
+static __always_inline void update_dns_stats_hash(__u32 domain_hash) {
     __u32 *count = bpf_map_lookup_elem(&dns_stats, &domain_hash);
     
     if (count) {
@@ -141,7 +159,7 @@ int dns_cache_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
     
-    // 只处理IPv4包
+    // 只处理IPv4包（UDP/53 查询）
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         return XDP_PASS;
     }
@@ -163,37 +181,36 @@ int dns_cache_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
     
-    // 只处理DNS查询 (端口53)
+    // 只处理DNS查询 (目标端口53，QR=0)
     if (udp->dest != bpf_htons(53)) {
         return XDP_PASS;
     }
     
-    // 解析DNS头部
-    struct dns_header *dns = (void*)(udp + 1);
-    if ((void*)(dns + 1) > data_end) {
-        return XDP_PASS;
-    }
-    
-    // 只处理查询包 (QR=0)
-    if (bpf_ntohs(dns->flags) & 0x8000) {
-        return XDP_PASS;
-    }
-    
-    // 解析域名
-    char domain[32];
-    int domain_len = parse_dns_simple(dns, data_end, domain, sizeof(domain));
-    if (domain_len <= 0) {
-        return XDP_PASS;
-    }
-    
-    // 更新统计信息
-    update_dns_stats(domain, domain_len);
-    
-    // 检查缓存
-    if (check_dns_cache(domain, domain_len) == 0) {
-        // 缓存命中，可以在这里实现缓存响应逻辑
-        // 由于eBPF限制，这里只是记录命中
+    // 解析DNS头部与 QNAME/QTYPE
+    // 计算 DNS 头起始偏移，使用 IHL 以避免固定 20 字节假设
+    __u8 vihl = 0;
+    if (bpf_xdp_load_bytes(ctx, 14, &vihl, 1) < 0) return XDP_PASS;
+    __u32 ihl = (vihl & 0x0F) * 4; // 字节
+    __u32 udp_off = 14 + ihl;
+    __u16 flags = 0;
+    if (bpf_xdp_load_bytes(ctx, udp_off + 8 + 2, &flags, sizeof(flags)) < 0) return XDP_PASS; // DNS flags 位于 DNS 头偏移 2
+    if ((flags & bpf_htons(0x8000)) != 0) return XDP_PASS; // 只处理查询（QR=0）
+
+    __u32 domain_hash = 0;
+    __u16 qtype = 0;
+    if (parse_qname_hash_qtype(ctx, udp_off + 8, &domain_hash, &qtype) < 0) return XDP_PASS;
+
+    update_dns_stats_hash(domain_hash);
+
+    // 根据类型检查缓存（命中仅统计，真正响应仍由用户态完成）
+    if (qtype == 1 /*A*/ ) {
+        (void)check_dns_cache_v4_hash(domain_hash);
+    } else if (qtype == 28 /*AAAA*/ ) {
+        (void)check_dns_cache_v6_hash(domain_hash);
     }
     
     return XDP_PASS;
 } 
+
+// 许可证声明
+char _license[] SEC("license") = "GPL";
