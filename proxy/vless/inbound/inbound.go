@@ -30,9 +30,9 @@ import (
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
-	"github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -470,12 +470,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
 			inbound.CanSpliceCopy = 2
-			
+
 			// 启用XTLS Vision eBPF加速
 			if os.Getenv("XRAY_EBPF") == "1" {
 				ebpf.EnableXTLSVisionInboundEBPFAcceleration(ctx, connection.RemoteAddr(), connection.LocalAddr())
 			}
-			
+
 			switch request.Command {
 			case protocol.RequestCommandUDP:
 				return errors.New(requestAddons.Flow + " doesn't support UDP").AtWarning()

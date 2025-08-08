@@ -7,26 +7,27 @@ import (
 	"net"
 	"sync"
 
+	"github.com/cilium/ebpf"
 	"github.com/xtls/xray-core/common/errors"
 )
 
 // EBpfGeoIPMatcher Linux专用eBPF GeoIP匹配器
 type EBpfGeoIPMatcher struct {
 	sync.RWMutex
-	
+
 	// 配置
 	countryCode  string
 	reverseMatch bool
 	enabled      bool
-	
+
 	// 统计信息
 	matchCount   uint64
 	missCount    uint64
 	totalQueries uint64
-	
+
 	// Linux专用eBPF对象
 	ebpfProgram interface{}
-	maps        map[string]interface{}
+	maps        map[string]*ebpf.Map
 }
 
 // NewEBpfGeoIPMatcher 创建新的eBPF GeoIP匹配器（Linux专用）
@@ -35,13 +36,20 @@ func NewEBpfGeoIPMatcher(countryCode string, reverseMatch bool) (*EBpfGeoIPMatch
 		countryCode:  countryCode,
 		reverseMatch: reverseMatch,
 		enabled:      false,
-		maps:         make(map[string]interface{}),
+		maps:         make(map[string]*ebpf.Map),
 	}
-	
-	// 在真正的实现中，这里会加载eBPF程序
+
+	// 尝试加载 route hint 相关 pinned maps（可选存在）
+	if m, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/route_geoip_v4_hint", nil); err == nil {
+		matcher.maps["route_geoip_v4_hint"] = m
+	}
+	if m, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/geoip_policy", nil); err == nil {
+		matcher.maps["geoip_policy"] = m
+	}
+
 	matcher.enabled = true
 	errors.LogInfo(context.Background(), "eBPF GeoIP matcher initialized on Linux for country: ", countryCode)
-	
+
 	return matcher, nil
 }
 
@@ -50,10 +58,10 @@ func (m *EBpfGeoIPMatcher) AddIPv4CIDR(cidr *net.IPNet, countryCode string) erro
 	if !m.enabled {
 		return errors.New("eBPF GeoIP matcher is not enabled")
 	}
-	
+
 	m.Lock()
 	defer m.Unlock()
-	
+
 	errors.LogInfo(context.Background(), "Added IPv4 CIDR to eBPF (Linux): ", cidr.String(), " -> ", countryCode)
 	return nil
 }
@@ -63,10 +71,10 @@ func (m *EBpfGeoIPMatcher) AddIPv6CIDR(cidr *net.IPNet, countryCode string) erro
 	if !m.enabled {
 		return errors.New("eBPF GeoIP matcher is not enabled")
 	}
-	
+
 	m.Lock()
 	defer m.Unlock()
-	
+
 	errors.LogInfo(context.Background(), "Added IPv6 CIDR to eBPF (Linux): ", cidr.String(), " -> ", countryCode)
 	return nil
 }
@@ -76,13 +84,13 @@ func (m *EBpfGeoIPMatcher) MatchIPv4(ip net.IP) bool {
 	if !m.enabled {
 		return false
 	}
-	
+
 	m.RLock()
 	defer m.RUnlock()
-	
+
 	// Linux特定的eBPF匹配实现
 	m.matchCount++
-	
+
 	// 模拟匹配逻辑
 	return true
 }
@@ -92,13 +100,13 @@ func (m *EBpfGeoIPMatcher) MatchIPv6(ip net.IP) bool {
 	if !m.enabled {
 		return false
 	}
-	
+
 	m.RLock()
 	defer m.RUnlock()
-	
+
 	// Linux特定的eBPF匹配实现
 	m.matchCount++
-	
+
 	// 模拟匹配逻辑
 	return true
 }
@@ -106,7 +114,7 @@ func (m *EBpfGeoIPMatcher) MatchIPv6(ip net.IP) bool {
 // Match 匹配IP地址
 func (m *EBpfGeoIPMatcher) Match(ip net.IP) bool {
 	m.totalQueries++
-	
+
 	if ip.To4() != nil {
 		return m.MatchIPv4(ip)
 	} else {
@@ -118,7 +126,7 @@ func (m *EBpfGeoIPMatcher) Match(ip net.IP) bool {
 func (m *EBpfGeoIPMatcher) GetStats() map[string]interface{} {
 	m.RLock()
 	defer m.RUnlock()
-	
+
 	stats := make(map[string]interface{})
 	stats["match_count"] = m.matchCount
 	stats["miss_count"] = m.missCount
@@ -128,7 +136,7 @@ func (m *EBpfGeoIPMatcher) GetStats() map[string]interface{} {
 	stats["country_code"] = m.countryCode
 	stats["reverse_match"] = m.reverseMatch
 	stats["platform"] = "linux"
-	
+
 	return stats
 }
 
@@ -136,10 +144,10 @@ func (m *EBpfGeoIPMatcher) GetStats() map[string]interface{} {
 func (m *EBpfGeoIPMatcher) Close() error {
 	m.Lock()
 	defer m.Unlock()
-	
+
 	m.enabled = false
 	errors.LogInfo(context.Background(), "eBPF GeoIP matcher closed (Linux)")
-	
+
 	return nil
 }
 
@@ -151,4 +159,4 @@ func (m *EBpfGeoIPMatcher) IsEnabled() bool {
 // GetCountryCode 获取国家代码
 func (m *EBpfGeoIPMatcher) GetCountryCode() string {
 	return m.countryCode
-} 
+}

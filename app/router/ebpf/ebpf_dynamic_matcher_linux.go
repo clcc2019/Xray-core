@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/cilium/ebpf"
 )
 
 // DynamicGeoIPMatcher 动态GeoIP匹配器
@@ -23,6 +25,8 @@ type DynamicGeoIPMatcher struct {
 	configPath string
 	mu         sync.RWMutex
 	lastStats  *GeoIPDynamicStats
+
+	maps map[string]*ebpf.Map
 }
 
 // DynamicGeoSiteMatcher 动态GeoSite匹配器
@@ -33,6 +37,8 @@ type DynamicGeoSiteMatcher struct {
 	configPath string
 	mu         sync.RWMutex
 	lastStats  *GeoSiteDynamicStats
+
+	maps map[string]*ebpf.Map
 }
 
 // GeoIP动态统计
@@ -72,22 +78,38 @@ type GeoSiteDynamicConfig struct {
 
 // NewDynamicGeoIPMatcher 创建动态GeoIP匹配器
 func NewDynamicGeoIPMatcher() *DynamicGeoIPMatcher {
-	return &DynamicGeoIPMatcher{
+	m := &DynamicGeoIPMatcher{
 		enabled:    true,
 		mapPath:    "/sys/fs/bpf/xray/geoip_dynamic_cache",
 		statsPath:  "/sys/fs/bpf/xray/geoip_stats_dynamic",
 		configPath: "/sys/fs/bpf/xray/geoip_config_dynamic",
+		maps:       make(map[string]*ebpf.Map),
 	}
+	if mm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/route_geoip_v4_hint", nil); err == nil {
+		m.maps["route_geoip_v4_hint"] = mm
+	}
+	if mm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/geoip_policy", nil); err == nil {
+		m.maps["geoip_policy"] = mm
+	}
+	return m
 }
 
 // NewDynamicGeoSiteMatcher 创建动态GeoSite匹配器
 func NewDynamicGeoSiteMatcher() *DynamicGeoSiteMatcher {
-	return &DynamicGeoSiteMatcher{
+	m := &DynamicGeoSiteMatcher{
 		enabled:    true,
 		mapPath:    "/sys/fs/bpf/xray/geosite_dynamic_cache",
 		statsPath:  "/sys/fs/bpf/xray/geosite_stats_dynamic",
 		configPath: "/sys/fs/bpf/xray/geosite_config_dynamic",
+		maps:       make(map[string]*ebpf.Map),
 	}
+	if mm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/route_geoip_v4_hint", nil); err == nil {
+		m.maps["route_geoip_v4_hint"] = mm
+	}
+	if mm, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/geoip_policy", nil); err == nil {
+		m.maps["geoip_policy"] = mm
+	}
+	return m
 }
 
 // 计算域名哈希

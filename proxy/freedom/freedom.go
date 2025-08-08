@@ -3,6 +3,7 @@ package freedom
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"os"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	tcpEbpf "github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -246,6 +248,27 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				writeConn = inbound.Conn
 				inTimer = inbound.Timer
 			}
+			// 基于连接键精确读取 parsing_state 直接决策（无需时间窗）
+			if os.Getenv("XRAY_EBPF") == "1" {
+				if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+					// 仅处理 TCP/IPv4
+					if lAddr, okL := conn.LocalAddr().(*net.TCPAddr); okL && lAddr.IP.To4() != nil {
+						if rAddr, okR := conn.RemoteAddr().(*net.TCPAddr); okR && rAddr.IP.To4() != nil {
+							saddr := binary.BigEndian.Uint32(lAddr.IP.To4())
+							daddr := binary.BigEndian.Uint32(rAddr.IP.To4())
+							sport := uint16(lAddr.Port)
+							dport := uint16(rAddr.Port)
+							if tcpEbpf.GetXTLSVisionManager().IsDirectCopyEnabledIPv4(saddr, sport, daddr, dport) {
+								inbound.CanSpliceCopy = 1
+								for _, obx := range session.OutboundsFromContext(ctx) {
+									obx.CanSpliceCopy = 1
+								}
+							}
+						}
+					}
+				}
+			}
+
 			if !isTLSConn(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 				return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
 			} else {

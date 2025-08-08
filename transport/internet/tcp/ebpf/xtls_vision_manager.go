@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/xtls/xray-core/common/log"
 )
 
@@ -25,9 +27,15 @@ type XTLSVisionManager struct {
 	inboundStats       *ebpf.Map
 	userUUIDWhitelist  *ebpf.Map
 	hotConnections     *ebpf.Map
+	directCopyHint     *ebpf.Map
+	eventsMap          *ebpf.Map
+	eventsReader       *ringbuf.Reader
+	cancelEvents       context.CancelFunc
 	ctx                context.Context
 	cancel             context.CancelFunc
 	stats              *XTLSVisionStats
+	lastTLSCompleteTs  time.Time
+	lastVisionActiveTs time.Time
 }
 
 // XTLSVisionStats 服务端入站统计信息
@@ -81,6 +89,9 @@ func (xvm *XTLSVisionManager) init() error {
 
 	// 启动统计收集
 	go xvm.collectStats()
+
+	// 订阅 ringbuf 事件（若存在）
+	xvm.startEventReader()
 
 	log.Record(&log.GeneralMessage{
 		Severity: log.Severity_Info,
@@ -209,6 +220,58 @@ func (xvm *XTLSVisionManager) collectStats() {
 	}
 }
 
+// startEventReader 订阅 XTLS ringbuf 事件（2=TLS完成，3=Vision激活）
+func (xvm *XTLSVisionManager) startEventReader() {
+	if xvm.eventsMap == nil {
+		return
+	}
+	reader, err := ringbuf.NewReader(xvm.eventsMap)
+	if err != nil {
+		return
+	}
+	xvm.eventsReader = reader
+	evCtx, cancel := context.WithCancel(context.Background())
+	xvm.cancelEvents = cancel
+	go func() {
+		defer reader.Close()
+		for {
+			select {
+			case <-evCtx.Done():
+				return
+			default:
+				rec, err := reader.Read()
+				if err != nil {
+					if err == ringbuf.ErrClosed {
+						return
+					}
+					continue
+				}
+				if len(rec.RawSample) >= 16 {
+					t := binary.LittleEndian.Uint32(rec.RawSample[0:4])
+					now := time.Now()
+					xvm.mu.Lock()
+					if t == 2 {
+						xvm.lastTLSCompleteTs = now
+					} else if t == 3 {
+						xvm.lastVisionActiveTs = now
+					}
+					xvm.mu.Unlock()
+				}
+			}
+		}
+	}()
+}
+
+// HasRecentVisionActive 返回近期是否有 Vision 激活事件
+func (xvm *XTLSVisionManager) HasRecentVisionActive(d time.Duration) bool {
+	xvm.mu.RLock()
+	defer xvm.mu.RUnlock()
+	if xvm.lastVisionActiveTs.IsZero() {
+		return false
+	}
+	return time.Since(xvm.lastVisionActiveTs) <= d
+}
+
 // Close 关闭XTLS Vision管理器
 func (xvm *XTLSVisionManager) Close() error {
 	xvm.mu.Lock()
@@ -278,15 +341,15 @@ func (xvm *XTLSVisionManager) checkEBPFSupport() error {
 
 // loadPinnedPrograms 从pinned资源加载eBPF程序
 func (xvm *XTLSVisionManager) loadPinnedPrograms() error {
-	// 从BPF文件系统加载已pin的程序
-	xdpProgPath := "/sys/fs/bpf/xray/xtls_vision_inbound_accelerator_xdp"
+	// 从BPF文件系统加载已pin的程序（改为 TC 版本以适配 ens5）
+	xdpProgPath := "/sys/fs/bpf/xray/xtls_vision_inbound_accelerator_tc"
 
 	// 检查pinned程序是否存在
 	if _, err := os.Stat(xdpProgPath); os.IsNotExist(err) {
 		return fmt.Errorf("pinned XDP program not found at %s. Please run mount-ebpf.sh first", xdpProgPath)
 	}
 
-	// 加载pinned XDP程序
+	// 加载 pinned 程序
 	xdpProg, err := ebpf.LoadPinnedProgram(xdpProgPath, nil)
 	if err != nil {
 		return fmt.Errorf("failed to load pinned XDP program: %w", err)
@@ -310,6 +373,7 @@ func (xvm *XTLSVisionManager) loadPinnedMaps() error {
 		"xtls_stats":               "/sys/fs/bpf/xray/xtls_stats",
 		"hot_connections":          "/sys/fs/bpf/xray/hot_connections",
 		"user_uuid_whitelist":      "/sys/fs/bpf/xray/user_uuid_whitelist",
+		"xtls_direct_copy_hint":    "/sys/fs/bpf/xray/xtls_direct_copy_hint",
 	}
 
 	// 加载连接表
@@ -340,10 +404,66 @@ func (xvm *XTLSVisionManager) loadPinnedMaps() error {
 		xvm.userUUIDWhitelist = uuidMap
 	}
 
+	// 加载 direct copy hint（可选）
+	if dcMap, err := ebpf.LoadPinnedMap(mapPaths["xtls_direct_copy_hint"], nil); err == nil {
+		xvm.directCopyHint = dcMap
+	}
+
+	// 尝试加载事件 ringbuf（可选）
+	if evMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/xtls_vision_events", nil); err == nil {
+		xvm.eventsMap = evMap
+	}
+
 	log.Record(&log.GeneralMessage{
 		Severity: log.Severity_Info,
 		Content:  "eBPF maps loaded from pinned resources successfully",
 	})
 
 	return nil
+}
+
+// IsDirectCopyEnabledIPv4 根据 IPv4 四元组查询解析状态是否为直拷（command=2）
+func (xvm *XTLSVisionManager) IsDirectCopyEnabledIPv4(srcIP uint32, srcPort uint16, dstIP uint32, dstPort uint16) bool {
+	if !xvm.enabled {
+		return false
+	}
+	// conn_id 需与 eBPF 侧保持一致
+	connID := (uint64(srcIP) << 32) | uint64(dstIP) | (uint64(srcPort) << 48) | (uint64(dstPort) << 32)
+	// 优先读 hint map
+	if xvm.directCopyHint != nil {
+		var one uint8
+		if err := xvm.directCopyHint.Lookup(&connID, &one); err == nil && one == 1 {
+			return true
+		}
+	}
+	// 回退读取连接表的 parsing_state
+	if xvm.inboundConnections != nil {
+		var v struct {
+			ClientIP        uint32
+			ServerIP        uint32
+			ClientPort      uint16
+			ServerPort      uint16
+			State           uint8
+			RealityVerified uint8
+			TLSVersion      uint8
+			VisionEnabled   uint8
+			HandshakeTime   uint64
+			BytesReceived   uint64
+			BytesSent       uint64
+			SpliceCount     uint32
+			VisionPackets   uint32
+			LastActivity    uint64
+			DestIP          uint32
+			DestPort        uint16
+			UserUUID        [16]byte
+			Command         uint8
+			ContentLen      uint16
+			PaddingLen      uint16
+			ParsingState    uint8
+		}
+		if err := xvm.inboundConnections.Lookup(&connID, &v); err == nil {
+			return v.ParsingState == 2 || v.ParsingState == 4
+		}
+	}
+	return false
 }

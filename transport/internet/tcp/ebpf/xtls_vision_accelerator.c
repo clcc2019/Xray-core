@@ -93,6 +93,14 @@ struct {
     __type(value, __u64);  // 事件计数
 } security_events SEC(".maps");
 
+// 直拷提示：根据连接ID标记 direct copy 可用
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);   // conn_id
+    __type(value, __u8);  // 1=direct copy enabled
+} xtls_direct_copy_hint SEC(".maps");
+
 // 事件 RingBuf（用于用户态消费关键事件）
 struct xtls_event {
     __u32 type;   // 1: reality_handshake, 2: tls_complete, 3: vision_active
@@ -621,15 +629,111 @@ int xtls_vision_inbound_accelerator_xdp(struct xdp_md *ctx) {
 // TC程序 - 极简版本，仅做基础统计
 SEC("classifier")
 int xtls_vision_inbound_accelerator_tc(struct __sk_buff *skb) {
-    // TC程序的极简版本，主要功能已转移到XDP层
-    // 仅更新基础统计计数
-    __u32 stats_key = 0;
-    struct xtls_vision_stats *stats = bpf_map_lookup_elem(&xtls_stats, &stats_key);
-    if (stats) {
-        stats->tc_total_packets++;
-        bpf_trace_printk("XTLS_EBPF: TC program packet processed\n", 1);
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    if (data + sizeof(struct ethhdr) > data_end)
+        return TC_ACT_OK;
+
+    struct ethhdr *eth = data;
+
+    // IPv4 branch
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) > data_end)
+            return TC_ACT_OK;
+        struct iphdr *ip = data + sizeof(struct ethhdr);
+        if (ip->protocol != IPPROTO_TCP)
+            return TC_ACT_OK;
+        if (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) > data_end)
+            return TC_ACT_OK;
+        struct tcphdr *tcp = data + sizeof(struct ethhdr) + sizeof(struct iphdr);
+        if (tcp->dest != bpf_htons(443))
+            return TC_ACT_OK;
+
+        // 连接ID仅对IPv4计算
+        __u64 conn_id = get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest);
+        struct xtls_vision_inbound *conn = bpf_map_lookup_elem(&xtls_inbound_connections, &conn_id);
+
+        // SYN 创建连接条目
+        if (tcp->syn && !tcp->ack) {
+            if (!conn) {
+                struct xtls_vision_inbound new_conn = {0};
+                new_conn.client_ip = ip->saddr;
+                new_conn.server_ip = ip->daddr;
+                new_conn.client_port = tcp->source;
+                new_conn.server_port = tcp->dest;
+                new_conn.state = 0;
+                new_conn.last_activity = get_current_time();
+                bpf_map_update_elem(&xtls_inbound_connections, &conn_id, &new_conn, BPF_ANY);
+                update_stats(0);
+            }
+            return TC_ACT_OK;
+        }
+
+        if (conn) {
+            conn->last_activity = get_current_time();
+
+            // REALITY 握手检测
+            if (conn->state == 0 && detect_reality_handshake(tcp + 1, data_end)) {
+                conn->state = 1;
+                conn->tls_version = 0x04;
+                update_stats(1);
+            }
+
+            // TLS 完成检测
+            if (conn->state == 1) {
+                if ((void *)(tcp + 1) + 5 <= data_end) {
+                    const unsigned char *ptr = (const unsigned char *)(tcp + 1);
+                    if (ptr[0] == 0x17) {
+                        conn->state = 2;
+                        conn->reality_verified = 1;
+                        emit_xtls_event(2, conn_id);
+                    }
+                }
+            }
+
+            // Vision 检测与 direct copy 标记
+            if (conn->state >= 2 && detect_xtls_vision(tcp + 1, data_end)) {
+                if (conn->state < 3) {
+                    conn->state = 3;
+                    conn->vision_enabled = 1;
+                    conn->handshake_time = get_current_time();
+                    update_stats(2);
+                    update_stats(3);
+                    emit_xtls_event(3, conn_id);
+                }
+                // 解析头并根据命令设置 direct_copy
+                if (parse_vision_header(tcp + 1, data_end, conn)) {
+                    // command==2 => PaddingDirect
+                    if (conn->command == 0x02) {
+                        conn->parsing_state = 2; // direct_copy
+                        update_stats(6);
+                        __u8 one = 1;
+                        bpf_map_update_elem(&xtls_direct_copy_hint, &conn_id, &one, BPF_ANY);
+                        emit_xtls_event(4, conn_id);
+                    }
+                }
+            }
+        }
+
+        return TC_ACT_OK;
     }
-    
+    // IPv6 基础支持：识别 TCP/443，做基础统计
+    else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        if (data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr) > data_end)
+            return TC_ACT_OK;
+        struct ipv6hdr *ip6 = data + sizeof(struct ethhdr);
+        if (ip6->nexthdr != IPPROTO_TCP)
+            return TC_ACT_OK;
+        if (data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct tcphdr) > data_end)
+            return TC_ACT_OK;
+        struct tcphdr *tcp6 = data + sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
+        if (tcp6->dest != bpf_htons(443))
+            return TC_ACT_OK;
+        update_stats(5);
+        return TC_ACT_OK;
+    }
+
     return TC_ACT_OK;
 }
 

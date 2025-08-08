@@ -58,6 +58,22 @@ struct {
     __type(value, __u64);  // 匹配次数
 } geoip_stats SEC(".maps");
 
+// 路由策略映射：country_code -> policy_id（由用户态填充）
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 512);
+    __type(key, __u8);     // 国家代码
+    __type(value, __u32);  // 策略ID（由用户约定，用户态再映射为 outbound tag）
+} geoip_policy SEC(".maps");
+
+// 路由提示：目的IPv4 -> policy_id（LRU，供用户态快速读取）
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);    // 目的IPv4（网络序）
+    __type(value, __u32);  // policy_id
+} route_geoip_v4_hint SEC(".maps");
+
 // 简单的字符串哈希函数
 static __always_inline __u32 hash_string(const char *str, int len) {
     __u32 hash = 5381;
@@ -169,14 +185,23 @@ int geoip_match_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     }
     
-    // 提取源IP地址
-    __u32 src_ip = bpf_ntohl(ip->saddr);
+    // 提取源/目的 IP 地址（保持网络序便于与内核一致）
+    __u32 src_ip = ip->saddr;
+    __u32 dst_ip = ip->daddr;
     
     // 执行GeoIP匹配
-    __u8 country_code = match_ipv4_geoip(src_ip);
+    __u8 country_code = match_ipv4_geoip(bpf_ntohl(src_ip));
     
     // 更新统计信息
     update_stats(country_code);
+
+    // 根据策略映射生成路由提示（若存在）
+    if (country_code != 0) {
+        __u32 *policy_id = bpf_map_lookup_elem(&geoip_policy, &country_code);
+        if (policy_id) {
+            bpf_map_update_elem(&route_geoip_v4_hint, &dst_ip, policy_id, BPF_ANY);
+        }
+    }
     
     // 可以根据匹配结果进行不同的处理
     // 例如：标记数据包、重定向等
