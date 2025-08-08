@@ -5,6 +5,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+#include <linux/ipv6.h>
 #include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -87,12 +88,31 @@ struct {
     __type(value, struct fast_forward_entry);
 } fast_forward_cache SEC(".maps");
 
+// per-CPU 统计
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u64);
 } stats_map SEC(".maps");
+
+// 事件 ringbuf（轻量事件通告）
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20); // 1MB
+} tcp_reality_events SEC(".maps");
+
+enum tcp_reality_event_type {
+    TCP_REALITY_EVENT_TOTAL_PACKETS = 0,
+    TCP_REALITY_EVENT_FAST_FORWARD = 1,
+    TCP_REALITY_EVENT_SESSION_REUSE = 2,
+};
+
+struct tcp_reality_event {
+    __u64 ts;
+    __u32 type;
+    __u64 conn_id;
+};
 
 // 辅助函数
 static __always_inline __u64 get_current_time() {
@@ -110,6 +130,15 @@ static __always_inline void update_stats(__u32 stat_type) {
     if (value) {
         __sync_fetch_and_add(value, 1);
     }
+}
+
+static __always_inline void emit_tcp_reality_event(__u32 type, __u64 conn_id) {
+    struct tcp_reality_event ev = {
+        .ts = bpf_ktime_get_ns(),
+        .type = type,
+        .conn_id = conn_id,
+    };
+    bpf_ringbuf_output(&tcp_reality_events, &ev, sizeof(ev), 0);
 }
 
 // 真正的零拷贝快速转发
@@ -143,6 +172,7 @@ static __always_inline int fast_forward_packet(struct xdp_md *ctx,
         conn->last_activity = get_current_time();
         
         update_stats(1); // fast_forward_count
+        emit_tcp_reality_event(TCP_REALITY_EVENT_FAST_FORWARD, get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest));
         
         return XDP_TX; // 零拷贝转发
     }
@@ -180,6 +210,7 @@ static __always_inline int accelerate_reality_handshake(struct tcp_connection_en
             bpf_map_update_elem(&reality_sessions, &session_id, session, BPF_ANY);
             
             update_stats(2); // reality_session_reuse
+            emit_tcp_reality_event(TCP_REALITY_EVENT_SESSION_REUSE, conn_id);
             return 0; // 握手加速成功
         } else {
             // 新会话 - 创建
@@ -218,6 +249,20 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
     __u16 eth_proto;
     if (bpf_xdp_load_bytes(ctx, 12, &eth_proto, sizeof(eth_proto)) < 0)
         return XDP_PASS;
+    // IPv6 快速检测与安全访问（当前不做加速，仅通过）
+    if (eth_proto == bpf_htons(ETH_P_IPV6)) {
+        __u8 nexthdr = 0;
+        if (bpf_xdp_load_bytes(ctx, 14 + 6, &nexthdr, sizeof(nexthdr)) < 0) return XDP_PASS;
+        if (nexthdr != IPPROTO_TCP) return XDP_PASS;
+        // 读取 TCP 端口以确认报文完整性
+        __u16 v6_sport = 0, v6_dport = 0;
+        __u32 tcp_off_v6 = 14 + sizeof(struct ipv6hdr);
+        if (bpf_xdp_load_bytes(ctx, tcp_off_v6 + 0, &v6_sport, sizeof(v6_sport)) < 0) return XDP_PASS;
+        if (bpf_xdp_load_bytes(ctx, tcp_off_v6 + 2, &v6_dport, sizeof(v6_dport)) < 0) return XDP_PASS;
+        // 目前仅统计并放行（后续可在此加入IPv6的加速路径）
+        update_stats(0);
+        return XDP_PASS;
+    }
     if (eth_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
     
@@ -237,6 +282,7 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
         return XDP_PASS;
     
     update_stats(0); // total_packets
+    emit_tcp_reality_event(TCP_REALITY_EVENT_TOTAL_PACKETS, get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest));
     
     // 计算连接标识符
     __u64 conn_id = get_connection_id(ip->saddr, tcp->source, ip->daddr, tcp->dest);
@@ -264,6 +310,7 @@ int tcp_reality_accelerator_xdp(struct xdp_md *ctx) {
                 .fast_path_enabled = 0
             };
             bpf_map_update_elem(&tcp_connections, &conn_id, &new_conn, BPF_ANY);
+            emit_tcp_reality_event(TCP_REALITY_EVENT_TOTAL_PACKETS, conn_id);
         }
         return XDP_PASS; // 让用户空间处理SYN
     }

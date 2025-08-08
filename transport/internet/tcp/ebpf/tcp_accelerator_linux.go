@@ -7,10 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/xtls/xray-core/common/errors"
 )
 
@@ -24,6 +27,10 @@ type TCPRealityAccelerator struct {
 	lastStats   *TCPRealityStats
 	connections map[string]*AcceleratedConnection
 	hotConns    map[string]bool
+
+	// ringbuf reader for tcp_reality_events
+	eventsReader *ringbuf.Reader
+	cancelReader context.CancelFunc
 }
 
 // AcceleratedConnection 加速连接信息
@@ -99,6 +106,9 @@ func (a *TCPRealityAccelerator) Start(ctx context.Context) error {
 		errors.LogWarning(ctx, "Failed to update TCP REALITY accelerator config: ", err)
 	}
 
+	// 启动事件ringbuf读取（若存在）
+	a.startEventReader()
+
 	// 启动监控协程
 	go a.monitorConnections(ctx)
 
@@ -112,8 +122,68 @@ func (a *TCPRealityAccelerator) Stop() error {
 	defer a.mu.Unlock()
 
 	a.enabled = false
+	if a.cancelReader != nil {
+		a.cancelReader()
+		a.cancelReader = nil
+	}
+	if a.eventsReader != nil {
+		_ = a.eventsReader.Close()
+		a.eventsReader = nil
+	}
 	errors.LogInfo(context.Background(), "TCP REALITY eBPF accelerator stopped")
 	return nil
+}
+
+// 事件结构
+type tcpRealityEvent struct {
+	Ts     uint64
+	Type   uint32
+	ConnID uint64
+}
+
+// 启动 ringbuf 读取
+func (a *TCPRealityAccelerator) startEventReader() {
+	rbPath := "/sys/fs/bpf/xray/tcp_reality_events"
+	if _, err := os.Stat(rbPath); err != nil {
+		return
+	}
+	rbMap, err := ebpf.LoadPinnedMap(rbPath, nil)
+	if err != nil {
+		return
+	}
+	reader, err := ringbuf.NewReader(rbMap)
+	if err != nil {
+		return
+	}
+	a.eventsReader = reader
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancelReader = cancel
+	go func() {
+		defer reader.Close()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				rec, err := reader.Read()
+				if err != nil {
+					if err == ringbuf.ErrClosed {
+						return
+					}
+					// 忽略短暂错误
+					continue
+				}
+				if len(rec.RawSample) >= 20 {
+					var ev tcpRealityEvent
+					b := rec.RawSample
+					ev.Ts = binary.LittleEndian.Uint64(b[0:8])
+					ev.Type = binary.LittleEndian.Uint32(b[8:12])
+					ev.ConnID = binary.LittleEndian.Uint64(b[12:20])
+					_ = ev // 按需处理：日志/指标
+				}
+			}
+		}
+	}()
 }
 
 // AccelerateConnection 为连接启用加速
@@ -253,7 +323,12 @@ func (a *TCPRealityAccelerator) GetStats() (*TCPRealityStats, error) {
 	cmd := exec.Command("bpftool", "map", "dump", "pinned", a.statsPath)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		// 回退到常见 pinned 名称
+		cmd2 := exec.Command("bpftool", "map", "dump", "pinned", "/sys/fs/bpf/xray/stats_map")
+		output, err = cmd2.Output()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// 解析bpftool输出（简化实现）

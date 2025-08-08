@@ -6,6 +6,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+#include <linux/ipv6.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -88,78 +89,53 @@ int tcp_reality_accelerator_tc(struct __sk_buff *skb) {
     if ((void*)(eth + 1) > data_end)
         return TC_ACT_OK;
     
-    // 只处理IPv4包
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
-    
-    // 解析IP头部
-    struct iphdr *ip = (void*)(eth + 1);
-    if ((void*)(ip + 1) > data_end)
-        return TC_ACT_OK;
-    
-    // 只处理TCP包
-    if (ip->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
-    
-    // 解析TCP头部
-    struct tcphdr *tcp = (void*)(ip + 1);
-    if ((void*)(tcp + 1) > data_end)
-        return TC_ACT_OK;
-    
-    // 更新统计
-    update_stats(0); // total_packets
-    
-    // 计算连接标识符
-    __u64 conn_id = get_connection_id(bpf_ntohl(ip->saddr), bpf_ntohs(tcp->source),
-                                     bpf_ntohl(ip->daddr), bpf_ntohs(tcp->dest));
-    
-    // 查找连接状态
-    struct tcp_connection_entry *conn = bpf_map_lookup_elem(&tcp_connections, &conn_id);
-    
-    // 处理SYN包 - 创建新连接
-    if (tcp->syn && !tcp->ack) {
-        if (!conn) {
-            struct tcp_connection_entry new_conn = {
-                .local_ip = bpf_ntohl(ip->saddr),
-                .remote_ip = bpf_ntohl(ip->daddr),
-                .local_port = bpf_ntohs(tcp->source),
-                .remote_port = bpf_ntohs(tcp->dest),
-                .state = TCP_STATE_SYN_SENT,
-                .reality_enabled = 0,
-                .reality_verified = 0,
-                .tls_established = 0,
-                .fast_path_count = 0,
-                .bytes_sent = 0,
-                .last_activity = get_current_time(),
-                .next_hop_ip = 0,
-                .next_hop_port = 0,
-                .fast_path_enabled = 0
-            };
-            bpf_map_update_elem(&tcp_connections, &conn_id, &new_conn, BPF_ANY);
-            update_stats(1); // new_connections
+    // IPv4
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        struct iphdr *ip = (void*)(eth + 1);
+        if ((void*)(ip + 1) > data_end)
+            return TC_ACT_OK;
+        if (ip->protocol != IPPROTO_TCP)
+            return TC_ACT_OK;
+        struct tcphdr *tcp = (void*)(ip + 1);
+        if ((void*)(tcp + 1) > data_end)
+            return TC_ACT_OK;
+        update_stats(0); // total_packets
+        __u64 conn_id = get_connection_id(bpf_ntohl(ip->saddr), bpf_ntohs(tcp->source),
+                                         bpf_ntohl(ip->daddr), bpf_ntohs(tcp->dest));
+        struct tcp_connection_entry *conn = bpf_map_lookup_elem(&tcp_connections, &conn_id);
+        if (tcp->syn && !tcp->ack) {
+            if (!conn) {
+                struct tcp_connection_entry new_conn = {
+                    .local_ip = bpf_ntohl(ip->saddr),
+                    .remote_ip = bpf_ntohl(ip->daddr),
+                    .local_port = bpf_ntohs(tcp->source),
+                    .remote_port = bpf_ntohs(tcp->dest),
+                    .state = TCP_STATE_SYN_SENT,
+                };
+                bpf_map_update_elem(&tcp_connections, &conn_id, &new_conn, BPF_ANY);
+                update_stats(1);
+            }
+            return TC_ACT_OK;
+        }
+        if (conn && conn->state >= TCP_STATE_ESTABLISHED) {
+            conn->bytes_sent += bpf_ntohs(ip->tot_len);
+            conn->last_activity = get_current_time();
+            bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
         }
         return TC_ACT_OK;
     }
-    
-    // 处理已建立的连接
-    if (conn && conn->state >= TCP_STATE_ESTABLISHED) {
-        // 更新连接统计
-        conn->bytes_sent += bpf_ntohs(ip->tot_len);
-        conn->last_activity = get_current_time();
-        bpf_map_update_elem(&tcp_connections, &conn_id, conn, BPF_ANY);
-        
-        // REALITY连接优化
-        if (conn->reality_enabled && conn->reality_verified) {
-            update_stats(2); // reality_packets
-            conn->fast_path_count++;
-        }
-        
-        // TLS连接优化
-        if (conn->tls_established) {
-            update_stats(3); // tls_packets
-        }
+    // IPv6：暂做基本校验与统计
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        __u8 nexthdr = 0;
+        if (bpf_skb_load_bytes(skb, 14 + 6, &nexthdr, sizeof(nexthdr)) < 0) return TC_ACT_OK;
+        if (nexthdr != IPPROTO_TCP) return TC_ACT_OK;
+        __u16 sport = 0, dport = 0;
+        __u32 tcp_off = 14 + sizeof(struct ipv6hdr);
+        if (bpf_skb_load_bytes(skb, tcp_off + 0, &sport, sizeof(sport)) < 0) return TC_ACT_OK;
+        if (bpf_skb_load_bytes(skb, tcp_off + 2, &dport, sizeof(dport)) < 0) return TC_ACT_OK;
+        update_stats(0);
+        return TC_ACT_OK;
     }
-    
     return TC_ACT_OK;
 }
 

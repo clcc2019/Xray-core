@@ -5,14 +5,18 @@ package ebpf
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/ringbuf"
 )
 
 // RealityImprovedManager 改进的REALITY管理器
@@ -36,6 +40,9 @@ type RealityImprovedManager struct {
 
 	// 统计信息
 	statsData *RealityImprovedStats
+
+	// ringbuf reader
+	realityEventsReader *ringbuf.Reader
 }
 
 // RealityImprovedStats 改进的REALITY统计信息
@@ -92,6 +99,8 @@ func (rim *RealityImprovedManager) Enable() error {
 
 	// 启动统计更新协程
 	go rim.updateStatsLoop()
+	// 启动事件读取协程
+	go rim.consumeEvents()
 
 	rim.enabled = true
 	log.Printf("Reality Improved Manager enabled")
@@ -108,6 +117,10 @@ func (rim *RealityImprovedManager) Disable() error {
 	}
 
 	rim.cancel()
+	if rim.realityEventsReader != nil {
+		_ = rim.realityEventsReader.Close()
+		rim.realityEventsReader = nil
+	}
 	rim.enabled = false
 	log.Printf("Reality Improved Manager disabled")
 	return nil
@@ -146,6 +159,17 @@ func (rim *RealityImprovedManager) loadMaps() error {
 		return fmt.Errorf("failed to load security_events map: %w", err)
 	}
 	rim.securityEvents = securityEvents
+
+	// 尝试加载 ringbuf（如果存在）
+	if rbMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/reality_events", nil); err == nil {
+		if reader, rErr := ringbuf.NewReader(rbMap); rErr == nil {
+			rim.realityEventsReader = reader
+		} else {
+			log.Printf("Warning: failed to open ringbuf reader: %v", rErr)
+		}
+	} else {
+		log.Printf("Info: reality_events ringbuf not present: %v", err)
+	}
 
 	return nil
 }
@@ -225,9 +249,21 @@ func (rim *RealityImprovedManager) GetStats() *RealityImprovedStats {
 
 	if rim.stats != nil {
 		var key uint32 = 0
-		var stats RealityImprovedStats
-		if err := rim.stats.Lookup(&key, &stats); err == nil {
-			return &stats
+		cpuCount := runtime.NumCPU()
+		perCPU := make([]RealityImprovedStats, cpuCount)
+		if err := rim.stats.Lookup(&key, &perCPU); err == nil {
+			var agg RealityImprovedStats
+			for i := range perCPU {
+				agg.TotalConnections += perCPU[i].TotalConnections
+				agg.ValidConnections += perCPU[i].ValidConnections
+				agg.InvalidConnections += perCPU[i].InvalidConnections
+				agg.SuccessfulHandshakes += perCPU[i].SuccessfulHandshakes
+				agg.FailedHandshakes += perCPU[i].FailedHandshakes
+				agg.RetryAttempts += perCPU[i].RetryAttempts
+				agg.ZeroCopyOperations += perCPU[i].ZeroCopyOperations
+				agg.SecurityViolations += perCPU[i].SecurityViolations
+			}
+			return &agg
 		}
 	}
 
@@ -276,6 +312,35 @@ func (rim *RealityImprovedManager) updateStatsLoop() {
 	}
 }
 
+// consumeEvents 消费 ringbuf 事件
+func (rim *RealityImprovedManager) consumeEvents() {
+	if rim.realityEventsReader == nil {
+		return
+	}
+	type RealityEvent struct {
+		Ts     uint64
+		Type   uint32
+		ConnID uint64
+	}
+	for {
+		record, err := rim.realityEventsReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if len(record.RawSample) >= 20 {
+			var ev RealityEvent
+			b := record.RawSample
+			ev.Ts = binary.LittleEndian.Uint64(b[0:8])
+			ev.Type = binary.LittleEndian.Uint32(b[8:12])
+			ev.ConnID = binary.LittleEndian.Uint64(b[12:20])
+			_ = ev
+		}
+	}
+}
+
 // updateStats 更新统计信息
 func (rim *RealityImprovedManager) updateStats() {
 	if rim.stats == nil {
@@ -283,8 +348,20 @@ func (rim *RealityImprovedManager) updateStats() {
 	}
 
 	var key uint32 = 0
-	var stats RealityImprovedStats
-	if err := rim.stats.Lookup(&key, &stats); err == nil {
+	cpuCount := runtime.NumCPU()
+	perCPU := make([]RealityImprovedStats, cpuCount)
+	if err := rim.stats.Lookup(&key, &perCPU); err == nil {
+		var stats RealityImprovedStats
+		for i := range perCPU {
+			stats.TotalConnections += perCPU[i].TotalConnections
+			stats.ValidConnections += perCPU[i].ValidConnections
+			stats.InvalidConnections += perCPU[i].InvalidConnections
+			stats.SuccessfulHandshakes += perCPU[i].SuccessfulHandshakes
+			stats.FailedHandshakes += perCPU[i].FailedHandshakes
+			stats.RetryAttempts += perCPU[i].RetryAttempts
+			stats.ZeroCopyOperations += perCPU[i].ZeroCopyOperations
+			stats.SecurityViolations += perCPU[i].SecurityViolations
+		}
 		// 更新内存中的统计信息
 		atomic.StoreUint64(&rim.statsData.TotalConnections, stats.TotalConnections)
 		atomic.StoreUint64(&rim.statsData.ValidConnections, stats.ValidConnections)

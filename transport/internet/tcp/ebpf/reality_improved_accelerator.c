@@ -46,12 +46,37 @@ struct {
     __type(value, struct reality_improved_conn);
 } reality_improved_connections SEC(".maps");
 
+// 统计信息（per-CPU，索引0）
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1000);
-    __type(key, __u32);    // 统计ID
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);    // 统计索引
     __type(value, struct reality_improved_stats);
 } reality_improved_stats SEC(".maps");
+
+// 事件环形缓冲区（ringbuf）
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20); // 1MB
+} reality_events SEC(".maps");
+
+// 事件类型
+enum reality_event_type {
+    EVENT_CONN_TOTAL = 0,
+    EVENT_CONN_VALID = 1,
+    EVENT_CONN_INVALID = 2,
+    EVENT_HANDSHAKE_OK = 3,
+    EVENT_HANDSHAKE_FAIL = 4,
+    EVENT_RETRY = 5,
+    EVENT_ZERO_COPY = 6,
+    EVENT_SECURITY_VIOLATION = 7,
+};
+
+struct reality_event {
+    __u64 ts;
+    __u32 type;
+    __u64 conn_id;
+};
 
 // UUID白名单映射表
 struct {
@@ -104,43 +129,48 @@ static __always_inline void record_security_event(__u32 event_type) {
 }
 
 // 更新统计信息
-static __always_inline void update_improved_stats(__u32 stat_type) {
+static __always_inline void emit_event(__u32 type, __u64 conn_id) {
+    struct reality_event ev = {
+        .ts = bpf_ktime_get_ns(),
+        .type = type,
+        .conn_id = conn_id,
+    };
+    bpf_ringbuf_output(&reality_events, &ev, sizeof(ev), 0);
+}
+
+static __always_inline void update_improved_stats(__u32 stat_type, __u64 conn_id) {
     __u32 key = 0;
     struct reality_improved_stats *stats = bpf_map_lookup_elem(&reality_improved_stats, &key);
     if (!stats) {
-        struct reality_improved_stats new_stats = {0};
-        bpf_map_update_elem(&reality_improved_stats, &key, &new_stats, BPF_ANY);
-        stats = bpf_map_lookup_elem(&reality_improved_stats, &key);
+        return;
     }
-    if (stats) {
-        switch (stat_type) {
-            case 0: // total_connections
-                stats->total_connections++;
-                break;
-            case 1: // valid_connections
-                stats->valid_connections++;
-                break;
-            case 2: // invalid_connections
-                stats->invalid_connections++;
-                break;
-            case 3: // successful_handshakes
-                stats->successful_handshakes++;
-                break;
-            case 4: // failed_handshakes
-                stats->failed_handshakes++;
-                break;
-            case 5: // retry_attempts
-                stats->retry_attempts++;
-                break;
-            case 6: // zero_copy_operations
-                stats->zero_copy_operations++;
-                break;
-            case 7: // security_violations
-                stats->security_violations++;
-                break;
-        }
-        bpf_map_update_elem(&reality_improved_stats, &key, stats, BPF_ANY);
+    switch (stat_type) {
+        case EVENT_CONN_TOTAL:
+            stats->total_connections++;
+            break;
+        case EVENT_CONN_VALID:
+            stats->valid_connections++;
+            break;
+        case EVENT_CONN_INVALID:
+            stats->invalid_connections++;
+            break;
+        case EVENT_HANDSHAKE_OK:
+            stats->successful_handshakes++;
+            break;
+        case EVENT_HANDSHAKE_FAIL:
+            stats->failed_handshakes++;
+            break;
+        case EVENT_RETRY:
+            stats->retry_attempts++;
+            break;
+        case EVENT_ZERO_COPY:
+            stats->zero_copy_operations++;
+            break;
+        case EVENT_SECURITY_VIOLATION:
+            stats->security_violations++;
+            break;
     }
+    emit_event(stat_type, conn_id);
 }
 
 // 检测改进的REALITY握手
@@ -266,7 +296,7 @@ int reality_improved_accelerator_xdp(struct xdp_md *ctx) {
         };
         
         bpf_map_update_elem(&reality_improved_connections, &conn_id, &new_conn, BPF_ANY);
-        update_improved_stats(0); // total_connections
+        update_improved_stats(EVENT_CONN_TOTAL, conn_id);
         
         conn = bpf_map_lookup_elem(&reality_improved_connections, &conn_id);
         if (!conn) {
@@ -293,11 +323,11 @@ int reality_improved_accelerator_xdp(struct xdp_md *ctx) {
             // 验证UUID白名单
             if (verify_uuid_whitelist(uuid_hash)) {
                 conn->is_valid_connection = 1;
-                update_improved_stats(1); // valid_connections
+                update_improved_stats(EVENT_CONN_VALID, conn_id);
                 bpf_trace_printk("REALITY: Valid connection detected, conn_id: %llu\n", 1, conn_id);
             } else {
                 conn->is_valid_connection = 0;
-                update_improved_stats(2); // invalid_connections
+                update_improved_stats(EVENT_CONN_INVALID, conn_id);
                 bpf_trace_printk("REALITY: Invalid connection detected, conn_id: %llu\n", 1, conn_id);
             }
             
@@ -308,14 +338,14 @@ int reality_improved_accelerator_xdp(struct xdp_md *ctx) {
     // 安全验证
     if (!verify_improved_security(data, data_end, conn)) {
         conn->retry_count++;
-        update_improved_stats(5); // retry_attempts
+        update_improved_stats(EVENT_RETRY, conn_id);
         bpf_map_update_elem(&reality_improved_connections, &conn_id, conn, BPF_ANY);
         return XDP_PASS;
     }
     
     // 对于有效连接，启用零拷贝
     if (conn->is_valid_connection && conn->handshake_stage >= 1) {
-        update_improved_stats(6); // zero_copy_operations
+        update_improved_stats(EVENT_ZERO_COPY, conn_id);
         bpf_trace_printk("REALITY: Zero-copy enabled for valid connection %llu\n", 1, conn_id);
         return XDP_TX; // 零拷贝转发
     }

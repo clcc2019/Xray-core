@@ -405,9 +405,10 @@ fi
 
 # 部署新文件
 log_info "部署新文件..."
+systemctl stop xray
 cp xray-linux-amd64-ebpf /usr/local/bin/xray
 chmod +x /usr/local/bin/xray
-
+systemctl start xray
 # 挂载eBPF程序
 log_info "挂载eBPF程序..."
 bash mount-ebpf.sh
