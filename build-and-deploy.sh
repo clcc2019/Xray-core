@@ -252,6 +252,12 @@ load_ebpf() {
     bpftool map create $BPF_ROOT/connection_map type hash key 8 value 64 entries 65536 name connection_map 2>/dev/null || true
     bpftool map create $BPF_ROOT/route_geoip_v4_hint type lru_hash key 4 value 4 entries 65536 name route_geoip_v4_hint 2>/dev/null || true
     bpftool map create $BPF_ROOT/xtls_direct_copy_hint type hash key 8 value 1 entries 65536 name xtls_direct_copy_hint 2>/dev/null || true
+    # DNS/GeoSite/IP 快速路由器 开关与 hint maps
+    bpftool map create $BPF_ROOT/dns_router_enable type array key 4 value 4 entries 1 name dns_router_enable 2>/dev/null || true
+    bpftool map create $BPF_ROOT/geosite_enable type array key 4 value 4 entries 1 name geosite_enable 2>/dev/null || true
+    bpftool map create $BPF_ROOT/route_ip_v4_hint type lru_hash key 4 value 12 entries 100000 name route_ip_v4_hint 2>/dev/null || true
+    bpftool map create $BPF_ROOT/route_ip_v6_hint type lru_hash key 16 value 12 entries 80000 name route_ip_v6_hint 2>/dev/null || true
+    bpftool map create $BPF_ROOT/ip_fastpath_enable type array key 4 value 4 entries 1 name ip_fastpath_enable 2>/dev/null || true
     
     # 加载函数
     load_program() {
@@ -452,6 +458,26 @@ load_ebpf() {
     tc filter replace dev "$interface_name" ingress prio 64 handle 64 bpf da obj transport/internet/tcp/ebpf/xtls_vision_tc.o sec classifier 2>/dev/null || true
 
     load_xdp "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp"
+    # IP 快速路由器（TC）
+    load_tc_with_pinmaps "app/router/ebpf/ip_fastpath_tc.o" "ip_fastpath_tc"
+
+    # 根据环境变量设置开关位（默认开启，可用环境变量显式置0关闭）
+    set_enable_flag() {
+      local map_path=$1; local on=$2
+      local key_hex="00 00 00 00"
+      local val_hex="00 00 00 00"
+      if [ "$on" = "1" ]; then val_hex="01 00 00 00"; fi
+      bpftool map update pinned "$map_path" key hex $key_hex value hex $val_hex 2>/dev/null || true
+    }
+    # 默认值改为 1（开启）。若环境变量显式为 0，则关闭。
+    if [ "${XRAY_EBPF_IP_FASTPATH:-1}" = "0" ]; then set_enable_flag "$BPF_ROOT/ip_fastpath_enable" 0; else set_enable_flag "$BPF_ROOT/ip_fastpath_enable" 1; fi
+    if [ "${XRAY_EBPF_DNS_ROUTER:-1}" = "0" ]; then set_enable_flag "$BPF_ROOT/dns_router_enable" 0; else set_enable_flag "$BPF_ROOT/dns_router_enable" 1; fi
+    if [ "${XRAY_EBPF_GEOSITE:-1}" = "0" ]; then set_enable_flag "$BPF_ROOT/geosite_enable" 0; else set_enable_flag "$BPF_ROOT/geosite_enable" 1; fi
+
+    # 固定写入示例 geosite 策略（site_code=1 -> fwmark 0x1），可用环境变量关闭
+    if [ "${XRAY_EBPF_WRITE_DEFAULT_POLICY:-1}" = "1" ]; then
+      bpftool map update pinned "$BPF_ROOT/geosite_policy" key hex 01 value hex 01 00 00 00 2>/dev/null || true
+    fi
 }
 
 # 设置权限

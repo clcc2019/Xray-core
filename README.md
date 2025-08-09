@@ -47,6 +47,11 @@ ssh root@your-server 'cd /root/xray-ebpf && bash deploy.sh'
 ```bash
 # Enable eBPF acceleration
 export XRAY_EBPF=1
+# Optional sub-features (default off)
+export XRAY_EBPF_DNS_ROUTER=1      # DNS router (TC) on/off
+export XRAY_EBPF_GEOSITE=1         # GeoSite mark apply on/off
+export XRAY_EBPF_IP_FASTPATH=1     # IP fastpath (TC) on/off
+
 ./xray-linux-amd64-ebpf run -config config.json
 ```
 
@@ -77,6 +82,13 @@ export XRAY_EBPF=1
 
 # Optional: Debug mode
 export XRAY_EBPF_DEBUG=1
+ 
+# Optional: XTLS pacing & TCP options
+export XRAY_XTLS_PACING=1                 # enable RTT-based tiny pacing
+export XRAY_SO_ZEROCOPY=1                 # enable SO_ZEROCOPY (Linux)
+export XRAY_SO_ZEROCOPY_DRAIN=1           # drain MSG_ERRQUEUE to avoid buffer retention
+export XRAY_TCP_NOTSENT_LOWAT=65536       # control kernel unsent buffer
+export XRAY_TCP_QUICKACK=1                # short-lived QUICKACK
 ```
 
 ### **Service Configuration**

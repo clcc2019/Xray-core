@@ -60,6 +60,7 @@ func NewEBpfGeoSiteMatcher(countryCode string, dynamicMode bool) (*EBpfGeoSiteMa
 	}
 
 	matcher.enabled = true
+	// 不再预置本地后缀规则，统一由学习缓存/用户态策略驱动
 	if dynamicMode {
 		errors.LogInfo(context.Background(), "Dynamic eBPF GeoSite matcher initialized on Linux for site: ", countryCode)
 	} else {
@@ -171,6 +172,8 @@ func (m *EBpfGeoSiteMatcher) MatchDomain(domain string) (bool, error) {
 		m.domainMatchCount++
 		// 学习：正缓存
 		m.putCache(domain, 1)
+		// 写入内核学习缓存
+		PromoteDomain(domain, 1, 900)
 		return !m.reverseMatch, nil
 	}
 
@@ -178,6 +181,9 @@ func (m *EBpfGeoSiteMatcher) MatchDomain(domain string) (bool, error) {
 	m.putCache(domain, 0)
 	return m.reverseMatch, nil
 }
+
+// seedCommonLocalRules 预置常见域名映射到 site_code=1
+// 本地预置规则已移除：统一依赖学习缓存/用户态策略
 
 // simpleMatch 简化的匹配逻辑（fallback）
 func (m *EBpfGeoSiteMatcher) simpleMatch(domain string) bool {

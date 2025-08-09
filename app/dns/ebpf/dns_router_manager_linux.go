@@ -5,7 +5,6 @@ package ebpf
 import (
 	"fmt"
 	"net"
-	"path/filepath"
 
 	"github.com/cilium/ebpf"
 )
@@ -67,7 +66,7 @@ func MarkForDNSServer(ip net.IP) uint32 {
 	return uint32(v4[3])
 }
 
-func ensureDir(path string) string { return filepath.Dir(path) }
+// removed unused ensureDir
 
 // SetDefaultDotMark sets the skb mark used for DoT (TCP/853) flows detected in BPF.
 func (m *DNSRouterManager) SetDefaultDotMark(mark uint32) error {
@@ -122,4 +121,20 @@ func (m *DNSRouterManager) AddDohEndpointV6(ip net.IP, port uint16, mark uint32)
 	key.Lo = uint64(v6[8])<<56 | uint64(v6[9])<<48 | uint64(v6[10])<<40 | uint64(v6[11])<<32 | uint64(v6[12])<<24 | uint64(v6[13])<<16 | uint64(v6[14])<<8 | uint64(v6[15])
 	key.Port = port
 	return mp.Update(&key, &mark, ebpf.UpdateAny)
+}
+
+// EnableDNSRouterAtomically flips the enable flag map if present; no server config change required.
+func EnableDNSRouterAtomically(enable bool) {
+	mp, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/dns_router_enable", nil)
+	if err != nil {
+		return
+	}
+	var k uint32 = 0
+	var v uint32
+	if enable {
+		v = 1
+	} else {
+		v = 0
+	}
+	_ = mp.Update(&k, &v, ebpf.UpdateAny)
 }

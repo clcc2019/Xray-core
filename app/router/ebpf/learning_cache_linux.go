@@ -19,6 +19,7 @@ type geoSiteLearningCache struct {
 	enabled bool
 	cache   *ebpf.Map // geosite_dynamic_cache
 	hotlist *ebpf.Map // hot_domain_list
+	enable  *ebpf.Map // geosite_enable
 }
 
 var globalGeoSiteLearning = &geoSiteLearningCache{}
@@ -39,12 +40,16 @@ func getGeoSiteLearning() *geoSiteLearningCache {
 	}
 	cache, err1 := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/geosite_dynamic_cache", nil)
 	hot, err2 := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/hot_domain_list", nil)
+	en, err3 := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/geosite_enable", nil)
 	if err1 != nil || err2 != nil {
-		errors.LogDebug(context.Background(), "GeoSite learning cache maps not available: ", err1, ", ", err2)
+		errors.LogDebug(context.Background(), "GeoSite learning cache maps not available: ", err1, ", ", err2, ", en:", err3)
 		return globalGeoSiteLearning
 	}
 	globalGeoSiteLearning.cache = cache
 	globalGeoSiteLearning.hotlist = hot
+	if err3 == nil {
+		globalGeoSiteLearning.enable = en
+	}
 	globalGeoSiteLearning.enabled = true
 	return globalGeoSiteLearning
 }
@@ -122,6 +127,15 @@ func PromoteDomain(domain string, siteCode uint8, ttlSeconds uint32) {
 
 	if err := lc.cache.Update(&key, buf, ebpf.UpdateAny); err != nil {
 		errors.LogDebug(context.Background(), "geosite_dynamic_cache update failed: ", err)
+	}
+
+	// Also auto-enable kernel geosite mark apply if switch map exists
+	if lc.enable != nil {
+		var k uint32 = 0
+		var on uint32 = 1
+		if err := lc.enable.Update(&k, &on, ebpf.UpdateAny); err != nil {
+			errors.LogDebug(context.Background(), "geosite_enable update failed: ", err)
+		}
 	}
 }
 

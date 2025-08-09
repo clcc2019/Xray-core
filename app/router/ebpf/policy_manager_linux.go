@@ -78,12 +78,17 @@ func (pm *PolicyManager) ApplyDefaultsFromEnv() {
 	}
 
 	if pm.geosite != nil {
-		for _, kv := range parse(os.Getenv("XRAY_GEOSITE_POLICY")) {
-			_ = pm.SetGeoSitePolicy(uint8(kv[0]), uint32(kv[1]))
+		def := os.Getenv("XRAY_GEOSITE_POLICY")
+		// 默认不强制写入，避免误把未匹配流量打上策略；如需启用可在环境变量中显式设置
+		if def != "" {
+			for _, kv := range parse(def) {
+				_ = pm.SetGeoSitePolicy(uint8(kv[0]), uint32(kv[1]))
+			}
 		}
 	}
 	if pm.geoip != nil {
-		for _, kv := range parse(os.Getenv("XRAY_GEOIP_POLICY")) {
+		def := os.Getenv("XRAY_GEOIP_POLICY")
+		for _, kv := range parse(def) {
 			_ = pm.SetGeoIPPolicy(uint8(kv[0]), uint32(kv[1]))
 		}
 	}

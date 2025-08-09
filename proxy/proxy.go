@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
+	tcpinfo "github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
@@ -439,18 +440,28 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			mb[i] = XtlsPadding(b, command, &w.writeOnceUserUUID, longPadding, w.ctx, w.trafficState)
 		}
 	}
-	// Optional tiny pacing jitter for TLS records on low-latency links
+	// Optional pacing based on RTT when available (low risk)
 	if xtlsPacingEnabled && w.trafficState.IsTLS && !w.trafficState.paddingHardDisable {
-		// only when not switched to direct-copy writer
 		shouldPace := !(w.isUplink && w.trafficState.Outbound.UplinkWriterDirectCopy) && !(!w.isUplink && w.trafficState.Inbound.DownlinkWriterDirectCopy)
 		if shouldPace {
-			r := w.trafficState.nextRand32()
-			// 0..750 microseconds jitter
-			us := r % 750
-			if us > 0 {
-				time.Sleep(time.Duration(us) * time.Microsecond)
+			// detect RTT from outbound raw conn
+			var baseDelay time.Duration
+			if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
+				if raw, _, _ := UnwrapRawConn(inbound.Conn); raw != nil {
+					if rtt, ok := tcpinfo.DetectRTT(raw); ok && rtt > 0 {
+						baseDelay = rtt / 20 // pace ~5% of RTT as tiny gap
+					}
+				}
+			}
+			// fallback tiny jitter
+			if baseDelay <= 0 {
+				r := w.trafficState.nextRand32()
+				baseDelay = time.Duration(r%750) * time.Microsecond
+			}
+			if baseDelay > 0 && baseDelay <= time.Millisecond*5 {
+				time.Sleep(baseDelay)
 				w.trafficState.lastPace = time.Now()
-				xtlsPacingMicrosTotal.Add(int64(us))
+				xtlsPacingMicrosTotal.Add(int64(baseDelay / time.Microsecond))
 			}
 		}
 	}

@@ -96,6 +96,19 @@ struct {
     __type(value, __u32);
 } geosite_policy SEC(".maps");
 
+// enable switch for geosite mark apply (0=off by default). User-space can flip it without改服务端配置
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} geosite_enable SEC(".maps");
+
+static __always_inline int geosite_is_enabled() {
+    __u32 k = 0; __u32 *v = bpf_map_lookup_elem(&geosite_enable, &k);
+    return v && *v != 0;
+}
+
 // 简单的字符串哈希函数
 static __always_inline __u64 simple_domain_hash(const char *str, int len) {
     __u64 hash = 5381;
@@ -330,10 +343,13 @@ int geosite_dynamic_match_tc(struct __sk_buff *skb) {
         
         if (site_code) {
             update_geosite_stats(1); // cache_hits
-            // 根据策略设置 fwmark；若无策略则采用默认 0x1
-            __u32 *mark = bpf_map_lookup_elem(&geosite_policy, &site_code);
-            __u32 m = mark ? *mark : 0x1;
-            skb->mark = m;
+            // 仅当功能开关开启且策略存在时才设置 fwmark；避免无策略或关闭时误标记
+            if (geosite_is_enabled()) {
+                __u32 *mark = bpf_map_lookup_elem(&geosite_policy, &site_code);
+                if (mark) {
+                    skb->mark = *mark;
+                }
+            }
         } else {
             update_geosite_stats(2); // cache_misses
         }

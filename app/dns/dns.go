@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	ebpf "github.com/xtls/xray-core/app/dns/ebpf"
+	routerebpf "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -50,6 +51,19 @@ func ensureEBPFDNS() {
 			ebpfCacheGlobal = cache
 		}
 	})
+}
+
+// shouldEnableKernelFastpath returns true if XRAY_EBPF is set
+func shouldEnableKernelFastpath() bool {
+	return strings.TrimSpace(os.Getenv("XRAY_EBPF")) != ""
+}
+
+// routerebpfLookupSiteCode1Mark: 保守返回 0，避免无策略误打 mark。
+func routerebpfLookupSiteCode1Mark() uint32 {
+	if v, ok := routerebpf.GetGeoSitePolicyMark(1); ok {
+		return v
+	}
+	return 0
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher
@@ -319,9 +333,26 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 					}
 					if len(v4s) > 0 {
 						_ = ebpfCacheGlobal.AddRecord(domain, v4s, ttl, 0)
+						// 同步写入 IP fastpath（仅在启用 eBPF 时，且有可用策略 mark 时），不修改服务端配置
+						if shouldEnableKernelFastpath() {
+							routerebpf.EnableIPFastpath(true)
+							if mark := routerebpfLookupSiteCode1Mark(); mark != 0 {
+								for _, ip4 := range v4s {
+									routerebpf.SetIPv4Mark(ip4, mark, ttl)
+								}
+							}
+						}
 					}
 					if len(v6s) > 0 {
 						_ = ebpfCacheGlobal.AddRecordV6(domain, v6s, ttl, 0)
+						if shouldEnableKernelFastpath() {
+							routerebpf.EnableIPFastpath(true)
+							if mark := routerebpfLookupSiteCode1Mark(); mark != 0 {
+								for _, ip6 := range v6s {
+									routerebpf.SetIPv6Mark(ip6, mark, ttl)
+								}
+							}
+						}
 					}
 				}
 			}

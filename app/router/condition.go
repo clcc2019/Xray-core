@@ -155,22 +155,7 @@ func (m *DomainMatcher) ApplyDomain(domain string) bool {
 	domain = strings.ToLower(domain)
 	errors.LogInfo(nil, "DomainMatcher.ApplyDomain: Matching domain ", domain, " (eBPF enabled: ", m.ebpfEnabled, ")")
 
-	// eBPF快速路径
-	if m.ebpfEnabled && m.ebpfMatcher != nil {
-		errors.LogInfo(nil, "DomainMatcher: Trying eBPF match for ", domain)
-		if matched, err := m.ebpfMatcher.MatchDomain(domain); err == nil {
-			if matched {
-				errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite matched: ", domain)
-				return true
-			} else {
-				errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite no match for: ", domain)
-			}
-		} else {
-			errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite match error: ", err)
-		}
-	}
-
-	// 标准匹配fallback
+	// 标准匹配优先（避免 eBPF 本地规则误触发到错误的路由规则，如 block）
 	result := len(m.matchers.Match(domain)) > 0
 	if result {
 		errors.LogInfo(nil, "DomainMatcher: Standard matcher matched: ", domain)
@@ -178,6 +163,21 @@ func (m *DomainMatcher) ApplyDomain(domain string) bool {
 		ebpf.PromoteDomain(domain, 1, 900) // 15分钟 TTL
 	} else {
 		errors.LogInfo(nil, "DomainMatcher: No match for domain: ", domain)
+		// 标准未命中时再尝试 eBPF 作为提示，但不直接决定路由，避免误判
+		if m.ebpfEnabled && m.ebpfMatcher != nil {
+			errors.LogInfo(nil, "DomainMatcher: Trying eBPF hint for ", domain)
+			if matched, err := m.ebpfMatcher.MatchDomain(domain); err == nil {
+				if matched {
+					errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite hinted match: ", domain)
+					// 仅作为学习信号：写入内核缓存，不改变当次路由决策
+					ebpf.PromoteDomain(domain, 1, 900)
+				} else {
+					errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite no match for: ", domain)
+				}
+			} else {
+				errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite match error: ", err)
+			}
+		}
 	}
 	return result
 }

@@ -79,6 +79,19 @@ struct {
     __type(value, __u32); // mark
 } doh_endpoints_v6 SEC(".maps");
 
+// global enable switch (default 0 = disabled)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} dns_router_enable SEC(".maps");
+
+static __always_inline int dns_router_is_enabled() {
+    __u32 k = 0; __u32 *v = bpf_map_lookup_elem(&dns_router_enable, &k);
+    return v && *v != 0;
+}
+
 // DNS header
 struct dns_header {
     __u16 id;
@@ -198,21 +211,23 @@ int dns_router_tc(struct __sk_buff *skb) {
                 if (exist) { *exist |= aflags; } else { bpf_map_update_elem(&dns_anomalies, &k, &aflags, BPF_ANY); }
             }
 
-            __u32 *mark = bpf_map_lookup_elem(&dns_route_map, &domain_hash);
-            if (mark) { skb->mark = *mark; }
+            if (dns_router_is_enabled()) {
+                __u32 *mark = bpf_map_lookup_elem(&dns_route_map, &domain_hash);
+                if (mark) { skb->mark = *mark; }
+            }
             return TC_ACT_OK;
         } else if (ip->protocol == IPPROTO_TCP) {
             // DoT: TCP/853
             struct tcphdr { __u16 source, dest; } *tcp;
             tcp = (void*)((void*)ip + ihl);
             if ((void*)(tcp + 1) > data_end) return TC_ACT_OK;
-            if (tcp->dest == bpf_htons(853)) {
+            if (tcp->dest == bpf_htons(853) && dns_router_is_enabled()) {
                 __u32 idx = 1, *dot_mark = bpf_map_lookup_elem(&dns_proto_marks, &idx);
                 if (dot_mark) { skb->mark = *dot_mark; }
                 return TC_ACT_OK;
             }
             // DoH allowlist on 443
-            if (tcp->dest == bpf_htons(443)) {
+            if (tcp->dest == bpf_htons(443) && dns_router_is_enabled()) {
                 __u64 key = ((__u64)ip->daddr << 16) | 443;
                 __u32 *m = bpf_map_lookup_elem(&doh_endpoints_v4, &key);
                 if (m) { skb->mark = *m; }
@@ -242,19 +257,21 @@ int dns_router_tc(struct __sk_buff *skb) {
                 __u32 *exist = bpf_map_lookup_elem(&dns_anomalies6, &k6);
                 if (exist) { *exist |= aflags; } else { bpf_map_update_elem(&dns_anomalies6, &k6, &aflags, BPF_ANY); }
             }
-            __u32 *mark = bpf_map_lookup_elem(&dns_route_map, &domain_hash);
-            if (mark) { skb->mark = *mark; }
+            if (dns_router_is_enabled()) {
+                __u32 *mark = bpf_map_lookup_elem(&dns_route_map, &domain_hash);
+                if (mark) { skb->mark = *mark; }
+            }
             return TC_ACT_OK;
         } else if (nexthdr == IPPROTO_TCP) {
             struct tcphdr6 { __u16 source, dest; } *tcp;
             tcp = (void*)((void*)ip6 + off);
             if ((void*)(tcp + 1) > data_end) return TC_ACT_OK;
-            if (tcp->dest == bpf_htons(853)) {
+            if (tcp->dest == bpf_htons(853) && dns_router_is_enabled()) {
                 __u32 idx = 1, *dot_mark = bpf_map_lookup_elem(&dns_proto_marks, &idx);
                 if (dot_mark) { skb->mark = *dot_mark; }
                 return TC_ACT_OK;
             }
-            if (tcp->dest == bpf_htons(443)) {
+            if (tcp->dest == bpf_htons(443) && dns_router_is_enabled()) {
                 struct doh_v6_key k = {0};
                 __builtin_memcpy(&k.hi, &ip6->daddr.s6_addr[0], 8);
                 __builtin_memcpy(&k.lo, &ip6->daddr.s6_addr[8], 8);
