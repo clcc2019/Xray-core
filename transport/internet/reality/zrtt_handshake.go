@@ -27,12 +27,7 @@ type ZeroRTTConnection struct {
 
 // TryZeroRTTHandshake 尝试0-RTT握手
 func TryZeroRTTHandshake(c net.Conn, config *Config, ctx context.Context, dest xnet.Destination) (net.Conn, bool, error) {
-	// 🔥 暂时禁用 0-RTT 以避免复杂的握手问题
-	// TODO: 重新启用并完善 0-RTT 实现
-	errors.LogDebug(ctx, "🔥 0-RTT temporarily disabled, using regular handshake")
-	return performRegularHandshakeAndCache(c, config, ctx, dest)
-
-	/* 原始 0-RTT 逻辑 - 暂时注释
+	// 仅当已存在缓存会话时尝试 0-RTT，否则回退常规握手
 	serverName := config.ServerName
 	if serverName == "" {
 		serverName = dest.Address.String()
@@ -40,32 +35,32 @@ func TryZeroRTTHandshake(c net.Conn, config *Config, ctx context.Context, dest x
 
 	shortIdStr := string(config.ShortId)
 
-	// 🔍 查找已缓存的0-RTT会话
 	cache := GetGlobalZeroRTTCache()
 	session := cache.GetZeroRTTSession(serverName, shortIdStr)
-
 	if session == nil {
-		// 没有可用的0-RTT会话，执行常规握手并缓存结果
 		return performRegularHandshakeAndCache(c, config, ctx, dest)
 	}
 
-	// 🚀 尝试0-RTT连接
+	// 策略判断
+	if !ShouldAttemptZeroRTT(session) {
+		incrSkipped()
+		return performRegularHandshakeAndCache(c, config, ctx, dest)
+	}
+
+	incrAttempt()
 	startTime := time.Now()
 	conn, success, err := performZeroRTTHandshake(c, config, session, ctx, dest)
 	rtt := time.Since(startTime)
-
-	// 更新会话状态
 	cache.UpdateSessionStatus(serverName, shortIdStr, success && err == nil, rtt)
 
 	if err != nil || !success {
-		// 0-RTT失败，回退到常规握手
-		errors.LogInfo(ctx, "REALITY 0-RTT handshake failed, falling back to regular handshake: ", err)
+		incrFallback()
+		errors.LogInfo(ctx, "REALITY 0-RTT handshake failed, fallback to regular: ", err)
 		return performRegularHandshakeAndCache(c, config, ctx, dest)
 	}
-
+	incrSuccess()
 	errors.LogInfo(ctx, "🚀 REALITY 0-RTT handshake successful, RTT: ", rtt)
 	return conn, true, nil
-	*/
 }
 
 // performZeroRTTHandshake 执行0-RTT握手

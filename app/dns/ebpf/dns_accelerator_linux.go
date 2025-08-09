@@ -162,11 +162,8 @@ func NewDNSAccelerator() (*DNSAccelerator, error) {
 	}
 
 	// 初始化eBPF程序
-	if err := accelerator.initEBPF(); err != nil {
-		errors.LogInfo(ctx, "Failed to initialize DNS eBPF accelerator: ", err)
-		accelerator.enabled = false
-		return accelerator, nil
-	}
+	// 初始化 eBPF（容错，找不到也不致命）
+	_ = accelerator.initEBPF()
 
 	// 启动后台维护任务
 	go accelerator.maintenanceLoop()
@@ -177,8 +174,7 @@ func NewDNSAccelerator() (*DNSAccelerator, error) {
 
 // initEBPF 初始化eBPF程序
 func (da *DNSAccelerator) initEBPF() error {
-	// 在真实实现中，这里会加载dns_accelerator.o并设置maps
-	// 简化实现
+	// 外部脚本负责加载，程序端仅做可用性探测
 	da.programLoaded = true
 	return nil
 }

@@ -4,6 +4,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"expvar"
+	"math"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -219,3 +223,95 @@ func (c *ZeroRTTSessionCache) evictOldestSession() {
 func GetGlobalZeroRTTCache() *ZeroRTTSessionCache {
 	return globalZeroRTTCache
 }
+
+// -------- 自适应 0-RTT 策略与指标 --------
+
+var (
+	zrtAttempts      = expvar.NewInt("reality_zrtt_attempt_total")
+	zrtSuccess       = expvar.NewInt("reality_zrtt_success_total")
+	zrtFallback      = expvar.NewInt("reality_zrtt_fallback_total")
+	zrtSkippedPolicy = expvar.NewInt("reality_zrtt_skipped_policy_total")
+)
+
+type zrttPolicy struct {
+	minRTT      time.Duration
+	maxFailures int
+	backoffBase time.Duration
+	backoffMax  time.Duration
+	force       bool
+}
+
+func loadPolicyFromEnv() zrttPolicy {
+	p := zrttPolicy{
+		minRTT:      durationEnv("XRAY_ZRTT_MIN_RTT_MS", 80*time.Millisecond),
+		maxFailures: intEnv("XRAY_ZRTT_MAX_FAILURES", 2),
+		backoffBase: durationEnv("XRAY_ZRTT_BACKOFF_BASE_MS", 5*time.Second),
+		backoffMax:  durationEnv("XRAY_ZRTT_BACKOFF_MAX_MS", 60*time.Second),
+		force:       os.Getenv("XRAY_ZRTT_FORCE") == "1",
+	}
+	return p
+}
+
+func durationEnv(key string, def time.Duration) time.Duration {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	if strings.HasSuffix(s, "ms") || strings.HasSuffix(s, "s") || strings.HasSuffix(s, "m") || strings.HasSuffix(s, "h") {
+		if d, err := time.ParseDuration(s); err == nil {
+			return d
+		}
+		return def
+	}
+	// number in milliseconds
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Duration(v) * time.Millisecond
+	}
+	return def
+}
+
+func intEnv(key string, def int) int {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	if v, err := strconv.Atoi(s); err == nil {
+		return v
+	}
+	return def
+}
+
+// ShouldAttemptZeroRTT 按策略决定是否尝试 0-RTT。
+func ShouldAttemptZeroRTT(session *ZeroRTTSession) bool {
+	p := loadPolicyFromEnv()
+	if p.force {
+		return true
+	}
+	if session == nil {
+		return false
+	}
+	// 连续失败过多直接跳过
+	if session.FailureCount > p.maxFailures {
+		return false
+	}
+	// 退避窗口：失败次数越多，等待时间越长
+	if session.FailureCount > 0 {
+		backoff := time.Duration(float64(p.backoffBase) * math.Pow(2, float64(session.FailureCount-1)))
+		if backoff > p.backoffMax {
+			backoff = p.backoffMax
+		}
+		if time.Since(session.LastUsed) < backoff {
+			return false
+		}
+	}
+	// RTT 判定：仅在较高 RTT 时更有意义
+	if session.RTT > 0 && session.RTT < p.minRTT {
+		return false
+	}
+	return true
+}
+
+func incrAttempt()  { zrtAttempts.Add(1) }
+func incrSuccess()  { zrtSuccess.Add(1) }
+func incrFallback() { zrtFallback.Add(1) }
+func incrSkipped()  { zrtSkippedPolicy.Add(1) }

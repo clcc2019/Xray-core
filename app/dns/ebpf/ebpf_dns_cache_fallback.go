@@ -42,6 +42,11 @@ func (c *EBpfDNSCache) LookupRecord(domain string) ([]net.IP, uint32, error) {
 	return nil, 0, errors.New("eBPF DNS cache not available on this platform")
 }
 
+// AddRecordV6 添加IPv6 DNS记录到缓存（fallback实现）
+func (c *EBpfDNSCache) AddRecordV6(domain string, ips []net.IP, ttl uint32, rcode uint16) error {
+	return errors.New("eBPF DNS cache not available on this platform")
+}
+
 // DeleteRecord 删除DNS记录（fallback实现）
 func (c *EBpfDNSCache) DeleteRecord(domain string) error {
 	return errors.New("eBPF DNS cache not available on this platform")

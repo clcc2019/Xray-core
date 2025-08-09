@@ -73,6 +73,18 @@ func (c *EBpfDNSCache) AddRecord(domain string, ips []net.IP, ttl uint32, rcode 
 	return nil
 }
 
+// AddRecordV6 添加IPv6 DNS记录到缓存
+func (c *EBpfDNSCache) AddRecordV6(domain string, ips []net.IP, ttl uint32, rcode uint16) error {
+	if !c.enabled {
+		return errors.New("eBPF DNS cache is not enabled")
+	}
+	if c.realCache != nil {
+		return c.realCache.AddRecordV6(domain, ips, ttl, rcode)
+	}
+	errors.LogInfo(context.Background(), "Added DNS AAAA record to eBPF cache (Linux): ", domain, " -> ", ips)
+	return nil
+}
+
 // LookupRecord 从缓存中查找DNS记录
 func (c *EBpfDNSCache) LookupRecord(domain string) ([]net.IP, uint32, error) {
 	if !c.enabled {
@@ -91,6 +103,19 @@ func (c *EBpfDNSCache) LookupRecord(domain string) ([]net.IP, uint32, error) {
 	c.hitCount++
 	errors.LogInfo(context.Background(), "DNS lookup (simulated): ", domain)
 	return []net.IP{net.ParseIP("127.0.0.1")}, 300, nil
+}
+
+// LookupRecordV6 从缓存中查找IPv6 DNS记录
+func (c *EBpfDNSCache) LookupRecordV6(domain string) ([]net.IP, uint32, error) {
+	if !c.enabled {
+		return nil, 0, errors.New("eBPF DNS cache is not enabled")
+	}
+	c.RLock()
+	defer c.RUnlock()
+	if c.realCache != nil {
+		return c.realCache.LookupRecordV6(domain)
+	}
+	return nil, 0, errors.New("no real eBPF implementation")
 }
 
 // DeleteRecord 删除DNS记录

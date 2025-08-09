@@ -229,7 +229,13 @@ load_ebpf() {
     
     # 创建基础maps
     log_info "创建基础maps..."
-    bpftool map create $BPF_ROOT/dns_cache type hash key 8 value 4 entries 50000 name dns_cache 2>/dev/null || true
+    # DNS 缓存映射（与 app/dns/ebpf/dns_cache.c 对齐）
+    # dns_cache: LRU_HASH, key=4 (FNV-1a 32bit), value=16 (u32 ip + u32 ttl + u64 expire)
+    # dns_cache_v6: LRU_HASH, key=4, value=28 (u128 ip + u32 ttl + u64 expire)
+    # dns_stats: HASH, key=4, value=4 (u32 count)
+    bpftool map create $BPF_ROOT/dns_cache type lru_hash key 4 value 16 entries 50000 name dns_cache 2>/dev/null || true
+    bpftool map create $BPF_ROOT/dns_cache_v6 type lru_hash key 4 value 28 entries 25000 name dns_cache_v6 2>/dev/null || true
+    bpftool map create $BPF_ROOT/dns_stats type hash key 4 value 4 entries 20000 name dns_stats 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v4 type hash key 4 value 1 entries 10000 name geoip_v4 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v6 type hash key 8 value 1 entries 10000 name geoip_v6 2>/dev/null || true
     bpftool map create $BPF_ROOT/connection_map type hash key 8 value 64 entries 65536 name connection_map 2>/dev/null || true
@@ -343,7 +349,25 @@ load_ebpf() {
       tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
       tc filter replace dev "$interface_name" ingress prio 60 handle 60 bpf da obj app/dns/ebpf/dns_router_tc.o sec classifier 2>/dev/null || true
     if [ "$XRAY_XDP_EXTRA" = "dns" ]; then
-      load_xdp "app/dns/ebpf/dns_cache.o" "dns_cache_prog"
+      # 为 dns_cache.o 绑定已 pin 的 maps，确保与用户态一致
+      if [ -f "app/dns/ebpf/dns_cache.o" ]; then
+        if bpftool prog load app/dns/ebpf/dns_cache.o "$BPF_ROOT/dns_cache_prog" type xdp \
+            map name dns_cache pinned "$BPF_ROOT/dns_cache" \
+            map name dns_cache_v6 pinned "$BPF_ROOT/dns_cache_v6" \
+            map name dns_stats pinned "$BPF_ROOT/dns_stats" 2>/dev/null; then
+          log_success "dns_cache_prog 加载成功 (XDP+pin maps)"
+          ip link set dev "$interface_name" xdp off 2>/dev/null || true
+          if ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/dns_cache_prog" 2>/dev/null; then
+            log_success "dns_cache_prog 附加到 $interface_name 成功 (原生XDP)"
+          elif ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/dns_cache_prog" mode skb 2>/dev/null; then
+            log_success "dns_cache_prog 附加到 $interface_name 成功 (通用XDP)"
+          else
+            log_info "dns_cache_prog 附加失败，已忽略（继续）"
+          fi
+        else
+          log_info "dns_cache_prog 加载失败 (XDP)，已忽略"
+        fi
+      fi
     fi
 
     # 避免多 XDP 并存，默认不附加 Geo XDP；如需启用请设置 XRAY_XDP_EXTRA=geo
@@ -586,7 +610,7 @@ export XRAY_EBPF=1
 ## 支持平台
 
 - Linux AMD64 (主要支持)
-- macOS AMD64 (开发测试)
+# - macOS AMD64 (开发测试)
 - macOS ARM64 (开发测试)
 EOF
 

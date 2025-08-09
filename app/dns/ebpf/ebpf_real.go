@@ -15,10 +15,11 @@ import (
 
 // 真正的eBPF集成实现
 type RealEBpfDNSCache struct {
-	enabled     bool
-	programFd   int
-	dnsCacheMap int
-	statsMap    int
+	enabled       bool
+	programFd     int
+	dnsCacheMap   int
+	dnsCacheV6Map int
+	statsMap      int
 }
 
 // BPF系统调用常量
@@ -70,26 +71,10 @@ func (c *RealEBpfDNSCache) checkEBpfSupport() error {
 
 // 加载eBPF程序
 func (c *RealEBpfDNSCache) loadEBpfProgram() error {
-	// 尝试从bpffs加载程序
-	programPath := "/sys/fs/bpf/xray/dns_cache"
-	if _, err := os.Stat(programPath); os.IsNotExist(err) {
-		return fmt.Errorf("eBPF program not found at %s", programPath)
-	}
-
-	// 打开程序文件描述符
-	fd, err := syscall.Open(programPath, syscall.O_RDONLY, 0)
-	if err != nil {
-		return fmt.Errorf("failed to open eBPF program: %v", err)
-	}
-
-	c.programFd = fd
-	errors.LogInfo(context.Background(), "eBPF program loaded, fd: ", fd)
-
-	// 打开maps
+	// 简化：仅确保所需 maps 存在并可打开；程序加载由外部脚本负责
 	if err := c.openMaps(); err != nil {
 		return fmt.Errorf("failed to open eBPF maps: %v", err)
 	}
-
 	return nil
 }
 
@@ -102,6 +87,15 @@ func (c *RealEBpfDNSCache) openMaps() error {
 		return fmt.Errorf("failed to open DNS cache map: %v", err)
 	}
 	c.dnsCacheMap = fd
+
+	// 打开IPv6 DNS缓存map（可选）
+	dnsCacheV6Path := "/sys/fs/bpf/xray/dns_cache_v6"
+	if _, err := os.Stat(dnsCacheV6Path); err == nil {
+		fdv6, err := syscall.Open(dnsCacheV6Path, syscall.O_RDWR, 0)
+		if err == nil {
+			c.dnsCacheV6Map = fdv6
+		}
+	}
 
 	// 打开统计map
 	statsPath := "/sys/fs/bpf/xray/dns_stats"
@@ -140,6 +134,33 @@ func (c *RealEBpfDNSCache) AddRecord(domain string, ips []net.IP, ttl uint32, rc
 	return nil
 }
 
+// 添加IPv6记录
+func (c *RealEBpfDNSCache) AddRecordV6(domain string, ips []net.IP, ttl uint32, rcode uint16) error {
+	if !c.enabled {
+		return errors.New("eBPF DNS cache is not enabled")
+	}
+	if c.dnsCacheV6Map == 0 {
+		return errors.New("IPv6 DNS cache map not available")
+	}
+	// 仅写入首个 IPv6 地址（简化）
+	var ip6 [16]byte
+	for _, ip := range ips {
+		if ip = ip.To16(); ip != nil && ip.To4() == nil {
+			copy(ip6[:], ip)
+			break
+		}
+	}
+	if ip6 == ([16]byte{}) {
+		return errors.New("no IPv6 address provided")
+	}
+	hash := c.hashDomain(domain)
+	if err := c.updateMap(c.dnsCacheV6Map, unsafe.Pointer(&hash), unsafe.Pointer(&ip6)); err != nil {
+		return err
+	}
+	errors.LogInfo(context.Background(), "Added DNS AAAA record to eBPF cache: ", domain)
+	return nil
+}
+
 // 从eBPF缓存查找DNS记录
 func (c *RealEBpfDNSCache) LookupRecord(domain string) ([]net.IP, uint32, error) {
 	if !c.enabled {
@@ -161,6 +182,23 @@ func (c *RealEBpfDNSCache) LookupRecord(domain string) ([]net.IP, uint32, error)
 	ipAddr := c.uint32ToIP(ip)
 	errors.LogInfo(context.Background(), "DNS cache hit: ", domain, " -> ", ipAddr)
 	return []net.IP{ipAddr}, 300, nil
+}
+
+// 查找IPv6记录
+func (c *RealEBpfDNSCache) LookupRecordV6(domain string) ([]net.IP, uint32, error) {
+	if !c.enabled {
+		return nil, 0, errors.New("eBPF DNS cache is not enabled")
+	}
+	if c.dnsCacheV6Map == 0 {
+		return nil, 0, errors.New("IPv6 DNS cache map not available")
+	}
+	hash := c.hashDomain(domain)
+	var ip6 [16]byte
+	if err := c.lookupMap(c.dnsCacheV6Map, unsafe.Pointer(&hash), unsafe.Pointer(&ip6)); err != nil {
+		return nil, 0, err
+	}
+	ip := net.IP(ip6[:])
+	return []net.IP{ip}, 300, nil
 }
 
 // 更新eBPF map

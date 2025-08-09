@@ -26,6 +26,7 @@ import (
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/reality"
+	realityprofiler "github.com/xtls/xray-core/app/realityprofiler"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -121,10 +122,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 }
 
 func UClientWithZeroRTT(c net.Conn, config *Config, ctx context.Context, dest net.Destination, enableZeroRTT bool) (net.Conn, error) {
-	// 🔥 0-RTT 暂时完全禁用以避免握手问题
-	// TODO: 重新启用并完善 0-RTT 实现
-	enableZeroRTT = false
-	errors.LogDebug(ctx, "🔥 0-RTT completely disabled, using regular handshake")
+	// 第一阶段：仅当缓存可用时才在外部逻辑尝试 0-RTT；此处不强制关闭
+	// 保持参数不使用，避免静态检查误报
+	_ = enableZeroRTT
 
 	/* 原始 0-RTT 逻辑 - 暂时注释
 	// 🚀 首先尝试REALITY 0-RTT握手（如果启用）
@@ -155,6 +155,8 @@ func UClientWithZeroRTT(c net.Conn, config *Config, ctx context.Context, dest ne
 	if utlsConfig.ServerName == "" {
 		utlsConfig.ServerName = dest.Address.String()
 	}
+	// Apply prebuilt REALITY profile (ALPN order, etc.) if available; otherwise schedule async probe
+	realityprofiler.ApplyToTLSConfig(utlsConfig.ServerName, utlsConfig)
 	uConn.ServerName = utlsConfig.ServerName
 	fingerprint := tls.GetFingerprint(config.Fingerprint)
 	if fingerprint == nil {
