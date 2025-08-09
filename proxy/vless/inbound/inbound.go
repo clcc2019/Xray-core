@@ -568,9 +568,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))
-		// 自适应阈值：高RTT用32KiB，低RTT用16KiB
-		if d, ok := tcpinfo.DetectRTT(iConn); ok && d > 30*time.Millisecond {
-			bufferWriter.SetFlushThreshold(32 * 1024)
+		// 自适应阈值：高RTT用64KiB/32KiB，低RTT用16KiB
+		if d, ok := tcpinfo.DetectRTT(iConn); ok {
+			if d > 60*time.Millisecond {
+				bufferWriter.SetFlushThreshold(64 * 1024)
+			} else if d > 30*time.Millisecond {
+				bufferWriter.SetFlushThreshold(32 * 1024)
+			} else {
+				bufferWriter.SetFlushThreshold(16 * 1024)
+			}
 		} else {
 			bufferWriter.SetFlushThreshold(16 * 1024)
 		}

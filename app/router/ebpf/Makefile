@@ -1,3 +1,15 @@
+CLANG ?= clang
+CFLAGS += -O2 -g -target bpf -D__TARGET_ARCH_x86 -fno-stack-protector -Wall
+INC += -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu
+
+all: geosite_matcher_dynamic.o geoip_matcher_dynamic.o
+
+%.o: %.c
+	$(CLANG) $(CFLAGS) $(INC) -c $< -o $@
+
+clean:
+	rm -f *.o
+
 # eBPF GeoIP Matcher Makefile
 
 # 编译器设置

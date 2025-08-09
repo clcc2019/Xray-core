@@ -306,8 +306,14 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		writer := buf.NewBufferedWriter(buf.NewWriter(connection))
-		if d, ok := tcpinfo.DetectRTT(iConn); ok && d > 30*time.Millisecond {
-			writer.SetFlushThreshold(32 * 1024)
+		if d, ok := tcpinfo.DetectRTT(iConn); ok {
+			if d > 60*time.Millisecond {
+				writer.SetFlushThreshold(64 * 1024)
+			} else if d > 30*time.Millisecond {
+				writer.SetFlushThreshold(32 * 1024)
+			} else {
+				writer.SetFlushThreshold(16 * 1024)
+			}
 		} else {
 			writer.SetFlushThreshold(16 * 1024)
 		}

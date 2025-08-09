@@ -80,6 +80,14 @@ struct {
     __type(value, struct geoip_dynamic_stats);
 } geoip_stats_dynamic SEC(".maps");
 
+// geoip 策略映射: country_code -> fwmark (policy id)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 512);
+    __type(key, __u8);
+    __type(value, __u32);
+} geoip_policy SEC(".maps");
+
 // 获取当前时间戳（简化实现）
 static __always_inline __u64 get_current_time() {
     return bpf_ktime_get_ns() / 1000000000; // 转换为秒
@@ -245,6 +253,10 @@ int geoip_dynamic_match_tc(struct __sk_buff *skb) {
     
     if (src_country || dst_country) {
         update_stats_dynamic(1); // cache_hits
+        __u8 cc = src_country ? src_country : dst_country;
+        __u32 *mark = bpf_map_lookup_elem(&geoip_policy, &cc);
+        __u32 m = mark ? *mark : 0x1;
+        skb->mark = m;
     } else {
         update_stats_dynamic(2); // cache_misses
     }

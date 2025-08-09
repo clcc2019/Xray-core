@@ -88,6 +88,14 @@ struct {
     __type(value, struct geosite_dynamic_stats);
 } geosite_stats_dynamic SEC(".maps");
 
+// geosite 策略映射: site_code -> fwmark (policy id)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 512);
+    __type(key, __u8);
+    __type(value, __u32);
+} geosite_policy SEC(".maps");
+
 // 简单的字符串哈希函数
 static __always_inline __u64 simple_domain_hash(const char *str, int len) {
     __u64 hash = 5381;
@@ -322,6 +330,10 @@ int geosite_dynamic_match_tc(struct __sk_buff *skb) {
         
         if (site_code) {
             update_geosite_stats(1); // cache_hits
+            // 根据策略设置 fwmark；若无策略则采用默认 0x1
+            __u32 *mark = bpf_map_lookup_elem(&geosite_policy, &site_code);
+            __u32 m = mark ? *mark : 0x1;
+            skb->mark = m;
         } else {
             update_geosite_stats(2); // cache_misses
         }

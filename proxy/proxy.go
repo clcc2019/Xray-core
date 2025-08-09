@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"expvar"
 	"io"
 	"os"
 	"runtime"
@@ -48,6 +49,15 @@ var (
 	}
 )
 
+// expvar metrics (global)
+var (
+	xtlsPaddingBytesTotal     = expvar.NewInt("xtls_padding_bytes_total")
+	xtlsPaddingBudgetHitTotal = expvar.NewInt("xtls_padding_budget_exhausted_total")
+	xtlsDirectCopyTotal       = expvar.NewInt("xtls_direct_copy_engaged_total")
+	xtlsPacingMicrosTotal     = expvar.NewInt("xtls_pacing_micros_total")
+	xtlsSpliceTotal           = expvar.NewInt("xtls_splice_total")
+)
+
 // XTLS padding runtime config (tunable via env)
 var xtlsPadCfg struct {
 	bucket1             int32
@@ -57,6 +67,9 @@ var xtlsPadCfg struct {
 	disableAfterGrace   bool
 	directMinimalJitter int32
 }
+
+// pacing: optional tiny jitter for TLS records to smooth intervals
+var xtlsPacingEnabled bool
 
 func init() {
 	// defaults
@@ -90,6 +103,9 @@ func init() {
 	}
 	if v := os.Getenv("XRAY_XTLS_DIRECT_MIN_JITTER"); v != "" {
 		xtlsPadCfg.directMinimalJitter = int32(atoi(v, int(xtlsPadCfg.directMinimalJitter)))
+	}
+	if v := os.Getenv("XRAY_XTLS_PACING"); v != "" {
+		xtlsPacingEnabled = v != "0" && v != "false"
 	}
 }
 
@@ -163,6 +179,8 @@ type TrafficState struct {
 	directCopySince time.Time
 	// if true, padding will be fully disabled after grace window
 	paddingHardDisable bool
+	// last pacing time for optional jitter
+	lastPace time.Time
 }
 
 type InboundState struct {
@@ -311,6 +329,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				// record direct-copy since timestamp for padding grace window
 				if w.trafficState.directCopySince.IsZero() {
 					w.trafficState.directCopySince = time.Now()
+					xtlsDirectCopyTotal.Add(1)
 				}
 				// 同步直拷提示到 eBPF（仅 Linux 且 XRAY_EBPF=1）
 				if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
@@ -328,6 +347,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 										dport := uint16(laddr.Port)
 										// 写入直拷 hint
 										ebpf.GetXTLSVisionManager().SetDirectCopyHintIPv4(saddr, sport, daddr, dport, true)
+										// 优化 TCP 选项（QUICKACK / ZEROCOPY / NOTSENT_LOWAT）
+										optimizeTCPForDirectCopy(rawConn)
 									}
 								}
 							}
@@ -416,6 +437,21 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				}
 			}
 			mb[i] = XtlsPadding(b, command, &w.writeOnceUserUUID, longPadding, w.ctx, w.trafficState)
+		}
+	}
+	// Optional tiny pacing jitter for TLS records on low-latency links
+	if xtlsPacingEnabled && w.trafficState.IsTLS && !w.trafficState.paddingHardDisable {
+		// only when not switched to direct-copy writer
+		shouldPace := !(w.isUplink && w.trafficState.Outbound.UplinkWriterDirectCopy) && !(!w.isUplink && w.trafficState.Inbound.DownlinkWriterDirectCopy)
+		if shouldPace {
+			r := w.trafficState.nextRand32()
+			// 0..750 microseconds jitter
+			us := r % 750
+			if us > 0 {
+				time.Sleep(time.Duration(us) * time.Microsecond)
+				w.trafficState.lastPace = time.Now()
+				xtlsPacingMicrosTotal.Add(int64(us))
+			}
 		}
 	}
 	return w.Writer.WriteMultiBuffer(mb)
@@ -514,6 +550,20 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 					paddingLen += rem
 				}
 			}
+			// occasionally align to 8KiB/16KiB on high throughput to mimic larger TLS records
+			if r%48 == 0 {
+				const bucket8k = 8192
+				rem := int32(bucket8k - (total % bucket8k))
+				if rem > 0 && rem <= 192 {
+					paddingLen += rem
+				}
+			} else if r%96 == 0 {
+				const bucket16k = 16384
+				rem := int32(bucket16k - (total % bucket16k))
+				if rem > 0 && rem <= 256 {
+					paddingLen += rem
+				}
+			}
 		}
 	} else {
 		// non-long padding phase: small perturbation only
@@ -534,6 +584,7 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 			if paddingLen > 16 {
 				paddingLen = 16
 			}
+			xtlsPaddingBudgetHitTotal.Add(1)
 		} else if paddingLen > ts.paddingBudget {
 			paddingLen = ts.paddingBudget
 		}
@@ -557,6 +608,7 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 		b = nil
 	}
 	newbuffer.Extend(paddingLen)
+	xtlsPaddingBytesTotal.Add(int64(paddingLen))
 	errors.LogInfo(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
 	return newbuffer
 }

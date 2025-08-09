@@ -213,8 +213,14 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, reader *buf
 
 		// 使用 BufferedWriter 并基于 RTT 选择阈值
 		buffered := buf.NewBufferedWriter(buf.NewWriter(conn))
-		if d, ok := tcpinfo.DetectRTT(conn); ok && d > 30*time.Millisecond {
-			buffered.SetFlushThreshold(32 * 1024)
+		if d, ok := tcpinfo.DetectRTT(conn); ok {
+			if d > 60*time.Millisecond {
+				buffered.SetFlushThreshold(64 * 1024)
+			} else if d > 30*time.Millisecond {
+				buffered.SetFlushThreshold(32 * 1024)
+			} else {
+				buffered.SetFlushThreshold(16 * 1024)
+			}
 		} else {
 			buffered.SetFlushThreshold(16 * 1024)
 		}

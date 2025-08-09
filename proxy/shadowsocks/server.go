@@ -247,8 +247,14 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
-		if d, ok := tcpinfo.DetectRTT(conn); ok && d > 30*time.Millisecond {
-			bufferedWriter.SetFlushThreshold(32 * 1024)
+		if d, ok := tcpinfo.DetectRTT(conn); ok {
+			if d > 60*time.Millisecond {
+				bufferedWriter.SetFlushThreshold(64 * 1024)
+			} else if d > 30*time.Millisecond {
+				bufferedWriter.SetFlushThreshold(32 * 1024)
+			} else {
+				bufferedWriter.SetFlushThreshold(16 * 1024)
+			}
 		} else {
 			bufferedWriter.SetFlushThreshold(16 * 1024)
 		}

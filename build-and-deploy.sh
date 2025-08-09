@@ -3,8 +3,6 @@
 # Xray eBPF 构建和部署脚本
 # 支持多平台构建和自动部署
 
-set -e
-
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -110,8 +108,6 @@ cat > $BUILD_DIR/mount-ebpf.sh << 'EOF'
 # Xray eBPF 挂载脚本
 # 自动编译、加载和管理eBPF程序
 
-set -e
-
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -141,6 +137,8 @@ fi
 cleanup_ebpf() {
     log_info "清理历史eBPF程序..."
     mkdir -p $BPF_ROOT
+    chmod 755 /sys/fs/bpf 2>/dev/null || true
+    chmod 755 $BPF_ROOT 2>/dev/null || true
     # 尝试卸载 tc 过滤器
     if command -v tc >/dev/null 2>&1; then
       IFACES=$(ip -o link show | awk -F': ' '{print $2}')
@@ -150,8 +148,8 @@ cleanup_ebpf() {
         ip link set dev "$IF" xdp off 2>/dev/null || true
       done
     fi
-    # 清理pinned文件
-    rm -rf $BPF_ROOT/* 2>/dev/null || true
+    # 清理pinned文件（遇权限问题继续）
+    find "$BPF_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
     log_success "历史eBPF程序清理完成"
 }
 
@@ -302,10 +300,10 @@ load_ebpf() {
           elif ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" mode skb 2>/dev/null; then
             log_success "$pinned_name 附加到 $interface_name 成功 (通用XDP)"
           else
-            log_warning "$pinned_name 附加到 $interface_name 失败"
+            log_info "$pinned_name 附加失败，已忽略（继续）"
           fi
         else
-          log_warning "$pinned_name 加载失败 (XDP)"
+          log_info "$pinned_name 加载失败 (XDP)，已忽略"
         fi
       fi
     }
@@ -330,16 +328,20 @@ load_ebpf() {
       if [ -f "$obj" ]; then
         if bpftool prog loadall "$obj" "$BPF_ROOT/$pinned_name" pinmaps "$BPF_ROOT" 2>/dev/null; then
           log_success "$pinned_name 加载成功 (TC, 已 pin maps)"
-          attach_tc "$BPF_ROOT/$pinned_name" "$interface_name" 60 60 1
+          # 使用 obj+sec 方式附加，避免读取 pinned program 失败
+          attach_tc "$obj" "$interface_name" 60 60 0
         else
-          log_warning "$pinned_name 加载失败 (TC)"
+          log_info "$pinned_name 加载失败 (TC)，已忽略"
         fi
       fi
     }
 
     # 加载各模块
-    # 默认 DNS 走 TC，避免与主 XDP 冲突；如需 XDP 可设置 XRAY_XDP_EXTRA=dns
-    load_tc_with_pinmaps "app/dns/ebpf/dns_router_tc.o" "dns_router_tc"
+      # 默认 DNS 走 TC，避免与主 XDP 冲突；如需 XDP 可设置 XRAY_XDP_EXTRA=dns
+      load_tc_with_pinmaps "app/dns/ebpf/dns_router_tc.o" "dns_router_tc"
+      # 兼容 legacy section 名称：强制以 sec classifier 再尝试一次（忽略失败）
+      tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
+      tc filter replace dev "$interface_name" ingress prio 60 handle 60 bpf da obj app/dns/ebpf/dns_router_tc.o sec classifier 2>/dev/null || true
     if [ "$XRAY_XDP_EXTRA" = "dns" ]; then
       load_xdp "app/dns/ebpf/dns_cache.o" "dns_cache_prog"
     fi
@@ -369,6 +371,9 @@ load_ebpf() {
                 done
             fi
         done
+        # 尝试附着 TC，实现域名热缓存打标（失败忽略）
+        tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
+        tc filter replace dev "$interface_name" ingress prio 61 handle 61 bpf da obj app/router/ebpf/geosite_matcher_dynamic.o sec tc 2>/dev/null || true
     fi
 
     # 动态 GeoIP 学习缓存
@@ -388,6 +393,9 @@ load_ebpf() {
                 done
             fi
         done
+        # 尝试附着 TC，实现 GeoIP 热缓存打标（失败忽略）
+        tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
+        tc filter replace dev "$interface_name" ingress prio 62 handle 62 bpf da obj app/router/ebpf/geoip_matcher_dynamic.o sec tc 2>/dev/null || true
     fi
 
     load_xdp "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp"
@@ -419,9 +427,10 @@ show_status() {
     bpftool prog list | grep -E "dns|xray|tcp|xtls|proxy" || true
     bpftool map list | grep -E "dns|xray|tcp|xtls|proxy" || true
     
-    log_info "部署命令:"
-    echo "   ip rule add fwmark 0x1 lookup 100; ip route add default via <DNS1-GW> table 100"
-    echo "   ip rule add fwmark 0x2 lookup 200; ip route add default via <DNS2-GW> table 200"
+    log_info "策略路由规则:"
+    ip rule list | grep -E 'fwmark 0x1|fwmark 0x2' | cat
+    ip route show table 100 | cat
+    ip route show table 200 | cat
 }
 
 # 主流程
@@ -452,8 +461,6 @@ cat > $BUILD_DIR/deploy.sh << 'EOF'
 #!/bin/bash
 
 # Xray eBPF 部署脚本
-
-set -e
 
 # 颜色定义
 GREEN='\033[0;32m'

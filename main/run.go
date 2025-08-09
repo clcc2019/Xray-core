@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	routerebpf "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common/cmdarg"
 	"github.com/xtls/xray-core/common/errors"
 	clog "github.com/xtls/xray-core/common/log"
@@ -85,6 +86,10 @@ func executeRun(cmd *base.Command, args []string) {
 
 	// Initialize TCP CC eBPF policy (Linux only; no-op elsewhere)
 	_ = transportebpf.InitDefaultTCPCCPolicy()
+	// Seed geosite/geoip policy from env if eBPF enabled (Linux-only)
+	if os.Getenv("XRAY_EBPF") == "1" {
+		routerebpf.NewPolicyManager().ApplyDefaultsFromEnv()
+	}
 
 	if *test {
 		fmt.Println("Configuration OK.")
