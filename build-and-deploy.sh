@@ -32,24 +32,20 @@ BUILD_DIR="build"
 BINARY_NAME="xray"
 VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 
-# 支持的平台
-PLATFORMS=(
-    "linux/amd64"
-    "darwin/amd64"
-    "darwin/arm64"
-)
+# 仅面向 Linux 服务器构建；如需自定义，设置环境变量 XRAY_BUILD_PLATFORMS（以逗号分隔）
+DEFAULT_PLATFORMS=("linux/amd64")
+if [ -n "${XRAY_BUILD_PLATFORMS:-}" ]; then
+  IFS=',' read -r -a PLATFORMS <<< "$XRAY_BUILD_PLATFORMS"
+else
+  PLATFORMS=("${DEFAULT_PLATFORMS[@]}")
+fi
 
 echo "========================================"
 echo "Xray eBPF 构建脚本 v$VERSION"
 echo "========================================"
 
-# 检测操作系统
-OS=$(uname -s)
-if [ "$OS" = "Darwin" ]; then
-    log_info "在 macOS 上构建多平台版本..."
-else
-    log_warning "当前在 $OS 上运行，建议在 macOS 上构建"
-fi
+# 打印构建目标
+log_info "构建目标平台: ${PLATFORMS[*]}"
 
 # 创建构建目录
 log_info "创建构建目录..."
@@ -63,9 +59,7 @@ build_platform() {
     local arch=$(echo $platform | cut -d'/' -f2)
     local output="$BUILD_DIR/${BINARY_NAME}-${os}-${arch}"
     
-    if [ "$os" = "linux" ]; then
-        output="${output}-ebpf"
-    fi
+    if [ "$os" = "linux" ]; then output="${output}-ebpf"; fi
     
     log_info "构建 $os/$arch 版本..."
     
@@ -472,30 +466,7 @@ load_ebpf() {
     # IP 快速路由器（TC）
     load_tc_with_pinmaps "app/router/ebpf/ip_fastpath_tc.o" "ip_fastpath_tc"
 
-    # sk_lookup 直连重定向（如内核支持）
-    if [ -f "transport/internet/tcp/ebpf/sk_lookup_redirect.o" ]; then
-      # 创建开关与 redirect maps
-      bpftool map create $BPF_ROOT/skl_redirect_enable type array key 4 value 4 entries 1 name skl_redirect_enable 2>/dev/null || true
-      bpftool map create $BPF_ROOT/route_ip_v4_redirect type lru_hash key 4 value 2 entries 100000 name route_ip_v4_redirect 2>/dev/null || true
-      bpftool map create $BPF_ROOT/route_ip_v6_redirect type lru_hash key 16 value 2 entries 80000 name route_ip_v6_redirect 2>/dev/null || true
-      if bpftool prog load transport/internet/tcp/ebpf/sk_lookup_redirect.o "$BPF_ROOT/sk_lookup_redirect" type sk_lookup 2>/dev/null; then
-        log_success "sk_lookup_redirect 加载成功"
-        # 默认关闭，除非显式开启 XRAY_EBPF_SKLOOKUP=1
-        if [ "${XRAY_EBPF_SKLOOKUP:-0}" = "1" ]; then
-          bpftool map update pinned "$BPF_ROOT/skl_redirect_enable" key hex 00 00 00 00 value hex 01 00 00 00 2>/dev/null || true
-        else
-          bpftool map update pinned "$BPF_ROOT/skl_redirect_enable" key hex 00 00 00 00 value hex 00 00 00 00 2>/dev/null || true
-        fi
-        # 尝试附加到 cgroup v2 根（需要系统启用 cgroup v2）
-        if mount | grep -q "cgroup2 on /sys/fs/cgroup"; then
-          bpftool cgroup attach /sys/fs/cgroup sk_lookup pinned "$BPF_ROOT/sk_lookup_redirect" 2>/dev/null || true
-        else
-          log_info "cgroup v2 未启用，跳过 sk_lookup 附加"
-        fi
-      else
-        log_info "sk_lookup_redirect 加载失败（可能内核不支持），已忽略"
-      fi
-    fi
+    # sk_lookup 重定向已移除（按用户要求精简）
 
     # 根据环境变量设置开关位（默认开启，可用环境变量显式置0关闭）
     set_enable_flag() {

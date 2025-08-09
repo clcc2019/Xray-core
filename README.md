@@ -1,5 +1,7 @@
 # Xray-core with eBPF Acceleration
 
+[中文文档（简体）](README_zh-CN.md)
+
 [Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).
 
 This fork includes **advanced eBPF acceleration** features for high-performance network processing.
@@ -183,3 +185,4 @@ export XRAY_LOG_LEVEL=debug
 ---
 
 **Note**: This is an enhanced fork of Xray-core with eBPF acceleration. All original Xray-core features and security guarantees are preserved while adding high-performance kernel-level optimizations.
+

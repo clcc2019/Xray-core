@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/xtls/xray-core/common/errors"
+	"golang.org/x/sys/unix"
 )
 
 // 真正的eBPF集成实现
@@ -28,6 +28,7 @@ const (
 	BPF_MAP_LOOKUP_ELEM = 1
 	BPF_MAP_UPDATE_ELEM = 2
 	BPF_MAP_DELETE_ELEM = 3
+	BPF_OBJ_GET         = 7
 )
 
 // value structs aligned with kernel side (dns_cache.c)
@@ -70,8 +71,8 @@ func NewRealEBpfDNSCache() (*RealEBpfDNSCache, error) {
 // 检查eBPF支持
 func (c *RealEBpfDNSCache) checkEBpfSupport() error {
 	// 检查内核版本
-	var uname syscall.Utsname
-	if err := syscall.Uname(&uname); err != nil {
+	var uname unix.Utsname
+	if err := unix.Uname(&uname); err != nil {
 		return fmt.Errorf("failed to get kernel version: %v", err)
 	}
 
@@ -140,7 +141,7 @@ func bpfObjGetPinned(path string) (int, error) {
 	}{
 		pathname: uint64(uintptr(unsafe.Pointer(&b[0]))),
 	}
-	fd, _, errno := syscall.Syscall(SYS_BPF, BPF_OBJ_GET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	fd, _, errno := unix.Syscall(unix.SYS_BPF, BPF_OBJ_GET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
 	if errno != 0 {
 		return -1, fmt.Errorf("bpf obj get failed: %v", errno)
 	}
@@ -263,7 +264,7 @@ func (c *RealEBpfDNSCache) updateMap(mapFd int, key, value unsafe.Pointer) error
 		flags: 0,
 	}
 
-	_, _, errno := syscall.Syscall(SYS_BPF, BPF_MAP_UPDATE_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	_, _, errno := unix.Syscall(unix.SYS_BPF, BPF_MAP_UPDATE_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
 	if errno != 0 {
 		return fmt.Errorf("bpf map update failed: %v", errno)
 	}
@@ -283,7 +284,7 @@ func (c *RealEBpfDNSCache) lookupMap(mapFd int, key, value unsafe.Pointer) error
 		value: uintptr(value),
 	}
 
-	_, _, errno := syscall.Syscall(SYS_BPF, BPF_MAP_LOOKUP_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	_, _, errno := unix.Syscall(unix.SYS_BPF, BPF_MAP_LOOKUP_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
 	if errno != 0 {
 		return fmt.Errorf("bpf map lookup failed: %v", errno)
 	}
@@ -300,7 +301,7 @@ func (c *RealEBpfDNSCache) deleteMap(mapFd int, key unsafe.Pointer) error {
 		mapFd: uint32(mapFd),
 		key:   uintptr(key),
 	}
-	_, _, errno := syscall.Syscall(SYS_BPF, BPF_MAP_DELETE_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	_, _, errno := unix.Syscall(unix.SYS_BPF, BPF_MAP_DELETE_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
 	if errno != 0 {
 		return fmt.Errorf("bpf map delete failed: %v", errno)
 	}
@@ -354,13 +355,13 @@ func (c *RealEBpfDNSCache) GetStats() map[string]interface{} {
 // 关闭eBPF资源
 func (c *RealEBpfDNSCache) Close() error {
 	if c.programFd > 0 {
-		syscall.Close(c.programFd)
+		_ = unix.Close(c.programFd)
 	}
 	if c.dnsCacheMap > 0 {
-		syscall.Close(c.dnsCacheMap)
+		_ = unix.Close(c.dnsCacheMap)
 	}
 	if c.statsMap > 0 {
-		syscall.Close(c.statsMap)
+		_ = unix.Close(c.statsMap)
 	}
 	c.enabled = false
 	errors.LogInfo(context.Background(), "Real eBPF DNS cache closed")
