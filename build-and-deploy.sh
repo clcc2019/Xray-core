@@ -127,11 +127,10 @@ CACHE_FILE="/tmp/.xray_ebpf_deps_checked"
 echo "🚀 Xray eBPF 挂载脚本"
 echo "================================"
 
-# 权限检查
-if [ "$EUID" -ne 0 ]; then
-    log_error "请使用 sudo 运行此脚本"
-    exit 1
-fi
+    # 权限检查（降级为警告：允许在非 root 环境下运行，跳过可能失败的步骤）
+    if [ "$EUID" -ne 0 ]; then
+        log_warning "未以 root 运行：部分步骤可能失败（将忽略并继续）"
+    fi
 
   # 确保 bpffs 已挂载
   if ! mountpoint -q /sys/fs/bpf 2>/dev/null; then
@@ -249,6 +248,11 @@ load_ebpf() {
     bpftool map create $BPF_ROOT/geoip_policy type hash key 1 value 4 entries 256 name geoip_policy 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v4 type hash key 4 value 1 entries 10000 name geoip_v4 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v6 type hash key 8 value 1 entries 10000 name geoip_v6 2>/dev/null || true
+    # GeoIP IPv4 CIDR LPM trie (key: struct {u32 prefixlen; u32 addr}) value: 4 bytes (prefix_len, country_code, reverse, reserved)
+    # 与 app/router/ebpf/geoip_matcher.c 的 struct lpm_v4_key / struct cidr_entry 对齐
+    bpftool map create $BPF_ROOT/cidr_v4_map type lpm_trie key 8 value 4 entries 100000 flags 1 name cidr_v4_map 2>/dev/null || true
+    # GeoIP IPv6 CIDR LPM trie (key: struct {u32 prefixlen; u64 hi; u64 lo}) value: 4 bytes
+    bpftool map create $BPF_ROOT/cidr_v6_map type lpm_trie key 20 value 4 entries 100000 flags 1 name cidr_v6_map 2>/dev/null || true
     bpftool map create $BPF_ROOT/connection_map type hash key 8 value 64 entries 65536 name connection_map 2>/dev/null || true
     bpftool map create $BPF_ROOT/route_geoip_v4_hint type lru_hash key 4 value 4 entries 65536 name route_geoip_v4_hint 2>/dev/null || true
     bpftool map create $BPF_ROOT/xtls_direct_copy_hint type hash key 8 value 1 entries 65536 name xtls_direct_copy_hint 2>/dev/null || true
@@ -303,13 +307,16 @@ load_ebpf() {
         return 1
     }
     
-    # 获取网络接口名称（可由 XRAY_IFACE 覆盖）
+    # 获取网络接口名称（可由 XRAY_IFACE 覆盖），避免使用 grep -P 以提升兼容性
     local interface_name=${XRAY_IFACE:-}
     if [ -z "$interface_name" ]; then
-      interface_name=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -1)
+      interface_name=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')
     fi
     if [ -z "$interface_name" ]; then
-        interface_name="ens5"  # 默认接口
+      interface_name=$(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|docker|veth|cni|br-)' | head -1)
+    fi
+    if [ -z "$interface_name" ]; then
+      interface_name="eth0"
     fi
     
     log_info "使用网络接口: $interface_name"
@@ -352,12 +359,16 @@ load_ebpf() {
     load_tc_with_pinmaps() {
       local obj=$1; local pinned_name=$2
       if [ -f "$obj" ]; then
+        # 优先使用 loadall + pinmaps；失败则回退逐个 section 加载 classifier/sec tc
         if bpftool prog loadall "$obj" "$BPF_ROOT/$pinned_name" pinmaps "$BPF_ROOT" 2>/dev/null; then
           log_success "$pinned_name 加载成功 (TC, 已 pin maps)"
           # 使用 obj+sec 方式附加，避免读取 pinned program 失败
           attach_tc "$obj" "$interface_name" 60 60 0
         else
-          log_info "$pinned_name 加载失败 (TC)，已忽略"
+          log_info "$pinned_name 加载失败 (TC loadall)，尝试 classifier/sec 回退"
+          tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
+          tc filter replace dev "$interface_name" ingress prio 60 handle 60 bpf da obj "$obj" sec classifier 2>/dev/null || true
+          tc filter replace dev "$interface_name" ingress prio 61 handle 61 bpf da obj "$obj" sec tc 2>/dev/null || true
         fi
       fi
     }
@@ -461,6 +472,31 @@ load_ebpf() {
     # IP 快速路由器（TC）
     load_tc_with_pinmaps "app/router/ebpf/ip_fastpath_tc.o" "ip_fastpath_tc"
 
+    # sk_lookup 直连重定向（如内核支持）
+    if [ -f "transport/internet/tcp/ebpf/sk_lookup_redirect.o" ]; then
+      # 创建开关与 redirect maps
+      bpftool map create $BPF_ROOT/skl_redirect_enable type array key 4 value 4 entries 1 name skl_redirect_enable 2>/dev/null || true
+      bpftool map create $BPF_ROOT/route_ip_v4_redirect type lru_hash key 4 value 2 entries 100000 name route_ip_v4_redirect 2>/dev/null || true
+      bpftool map create $BPF_ROOT/route_ip_v6_redirect type lru_hash key 16 value 2 entries 80000 name route_ip_v6_redirect 2>/dev/null || true
+      if bpftool prog load transport/internet/tcp/ebpf/sk_lookup_redirect.o "$BPF_ROOT/sk_lookup_redirect" type sk_lookup 2>/dev/null; then
+        log_success "sk_lookup_redirect 加载成功"
+        # 默认关闭，除非显式开启 XRAY_EBPF_SKLOOKUP=1
+        if [ "${XRAY_EBPF_SKLOOKUP:-0}" = "1" ]; then
+          bpftool map update pinned "$BPF_ROOT/skl_redirect_enable" key hex 00 00 00 00 value hex 01 00 00 00 2>/dev/null || true
+        else
+          bpftool map update pinned "$BPF_ROOT/skl_redirect_enable" key hex 00 00 00 00 value hex 00 00 00 00 2>/dev/null || true
+        fi
+        # 尝试附加到 cgroup v2 根（需要系统启用 cgroup v2）
+        if mount | grep -q "cgroup2 on /sys/fs/cgroup"; then
+          bpftool cgroup attach /sys/fs/cgroup sk_lookup pinned "$BPF_ROOT/sk_lookup_redirect" 2>/dev/null || true
+        else
+          log_info "cgroup v2 未启用，跳过 sk_lookup 附加"
+        fi
+      else
+        log_info "sk_lookup_redirect 加载失败（可能内核不支持），已忽略"
+      fi
+    fi
+
     # 根据环境变量设置开关位（默认开启，可用环境变量显式置0关闭）
     set_enable_flag() {
       local map_path=$1; local on=$2
@@ -474,10 +510,40 @@ load_ebpf() {
     if [ "${XRAY_EBPF_DNS_ROUTER:-1}" = "0" ]; then set_enable_flag "$BPF_ROOT/dns_router_enable" 0; else set_enable_flag "$BPF_ROOT/dns_router_enable" 1; fi
     if [ "${XRAY_EBPF_GEOSITE:-1}" = "0" ]; then set_enable_flag "$BPF_ROOT/geosite_enable" 0; else set_enable_flag "$BPF_ROOT/geosite_enable" 1; fi
 
+    # 自动路由表与规则（Direct 直出），减少手工操作
+    # 可通过环境变量控制：
+    #   XRAY_RT_AUTOCONFIG=0 关闭
+    #   XRAY_RT_DIRECT_TABLE=100 指定直出表号
+    #   XRAY_RT_DIRECT_MARK=0x1  指定直出 fwmark
+    if [ "${XRAY_RT_AUTOCONFIG:-1}" = "1" ]; then
+      local dir_table=${XRAY_RT_DIRECT_TABLE:-100}
+      local dir_mark=${XRAY_RT_DIRECT_MARK:-0x1}
+      # 解析默认网关
+      local gw
+      gw=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}')
+      if [ -z "$gw" ]; then
+        gw=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}' | head -1)
+      fi
+      if [ -n "$gw" ]; then
+        # 添加策略路由与表的默认路由（幂等）
+        ip rule list 2>/dev/null | grep -q "fwmark $dir_mark lookup $dir_table" || ip rule add fwmark $dir_mark table $dir_table 2>/dev/null || true
+        ip -f inet route replace default via "$gw" dev "$interface_name" table "$dir_table" 2>/dev/null || true
+      else
+        log_warning "未检测到默认网关，跳过直出表($dir_table)自动配置"
+      fi
+    fi
+
     # 固定写入示例 geosite 策略（site_code=1 -> fwmark 0x1），可用环境变量关闭
     if [ "${XRAY_EBPF_WRITE_DEFAULT_POLICY:-1}" = "1" ]; then
       bpftool map update pinned "$BPF_ROOT/geosite_policy" key hex 01 value hex 01 00 00 00 2>/dev/null || true
     fi
+    # 调试：输出当前关键 maps 与开关状态（失败忽略）
+    log_info "开关状态概览(尝试读取)："
+    for m in ip_fastpath_enable dns_router_enable geosite_enable; do
+      if [ -e "$BPF_ROOT/$m" ]; then
+        bpftool map lookup pinned "$BPF_ROOT/$m" key hex 00 00 00 00 2>/dev/null || true
+      fi
+    done
 }
 
 # 设置权限
@@ -498,9 +564,14 @@ show_status() {
     bpftool map list | grep -E "dns|xray|tcp|xtls|proxy" || true
     
     log_info "策略路由规则:"
-    ip rule list | grep -E 'fwmark 0x1|fwmark 0x2' | cat
-    ip route show table 100 | cat
-    ip route show table 200 | cat
+    ip -f inet rule list | cat
+    # 避免“FIB table does not exist”报错：仅展示实际引用的表
+    local tbls
+    tbls=$(ip -f inet rule list 2>/dev/null | awk '/lookup/{for(i=1;i<=NF;i++){if($i=="lookup"){print $(i+1)}}}' | sort -u)
+    for t in $tbls; do
+      log_info "路由表 $t:"
+      ip -f inet route show table "$t" 2>/dev/null || true
+    done
 }
 
 # 主流程

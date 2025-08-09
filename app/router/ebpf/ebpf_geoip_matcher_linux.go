@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"sync"
 
@@ -62,7 +63,33 @@ func (m *EBpfGeoIPMatcher) AddIPv4CIDR(cidr *net.IPNet, countryCode string) erro
 	m.Lock()
 	defer m.Unlock()
 
-	errors.LogInfo(context.Background(), "Added IPv4 CIDR to eBPF (Linux): ", cidr.String(), " -> ", countryCode)
+	// Load LPM trie pinned map for IPv4 CIDRs
+	mp, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/cidr_v4_map", nil)
+	if err != nil {
+		return errors.New("cidr_v4_map not available: ").Base(err)
+	}
+	// Parse CIDR
+	ones, _ := cidr.Mask.Size()
+	// Convert network to host-order u32
+	ip4 := cidr.IP.To4()
+	if ip4 == nil {
+		return errors.New("not an IPv4 CIDR")
+	}
+	key := struct {
+		PrefixLen uint32
+		Addr      uint32
+	}{PrefixLen: uint32(ones), Addr: binary.BigEndian.Uint32(ip4)}
+	// Value layout must match struct cidr_entry in C (4 bytes)
+	val := struct {
+		PrefixLen   uint8
+		CountryCode uint8
+		Reverse     uint8
+		Reserved    uint8
+	}{PrefixLen: uint8(ones), CountryCode: CountryCode8FromString(countryCode)}
+	if err := mp.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		return errors.New("update cidr_v4_map failed: ").Base(err)
+	}
+	errors.LogInfo(context.Background(), "Added IPv4 CIDR to eBPF (LPM): ", cidr.String(), " -> ", countryCode)
 	return nil
 }
 
@@ -74,8 +101,31 @@ func (m *EBpfGeoIPMatcher) AddIPv6CIDR(cidr *net.IPNet, countryCode string) erro
 
 	m.Lock()
 	defer m.Unlock()
-
-	errors.LogInfo(context.Background(), "Added IPv6 CIDR to eBPF (Linux): ", cidr.String(), " -> ", countryCode)
+	// Load IPv6 LPM trie
+	mp, err := ebpf.LoadPinnedMap("/sys/fs/bpf/xray/cidr_v6_map", nil)
+	if err != nil {
+		return errors.New("cidr_v6_map not available: ").Base(err)
+	}
+	ones, _ := cidr.Mask.Size()
+	ip6 := cidr.IP.To16()
+	if ip6 == nil || cidr.IP.To4() != nil {
+		return errors.New("not an IPv6 CIDR")
+	}
+	key := struct {
+		PrefixLen uint32
+		Hi        uint64
+		Lo        uint64
+	}{PrefixLen: uint32(ones), Hi: binary.BigEndian.Uint64(ip6[0:8]), Lo: binary.BigEndian.Uint64(ip6[8:16])}
+	val := struct {
+		PrefixLen   uint8
+		CountryCode uint8
+		Reverse     uint8
+		Reserved    uint8
+	}{PrefixLen: uint8(ones), CountryCode: CountryCode8FromString(countryCode)}
+	if err := mp.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		return errors.New("update cidr_v6_map failed: ").Base(err)
+	}
+	errors.LogInfo(context.Background(), "Added IPv6 CIDR to eBPF (LPM): ", cidr.String(), " -> ", countryCode)
 	return nil
 }
 

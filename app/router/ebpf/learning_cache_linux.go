@@ -137,6 +137,16 @@ func PromoteDomain(domain string, siteCode uint8, ttlSeconds uint32) {
 			errors.LogDebug(context.Background(), "geosite_enable update failed: ", err)
 		}
 	}
+
+	// 同步将域名解析结果对应的已知 IP（若存在）写入 IP FastPath hint：
+	// 轻量策略：仅当 site_code=1 且存在 geosite_policy[1] mark 时执行。
+	if siteCode == 1 {
+		if mark, ok := GetGeoSitePolicyMark(1); ok && mark != 0 {
+			// 无法直接从此处取到域名 IP 列表；留给 DNS 写回路径完成（已实现）。
+			// 这里仅确保 fastpath 开关开启。
+			EnableIPFastpath(true)
+		}
+	}
 }
 
 // PromoteIPv4 writes IPv4 country-code to dynamic cache and to route hint map for fast path.

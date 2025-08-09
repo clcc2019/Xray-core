@@ -108,24 +108,21 @@ func (xvm *XTLSVisionManager) loadInboundProgram() error {
 		return fmt.Errorf("eBPF not supported: %w", err)
 	}
 
-	// 2. 从pinned程序中获取eBPF程序（由mount-ebpf.sh预先加载）
+	// 2. 从pinned程序中获取eBPF程序（由mount-ebpf.sh预先加载）。若失败，仅告警并继续（不影响主功能）。
 	if err := xvm.loadPinnedPrograms(); err != nil {
 		log.Record(&log.GeneralMessage{
 			Severity: log.Severity_Warning,
-			Content:  "Failed to load pinned eBPF programs: " + err.Error() + ". eBPF acceleration disabled.",
+			Content:  "Pinned XDP/TC program not loaded: " + err.Error() + "; continue without kernel acceleration",
 		})
-		xvm.enabled = false
-		return nil
+		// 不标记为禁用，以便 maps 仍然可用（例如 direct_copy_hint 等）
 	}
 
-	// 3. 获取eBPF映射表
+	// 3. 获取eBPF映射表（失败也不致停用；可能仅部分功能不可用）
 	if err := xvm.loadPinnedMaps(); err != nil {
 		log.Record(&log.GeneralMessage{
 			Severity: log.Severity_Warning,
-			Content:  "Failed to load pinned eBPF maps: " + err.Error() + ". eBPF acceleration disabled.",
+			Content:  "Pinned maps not fully available: " + err.Error(),
 		})
-		xvm.enabled = false
-		return nil
 	}
 
 	log.Record(&log.GeneralMessage{

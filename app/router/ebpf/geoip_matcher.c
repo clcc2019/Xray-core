@@ -34,12 +34,19 @@ struct geoip_v6_entry {
     __u8 reserved;         // 保留字段
 };
 
-// CIDR范围映射表
+// LPM Trie key for IPv4
+struct lpm_v4_key {
+    __u32 prefixlen;   // 前缀长度（单位：bit）
+    __u32 addr;        // IPv4地址（与用户态一致的字节序）
+};
+
+// CIDR范围映射表（改为 LPM_TRIE，最长前缀匹配）
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10000);
-    __type(key, __u32);    // 网络地址
-    __type(value, struct cidr_entry);   // CIDR条目
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __uint(max_entries, 100000);
+    __type(key, struct lpm_v4_key);         // {prefixlen, addr}
+    __type(value, struct cidr_entry);       // CIDR条目
 } cidr_v4_map SEC(".maps");
 
 // CIDR条目结构
@@ -107,28 +114,22 @@ static __always_inline __u8 match_ipv4_geoip(__u32 ip) {
     if (country_code) {
         return *country_code;
     }
-    
-    // 检查CIDR范围匹配
-    struct cidr_entry *entry;
-    __u32 network;
-    
-    // 遍历可能的网络地址
-    for (int prefix_len = 32; prefix_len >= 8; prefix_len--) {
-        __u32 mask = 0xFFFFFFFF << (32 - prefix_len);
-        network = ip & mask;
-        
-        entry = bpf_map_lookup_elem(&cidr_v4_map, &network);
-        if (entry && entry->prefix_len == prefix_len) {
-            // 更新统计信息
-            __u8 country_code = entry->country_code;
-            __u64 *count = bpf_map_lookup_elem(&geoip_stats, &country_code);
-            if (count) {
-                (*count)++;
-            }
-            return country_code;
+
+    // 使用 LPM_TRIE 进行最长前缀匹配
+    struct lpm_v4_key key = {
+        .prefixlen = 32,
+        .addr = ip,
+    };
+    struct cidr_entry *entry = bpf_map_lookup_elem(&cidr_v4_map, &key);
+    if (entry) {
+        __u8 cc = entry->country_code;
+        __u64 *count = bpf_map_lookup_elem(&geoip_stats, &cc);
+        if (count) {
+            (*count)++;
         }
+        return cc;
     }
-    
+
     return 0; // 未匹配
 }
 

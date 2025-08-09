@@ -146,10 +146,11 @@ func UClientWithZeroRTT(c net.Conn, config *Config, ctx context.Context, dest ne
 		Config: config,
 	}
 	utlsConfig := &utls.Config{
-		VerifyPeerCertificate:  uConn.VerifyPeerCertificate,
-		ServerName:             config.ServerName,
-		InsecureSkipVerify:     true,
-		SessionTicketsDisabled: true,
+		VerifyPeerCertificate: uConn.VerifyPeerCertificate,
+		ServerName:            config.ServerName,
+		InsecureSkipVerify:    true,
+		// 为更贴近浏览器行为，允许会话票据（不启用 0-RTT，仅影响恢复特征）
+		SessionTicketsDisabled: false,
 		KeyLogWriter:           KeyLogWriterFromConfig(config),
 	}
 	if utlsConfig.ServerName == "" {
@@ -158,7 +159,12 @@ func UClientWithZeroRTT(c net.Conn, config *Config, ctx context.Context, dest ne
 	// Apply prebuilt REALITY profile (ALPN order, etc.) if available; otherwise schedule async probe
 	realityprofiler.ApplyToTLSConfig(utlsConfig.ServerName, utlsConfig)
 	uConn.ServerName = utlsConfig.ServerName
-	fingerprint := tls.GetFingerprint(config.Fingerprint)
+	// 浏览器指纹优化：若未显式配置则按预采集偏好选择（保守使用 chrome）
+	fpName := config.Fingerprint
+	if fpName == "" {
+		fpName = "chrome"
+	}
+	fingerprint := tls.GetFingerprint(fpName)
 	if fingerprint == nil {
 		return nil, errors.New("REALITY: failed to get fingerprint").AtError()
 	}

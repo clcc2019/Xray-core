@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"expvar"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -35,6 +38,14 @@ type manager struct {
 	fpPreset  string
 	dialTO    time.Duration
 	refreshTO time.Duration
+	// persistence
+	storePath string
+	persistCh chan struct{}
+	// concurrency control
+	maxInflight int
+	sem         chan struct{}
+	// retry
+	retryCount map[string]int
 
 	// metrics
 	hits    *expvar.Int
@@ -45,29 +56,43 @@ type manager struct {
 var global *manager
 
 func init() {
-	// Enable via env: XRAY_REALITY_PREBUILD=1
-	if os.Getenv("XRAY_REALITY_PREBUILD") == "" {
-		return
-	}
 	m := &manager{
-		profiles:  make(map[string]*Profile),
-		pending:   make(map[string]struct{}),
-		ttl:       envDuration("XRAY_REALITY_TTL", 30*time.Minute),
-		interval:  envDuration("XRAY_REALITY_REFRESH_INTERVAL", 10*time.Minute),
-		fpPreset:  envString("XRAY_REALITY_FP", "chrome"),
-		dialTO:    envDuration("XRAY_REALITY_DIAL_TIMEOUT", 5*time.Second),
-		refreshTO: envDuration("XRAY_REALITY_REFRESH_TIMEOUT", 6*time.Second),
-		hits:      expvar.NewInt("reality_prebuild_hits_total"),
-		misses:    expvar.NewInt("reality_prebuild_misses_total"),
-		updates:   expvar.NewInt("reality_prebuild_updates_total"),
+		profiles:    make(map[string]*Profile),
+		pending:     make(map[string]struct{}),
+		ttl:         envDuration("XRAY_REALITY_TTL", 30*time.Minute),
+		interval:    envDuration("XRAY_REALITY_REFRESH_INTERVAL", 10*time.Minute),
+		fpPreset:    envString("XRAY_REALITY_FP", "chrome"),
+		dialTO:      envDuration("XRAY_REALITY_DIAL_TIMEOUT", 5*time.Second),
+		refreshTO:   envDuration("XRAY_REALITY_REFRESH_TIMEOUT", 6*time.Second),
+		hits:        expvar.NewInt("reality_prebuild_hits_total"),
+		misses:      expvar.NewInt("reality_prebuild_misses_total"),
+		updates:     expvar.NewInt("reality_prebuild_updates_total"),
+		storePath:   defaultStorePath(),
+		persistCh:   make(chan struct{}, 1),
+		maxInflight: envInt("XRAY_REALITY_MAX_INFLIGHT", 4),
+		retryCount:  make(map[string]int),
 	}
+	if m.maxInflight <= 0 {
+		m.maxInflight = 2
+	}
+	m.sem = make(chan struct{}, m.maxInflight)
 	global = m
 
-	// Kickoff initial targets
-	targets := parseTargets(os.Getenv("XRAY_REALITY_TARGETS"))
-	for _, h := range targets {
-		go m.probeAndStore(context.Background(), h)
-	}
+	// Load persisted profiles (best-effort)
+	_ = m.loadFromFile()
+
+	// Persistence worker (debounced)
+	go func() {
+		var t *time.Timer
+		for range m.persistCh {
+			if t != nil {
+				t.Stop()
+			}
+			t = time.NewTimer(1 * time.Second)
+			<-t.C
+			_ = m.storeToFile()
+		}
+	}()
 
 	// Periodic refresh
 	go func() {
@@ -112,6 +137,20 @@ func envDuration(key string, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	// simple parse
+	var x int
+	_, err := fmt.Sscanf(v, "%d", &x)
+	if err != nil {
+		return def
+	}
+	return x
 }
 
 func parseTargets(s string) []string {
@@ -183,6 +222,11 @@ func (m *manager) set(host string, p *Profile) {
 	defer m.mu.Unlock()
 	m.profiles[strings.ToLower(host)] = p
 	delete(m.pending, strings.ToLower(host))
+	// notify persist
+	select {
+	case m.persistCh <- struct{}{}:
+	default:
+	}
 }
 
 func (m *manager) markPending(host string) bool {
@@ -206,10 +250,15 @@ func (m *manager) probeAndStore(ctx context.Context, host string) {
 		m.mu.Unlock()
 	}()
 
+	// concurrency limit
+	m.sem <- struct{}{}
+	defer func() { <-m.sem }()
+
 	start := time.Now()
 	prof, err := m.probeOnce(ctx, host)
 	if err != nil {
 		errors.LogWarning(context.Background(), "REALITY prebuild probe failed for ", host, ": ", err)
+		m.scheduleRetry(host)
 		return
 	}
 	prof.HandshakeRTTMs = time.Since(start).Milliseconds()
@@ -235,8 +284,10 @@ func (m *manager) probeOnce(ctx context.Context, host string) (*Profile, error) 
 	ucfg := &utls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
-		// Offer common ALPN order; server will select one we can observe
+		// 模仿浏览器：提供常见 ALPN 顺序，后续由服务器选择
 		NextProtos: []string{"h2", "http/1.1"},
+		// 允许会话票据更贴近浏览器，但不在此启用 0-RTT
+		SessionTicketsDisabled: false,
 	}
 	uconn := utls.UClient(conn, ucfg, *fp)
 	// Trigger TLS handshake
@@ -275,13 +326,32 @@ func ApplyToTLSConfig(host string, cfg *utls.Config) {
 	if cfg == nil {
 		return
 	}
-	if p := Get(host); p != nil {
-		if len(p.ALPN) > 0 {
-			cfg.NextProtos = append([]string(nil), p.ALPN...)
+	// 默认安全候选（严格、可互通）
+	const (
+		alpnH2     = "h2"
+		alpnHTTP11 = "http/1.1"
+	)
+	defaultOrder := []string{alpnH2, alpnHTTP11}
+
+	// 读取已缓存的 ALPN；否则触发异步采集
+	var order []string
+	if host != "" {
+		if p := Get(host); p != nil && len(p.ALPN) > 0 {
+			order = sanitizeAndClampALPN(p.ALPN)
+		} else {
+			EnsureAsync(host)
 		}
-	} else {
-		EnsureAsync(host)
 	}
+
+	// 极限保护：
+	// - 若无可用 ALPN 或清洗后为空，则回退到默认顺序
+	// - 任何情况下都避免产生空的 NextProtos
+	if len(order) == 0 {
+		order = defaultOrder
+	}
+
+	// 应用到配置（覆盖式），避免叠加导致指纹异常
+	cfg.NextProtos = append([]string(nil), order...)
 }
 
 // For other subsystems which may need RTT for pacing decisions.
@@ -290,6 +360,38 @@ func GetHandshakeRTT(host string) time.Duration {
 		return time.Duration(p.HandshakeRTTMs) * time.Millisecond
 	}
 	return 0
+}
+
+// 仅允许安全/常见的 ALPN 候选，并去重、限长
+func sanitizeAndClampALPN(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	// 仅保留 h2 与 http/1.1，并按出现顺序保序去重
+	seen := make(map[string]struct{}, 2)
+	out := make([]string, 0, 2)
+	for _, v := range in {
+		v = strings.TrimSpace(strings.ToLower(v))
+		switch v {
+		case "h2":
+			if _, ok := seen[v]; !ok {
+				out = append(out, v)
+				seen[v] = struct{}{}
+			}
+		case "http/1.1", "http/1.0":
+			// 始终规范化为 http/1.1
+			if _, ok := seen["http/1.1"]; !ok {
+				out = append(out, "http/1.1")
+				seen["http/1.1"] = struct{}{}
+			}
+		default:
+			// 其他一律丢弃，避免指纹异常
+		}
+		if len(out) >= 2 { // 限长
+			break
+		}
+	}
+	return out
 }
 
 // Expose a minimal expvar snapshot to aid debugging.
@@ -312,4 +414,104 @@ func init() {
 		}
 		return m
 	}))
+}
+
+// persistence helpers
+func defaultStorePath() string {
+	p := strings.TrimSpace(os.Getenv("XRAY_REALITY_STORE"))
+	if p != "" {
+		return p
+	}
+	// prefer /var/lib if exists
+	if _, err := os.Stat("/var/lib"); err == nil {
+		return "/var/lib/xray-reality-profiles.json"
+	}
+	return "/tmp/xray-reality-profiles.json"
+}
+
+func (m *manager) storeToFile() error {
+	if m.storePath == "" {
+		return nil
+	}
+	// ensure parent dir exists (best-effort)
+	if dir := filepath.Dir(m.storePath); dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.profiles) == 0 {
+		return nil
+	}
+	tmp := m.storePath + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", " ")
+	if err := enc.Encode(m.profiles); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, m.storePath)
+}
+
+func (m *manager) loadFromFile() error {
+	if m.storePath == "" {
+		return nil
+	}
+	f, err := os.Open(m.storePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	var data map[string]*Profile
+	dec := json.NewDecoder(f)
+	if err := dec.Decode(&data); err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	m.mu.Lock()
+	for k, v := range data {
+		// drop obviously stale (older than TTL*2)
+		if v != nil && (m.ttl <= 0 || now-int64(m.ttl.Seconds())*2 <= v.LastUpdatedUnix) {
+			m.profiles[strings.ToLower(k)] = v
+		}
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *manager) scheduleRetry(host string) {
+	m.mu.Lock()
+	n := m.retryCount[strings.ToLower(host)] + 1
+	if n > 6 { // cap backoff steps
+		m.mu.Unlock()
+		return
+	}
+	m.retryCount[strings.ToLower(host)] = n
+	m.mu.Unlock()
+	// exponential backoff with jitter up to ~min(2^n, 300s)
+	base := time.Duration(1<<uint(min(n, 8))) * time.Second
+	if base > 5*time.Minute {
+		base = 5 * time.Minute
+	}
+	delay := base + time.Duration(int64(time.Millisecond)*int64(100*(n%5)))
+	time.AfterFunc(delay, func() { m.probeAndStore(context.Background(), host) })
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

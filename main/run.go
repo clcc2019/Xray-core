@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	realityprofiler "github.com/xtls/xray-core/app/realityprofiler"
 	routerebpf "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common/cmdarg"
 	"github.com/xtls/xray-core/common/errors"
@@ -236,6 +237,64 @@ func startXray() (core.Server, error) {
 	if err != nil {
 		return nil, errors.New("failed to create server").Base(err)
 	}
+
+	// REALITY 预采集：仅从服务端配置的 serverNames 收集目标，注入预热
+	go func() {
+		defer func() { _ = recover() }()
+		// 解析合并后的配置文本，仅提取 serverNames 数组中的域名
+		files := getConfigFilePath(false)
+		merged, err := core.GetMergedConfig(files)
+		if err != nil || merged == "" {
+			return
+		}
+		// 正则捕获: "serverNames": ["a.com", "b.com"]
+		re := regexp.MustCompile(`"serverNames"\s*:\s*\[([^\]]*)\]`)
+		matches := re.FindAllStringSubmatch(merged, -1)
+		seen := make(map[string]struct{})
+		const maxTargets = 128
+		for _, m := range matches {
+			if len(m) < 2 {
+				continue
+			}
+			section := m[1]
+			// 提取引号内的 token
+			tokRe := regexp.MustCompile(`"([^"]+)"`)
+			for _, t := range tokRe.FindAllStringSubmatch(section, -1) {
+				if len(t) < 2 {
+					continue
+				}
+				host := strings.ToLower(strings.TrimSpace(t[1]))
+				if strings.HasPrefix(host, "*.") {
+					host = host[2:]
+				}
+				host = strings.TrimSuffix(host, ".")
+				if host == "" || strings.Contains(host, ":") {
+					continue
+				}
+				if strings.Count(host, ".") < 1 {
+					continue
+				}
+				if _, ok := seen[host]; ok {
+					continue
+				}
+				seen[host] = struct{}{}
+				if len(seen) >= maxTargets {
+					break
+				}
+			}
+			if len(seen) >= maxTargets {
+				break
+			}
+		}
+		// 无匹配则直接返回
+		if len(seen) == 0 {
+			return
+		}
+		// 注入
+		for h := range seen {
+			realityprofiler.EnsureAsync(h)
+		}
+	}()
 
 	return server, nil
 }

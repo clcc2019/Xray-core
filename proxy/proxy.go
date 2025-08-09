@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -57,6 +58,12 @@ var (
 	xtlsDirectCopyTotal       = expvar.NewInt("xtls_direct_copy_engaged_total")
 	xtlsPacingMicrosTotal     = expvar.NewInt("xtls_pacing_micros_total")
 	xtlsSpliceTotal           = expvar.NewInt("xtls_splice_total")
+)
+
+// sampling control for noisy logs in hot path
+var (
+	xtlsLogSampleEvery int64 = 512
+	xtlsLogCounter     int64
 )
 
 // XTLS padding runtime config (tunable via env)
@@ -357,7 +364,9 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 					}
 				}
 			} else {
-				errors.LogInfo(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
+				if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+					errors.LogInfo(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
+				}
 			}
 		}
 		if w.trafficState.NumberOfPacketToFilter > 0 {
@@ -499,7 +508,9 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 		buffer[i] = nil
 	}
 	buffer = buffer[:0]
-	errors.LogInfo(ctx, "ReshapeMultiBuffer ", toPrint)
+	if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+		errors.LogInfo(ctx, "ReshapeMultiBuffer ", toPrint)
+	}
 	return mb2
 }
 
@@ -620,7 +631,9 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 	}
 	newbuffer.Extend(paddingLen)
 	xtlsPaddingBytesTotal.Add(int64(paddingLen))
-	errors.LogInfo(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
+	if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+		errors.LogInfo(ctx, "XtlsPadding ", contentLen, " ", paddingLen, " ", command)
+	}
 	return newbuffer
 }
 
@@ -667,7 +680,9 @@ func XtlsUnpadding(b *buf.Buffer, s *TrafficState, isUplink bool, ctx context.Co
 				*remainingPadding = int32(data) << 8
 			case 1:
 				*remainingPadding = *remainingPadding | int32(data)
-				errors.LogInfo(ctx, "Xtls Unpadding new block, content ", *remainingContent, " padding ", *remainingPadding, " command ", *currentCommand)
+				if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+					errors.LogInfo(ctx, "Xtls Unpadding new block, content ", *remainingContent, " padding ", *remainingPadding, " command ", *currentCommand)
+				}
 			}
 			*remainingCommand--
 		} else if *remainingContent > 0 {
@@ -726,7 +741,9 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 					cipherSuite := b.BytesRange(43+sessionIdLen+1, 43+sessionIdLen+3)
 					trafficState.Cipher = uint16(cipherSuite[0])<<8 | uint16(cipherSuite[1])
 				} else {
-					errors.LogInfo(ctx, "XtlsFilterTls short server hello, tls 1.2 or older? ", b.Len(), " ", trafficState.RemainingServerHello)
+					if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+						errors.LogInfo(ctx, "XtlsFilterTls short server hello, tls 1.2 or older? ", b.Len(), " ", trafficState.RemainingServerHello)
+					}
 				}
 			} else if bytes.Equal(TlsClientHandShakeStart, startsBytes[:2]) && startsBytes[5] == TlsHandshakeTypeClientHello {
 				trafficState.IsTLS = true
@@ -746,18 +763,26 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 				} else if v != "TLS_AES_128_CCM_8_SHA256" {
 					trafficState.EnableXtls = true
 				}
-				errors.LogInfo(ctx, "XtlsFilterTls found tls 1.3! ", b.Len(), " ", v)
+				if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+					errors.LogInfo(ctx, "XtlsFilterTls found tls 1.3! ", b.Len(), " ", v)
+				}
 				trafficState.NumberOfPacketToFilter = 0
 				return
 			} else if trafficState.RemainingServerHello <= 0 {
-				errors.LogInfo(ctx, "XtlsFilterTls found tls 1.2! ", b.Len())
+				if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+					errors.LogInfo(ctx, "XtlsFilterTls found tls 1.2! ", b.Len())
+				}
 				trafficState.NumberOfPacketToFilter = 0
 				return
 			}
-			errors.LogInfo(ctx, "XtlsFilterTls inconclusive server hello ", b.Len(), " ", trafficState.RemainingServerHello)
+			if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+				errors.LogInfo(ctx, "XtlsFilterTls inconclusive server hello ", b.Len(), " ", trafficState.RemainingServerHello)
+			}
 		}
 		if trafficState.NumberOfPacketToFilter <= 0 {
-			errors.LogInfo(ctx, "XtlsFilterTls stop filtering", buffer.Len())
+			if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
+				errors.LogInfo(ctx, "XtlsFilterTls stop filtering", buffer.Len())
+			}
 		}
 	}
 }
