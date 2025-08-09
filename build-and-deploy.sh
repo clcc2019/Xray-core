@@ -243,6 +243,10 @@ load_ebpf() {
     bpftool map create $BPF_ROOT/dns_cache type lru_hash key 4 value 16 entries 50000 name dns_cache 2>/dev/null || true
     bpftool map create $BPF_ROOT/dns_cache_v6 type lru_hash key 4 value 28 entries 25000 name dns_cache_v6 2>/dev/null || true
     bpftool map create $BPF_ROOT/dns_stats type hash key 4 value 4 entries 20000 name dns_stats 2>/dev/null || true
+
+    # Router 策略映射：geosite/geoip policy（uint8 -> uint32）
+    bpftool map create $BPF_ROOT/geosite_policy type hash key 1 value 4 entries 256 name geosite_policy 2>/dev/null || true
+    bpftool map create $BPF_ROOT/geoip_policy type hash key 1 value 4 entries 256 name geoip_policy 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v4 type hash key 4 value 1 entries 10000 name geoip_v4 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v6 type hash key 8 value 1 entries 10000 name geoip_v6 2>/dev/null || true
     bpftool map create $BPF_ROOT/connection_map type hash key 8 value 64 entries 65536 name connection_map 2>/dev/null || true

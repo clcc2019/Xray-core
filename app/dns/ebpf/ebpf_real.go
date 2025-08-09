@@ -95,13 +95,12 @@ func (c *RealEBpfDNSCache) loadEBpfProgram() error {
 
 // 打开eBPF maps
 func (c *RealEBpfDNSCache) openMaps() error {
-	// 打开DNS缓存map（重试，等待挂载脚本创建）
+	// 打开DNS缓存map（使用 BPF_OBJ_GET 获取 FD）
 	dnsCachePath := "/sys/fs/bpf/xray/dns_cache"
 	var fd int
 	var err error
 	for i := 0; i < 10; i++ {
-		fd, err = syscall.Open(dnsCachePath, syscall.O_RDWR, 0)
-		if err == nil {
+		if fd, err = bpfObjGetPinned(dnsCachePath); err == nil {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -113,25 +112,39 @@ func (c *RealEBpfDNSCache) openMaps() error {
 
 	// 打开IPv6 DNS缓存map（可选）
 	dnsCacheV6Path := "/sys/fs/bpf/xray/dns_cache_v6"
-	if _, err := os.Stat(dnsCacheV6Path); err == nil {
-		fdv6, err := syscall.Open(dnsCacheV6Path, syscall.O_RDWR, 0)
-		if err == nil {
+	if _, statErr := os.Stat(dnsCacheV6Path); statErr == nil {
+		if fdv6, ge := bpfObjGetPinned(dnsCacheV6Path); ge == nil {
 			c.dnsCacheV6Map = fdv6
 		}
 	}
 
 	// 打开统计map
 	statsPath := "/sys/fs/bpf/xray/dns_stats"
-	fd, err = syscall.Open(statsPath, syscall.O_RDWR, 0)
-	if err != nil {
-		// 统计 map 可选，缺失不致命
-		errors.LogInfo(context.Background(), "dns_stats map not available: ", err)
-	} else {
+	if fd, ge := bpfObjGetPinned(statsPath); ge == nil {
 		c.statsMap = fd
+	} else {
+		errors.LogInfo(context.Background(), "dns_stats map not available: ", ge)
 	}
 
 	errors.LogInfo(context.Background(), "eBPF maps opened successfully")
 	return nil
+}
+
+// 通过 BPF_OBJ_GET 打开 pinned 对象
+func bpfObjGetPinned(path string) (int, error) {
+	b := append([]byte(path), 0)
+	attr := struct {
+		pathname   uint64
+		bpf_fd     uint32
+		file_flags uint32
+	}{
+		pathname: uint64(uintptr(unsafe.Pointer(&b[0]))),
+	}
+	fd, _, errno := syscall.Syscall(SYS_BPF, BPF_OBJ_GET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	if errno != 0 {
+		return -1, fmt.Errorf("bpf obj get failed: %v", errno)
+	}
+	return int(fd), nil
 }
 
 // 添加DNS记录到eBPF缓存

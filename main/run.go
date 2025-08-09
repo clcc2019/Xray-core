@@ -86,7 +86,8 @@ func executeRun(cmd *base.Command, args []string) {
 
 	// Initialize TCP CC eBPF policy (Linux only; no-op elsewhere)
 	_ = transportebpf.InitDefaultTCPCCPolicy()
-	// Seed geosite/geoip policy from env if eBPF enabled (Linux-only)
+	// Router geosite/geoip 策略默认开启：当 XRAY_EBPF=1 时初始化策略管理器
+	// 如环境变量未设置，ApplyDefaultsFromEnv 不会写入任何条目，但管理器可用于后续动态写入
 	if os.Getenv("XRAY_EBPF") == "1" {
 		routerebpf.NewPolicyManager().ApplyDefaultsFromEnv()
 	}
