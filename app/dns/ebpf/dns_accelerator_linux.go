@@ -65,6 +65,9 @@ type DNSAccelerator struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	cleanupInterval time.Duration
+
+	// pinned maps accessor
+	ebpfCache *EBpfDNSCache
 }
 
 // DNSServerInfo DNS服务器信息
@@ -161,9 +164,17 @@ func NewDNSAccelerator() (*DNSAccelerator, error) {
 		prefetchEnabled:  enabled,
 	}
 
-	// 初始化eBPF程序
-	// 初始化 eBPF（容错，找不到也不致命）
+	// 初始化 eBPF（容错）
 	_ = accelerator.initEBPF()
+
+	// 绑定 pinned maps 访问器
+	if accelerator.enabled {
+		if cache, err := NewEBpfDNSCache(); err == nil && cache != nil && cache.IsEnabled() {
+			accelerator.ebpfCache = cache
+		} else {
+			errors.LogInfo(ctx, "DNS eBPF cache not available: ", err)
+		}
+	}
 
 	// 启动后台维护任务
 	go accelerator.maintenanceLoop()
@@ -258,65 +269,27 @@ func (da *DNSAccelerator) QueryDomain(domain string, queryType DNSType) (*DNSRes
 	if !da.enabled || !da.programLoaded {
 		return nil, errors.New("DNS accelerator not enabled")
 	}
-
-	da.RLock()
-	defer da.RUnlock()
-
-	da.totalQueries++
-
-	// 检查恶意域名
-	if da.filterEnabled {
-		if entry, exists := da.maliciousDomains[domain]; exists && entry.Confidence > 70 {
-			da.blockedQueries++
-			return nil, errors.New("domain blocked: malicious")
+	start := time.Now()
+	// 1) 直接查 pinned maps
+	if da.ebpfCache != nil && da.ebpfCache.IsEnabled() && da.cacheEnabled {
+		switch queryType {
+		case DNSTypeA:
+			if ips, ttl, err := da.ebpfCache.LookupRecord(domain); err == nil && len(ips) > 0 && ttl > 0 {
+				da.cacheHits++
+				return &DNSResult{Domain: domain, IPs: ips, TTL: ttl, Source: "eBPF-cache", CacheHit: true, ResponseTime: time.Since(start)}, nil
+			}
+		case DNSTypeAAAA:
+			if ips, ttl, err := da.ebpfCache.LookupRecordV6(domain); err == nil && len(ips) > 0 && ttl > 0 {
+				da.cacheHits++
+				return &DNSResult{Domain: domain, IPs: ips, TTL: ttl, Source: "eBPF-cache-v6", CacheHit: true, ResponseTime: time.Since(start)}, nil
+			}
 		}
+		da.cacheMisses++
+		return &DNSResult{Domain: domain, CacheHit: false, ResponseTime: time.Since(start)}, nil
 	}
 
-	// 在真实实现中，这里会查询eBPF缓存map
-	// 简化实现：模拟缓存查询
-	startTime := time.Now()
-
-	// 模拟缓存命中
-	if da.shouldHitCache(domain) {
-		da.cacheHits++
-		result := &DNSResult{
-			Domain:       domain,
-			IPs:          []net.IP{net.ParseIP("1.2.3.4")},
-			TTL:          uint32(da.cacheTTL.Seconds()),
-			Source:       "eBPF-cache",
-			CacheHit:     true,
-			ResponseTime: time.Since(startTime),
-		}
-		return result, nil
-	}
-
-	da.cacheMisses++
-
-	// 选择最佳DNS服务器
-	serverIndex := da.selectBestServer()
-	if serverIndex < 0 {
-		da.failedQueries++
-		return nil, errors.New("no available DNS servers")
-	}
-
-	// 模拟DNS查询
-	server := da.dnsServers[serverIndex]
-	responseTime := da.simulateQuery(server)
-
-	result := &DNSResult{
-		Domain:       domain,
-		IPs:          []net.IP{net.ParseIP("1.2.3.4")},
-		TTL:          300,
-		Source:       server.ServerIP.String(),
-		CacheHit:     false,
-		ResponseTime: responseTime,
-		ServerType:   server.ServerType,
-	}
-
-	// 更新服务器统计
-	da.updateServerStats(serverIndex, responseTime, true)
-
-	return result, nil
+	// 2) 无 eBPF 缓存可用：直接 miss，让上层继续
+	return &DNSResult{Domain: domain, CacheHit: false, ResponseTime: time.Since(start)}, nil
 }
 
 // DNSResult DNS查询结果

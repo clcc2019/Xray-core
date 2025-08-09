@@ -4,7 +4,6 @@ package dns
 import (
 	"context"
 	go_errors "errors"
-	"expvar"
 	"fmt"
 	"os"
 	"sort"
@@ -37,14 +36,9 @@ type DNS struct {
 // -------- 双层缓存融合：全局 eBPF 加速器与 eBPF 缓存（懒加载） --------
 
 var (
-	ebpfInitOnce         sync.Once
-	ebpfAccelGlobal      *ebpf.DNSAccelerator
-	ebpfCacheGlobal      *ebpf.EBpfDNSCache
-	dnsEbpfcHits         = expvar.NewInt("dns_ebpf_hits_total")
-	dnsEbpfcMisses       = expvar.NewInt("dns_ebpf_misses_total")
-	dnsEbpfcWritebacks   = expvar.NewInt("dns_ebpf_writebacks_total")
-	dnsPrefetchLaunched  = expvar.NewInt("dns_prefetch_launched_total")
-	dnsPrefetchCompleted = expvar.NewInt("dns_prefetch_completed_total")
+	ebpfInitOnce    sync.Once
+	ebpfAccelGlobal *ebpf.DNSAccelerator
+	ebpfCacheGlobal *ebpf.EBpfDNSCache
 )
 
 func ensureEBPFDNS() {
@@ -189,28 +183,15 @@ func (*DNS) Type() interface{} {
 func (s *DNS) Start() error {
 	// 启动时尝试初始化 eBPF 加速与缓存，并执行可选预取
 	ensureEBPFDNS()
-	// 预取列表：XRAY_DNS_PREFETCH=domain1,domain2（优先 go env，失败无感知降级到进程环境变量）
-	prefetchList := ""
-	if rv, err := common.GetRuntimeEnv("XRAY_DNS_PREFETCH"); err == nil {
-		prefetchList = strings.TrimSpace(rv)
-	}
-	if prefetchList == "" {
-		prefetchList = strings.TrimSpace(os.Getenv("XRAY_DNS_PREFETCH"))
-	}
+	// 可选预取：如需关闭监控/指标，这里保留功能但静默执行
+	prefetchList := strings.TrimSpace(os.Getenv("XRAY_DNS_PREFETCH"))
 	if prefetchList != "" {
-		domains := strings.Split(prefetchList, ",")
-		for _, d := range domains {
+		for _, d := range strings.Split(prefetchList, ",") {
 			d = strings.TrimSpace(d)
 			if d == "" {
 				continue
 			}
-			dnsPrefetchLaunched.Add(1)
-			go func(domain string) {
-				// 用户态查询，触发写回 eBPF
-				if ips, ttl, err := s.LookupIP(domain, *s.ipOption); err == nil && len(ips) > 0 && ttl > 0 {
-					dnsPrefetchCompleted.Add(1)
-				}
-			}(d)
+			go func(domain string) { _, _, _ = s.LookupIP(domain, *s.ipOption) }(d)
 		}
 	}
 	return nil
@@ -247,11 +228,7 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	ensureEBPFDNS()
 	if ebpfAccelGlobal != nil && ebpfAccelGlobal.IsEnabled() {
 		if result, err := ebpfAccelGlobal.QueryDomain(domain, ebpf.DNSTypeA); err == nil && result.CacheHit {
-			dnsEbpfcHits.Add(1)
-			errors.LogDebug(s.ctx, "DNS eBPF cache hit for domain: ", domain)
 			return result.IPs, result.TTL, nil
-		} else {
-			dnsEbpfcMisses.Add(1)
 		}
 	}
 
@@ -300,11 +277,9 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 			}
 			if len(v4s) > 0 {
 				_ = ebpfCacheGlobal.AddRecord(domain, v4s, 10, 0)
-				dnsEbpfcWritebacks.Add(1)
 			}
 			if len(v6s) > 0 {
 				_ = ebpfCacheGlobal.AddRecordV6(domain, v6s, 10, 0)
-				dnsEbpfcWritebacks.Add(1)
 			}
 		}
 		return ips, 10, nil // Hosts ttl is 10
@@ -344,11 +319,9 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 					}
 					if len(v4s) > 0 {
 						_ = ebpfCacheGlobal.AddRecord(domain, v4s, ttl, 0)
-						dnsEbpfcWritebacks.Add(1)
 					}
 					if len(v6s) > 0 {
 						_ = ebpfCacheGlobal.AddRecordV6(domain, v6s, ttl, 0)
-						dnsEbpfcWritebacks.Add(1)
 					}
 				}
 			}

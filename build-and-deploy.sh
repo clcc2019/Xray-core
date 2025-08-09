@@ -434,12 +434,18 @@ load_ebpf() {
 
     load_xdp "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp"
     load_tc_with_pinmaps "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc"
+    # 兼容 legacy section：尝试 classifier 兜底
+    tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
+    tc filter replace dev "$interface_name" ingress prio 63 handle 63 bpf da obj transport/internet/tcp/ebpf/tcp_reality_tc.o sec classifier 2>/dev/null || true
 
     load_xdp "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp"
     load_tc_with_pinmaps "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_tc"
 
     load_xdp "transport/internet/tcp/ebpf/xtls_vision_xdp.o" "xtls_vision_inbound_accelerator_xdp"
     load_tc_with_pinmaps "transport/internet/tcp/ebpf/xtls_vision_tc.o" "xtls_vision_inbound_accelerator_tc"
+    # 兼容 legacy section：尝试 classifier 兜底
+    tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
+    tc filter replace dev "$interface_name" ingress prio 64 handle 64 bpf da obj transport/internet/tcp/ebpf/xtls_vision_tc.o sec classifier 2>/dev/null || true
 
     load_xdp "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp"
 }

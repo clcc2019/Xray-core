@@ -30,6 +30,20 @@ const (
 	BPF_MAP_DELETE_ELEM = 3
 )
 
+// value structs aligned with kernel side (dns_cache.c)
+type dnsResponseV4 struct {
+	IP         uint32
+	TTL        uint32
+	ExpireTime uint64
+}
+
+type dnsResponseV6 struct {
+	IPHigh     uint64
+	IPLow      uint64
+	TTL        uint32
+	ExpireTime uint64
+}
+
 // 创建真正的eBPF DNS缓存
 func NewRealEBpfDNSCache() (*RealEBpfDNSCache, error) {
 	cache := &RealEBpfDNSCache{
@@ -125,23 +139,23 @@ func (c *RealEBpfDNSCache) AddRecord(domain string, ips []net.IP, ttl uint32, rc
 	if !c.enabled {
 		return errors.New("eBPF DNS cache is not enabled")
 	}
-
-	// 计算域名哈希
-	hash := c.hashDomain(domain)
-
-	// 准备数据
-	var ip uint32
-	if len(ips) > 0 {
-		ip = c.ipToUint32(ips[0])
+	if len(ips) == 0 {
+		return errors.New("no IP to add")
 	}
-
-	// 更新eBPF map
-	if err := c.updateMap(c.dnsCacheMap, unsafe.Pointer(&hash), unsafe.Pointer(&ip)); err != nil {
-		errors.LogInfo(context.Background(), "Failed to update eBPF DNS cache: ", err)
+	hash := fnv1a32Domain(domain)
+	v4 := ips[0].To4()
+	if v4 == nil {
+		return errors.New("no IPv4 in AddRecord; use AddRecordV6")
+	}
+	now := uint64(time.Now().Unix())
+	val := dnsResponseV4{
+		IP:         uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3]),
+		TTL:        ttl,
+		ExpireTime: now + uint64(ttl),
+	}
+	if err := c.updateMap(c.dnsCacheMap, unsafe.Pointer(&hash), unsafe.Pointer(&val)); err != nil {
 		return err
 	}
-
-	errors.LogInfo(context.Background(), "Added DNS record to eBPF cache: ", domain, " -> ", ips[0])
 	return nil
 }
 
@@ -153,22 +167,26 @@ func (c *RealEBpfDNSCache) AddRecordV6(domain string, ips []net.IP, ttl uint32, 
 	if c.dnsCacheV6Map == 0 {
 		return errors.New("IPv6 DNS cache map not available")
 	}
-	// 仅写入首个 IPv6 地址（简化）
-	var ip6 [16]byte
+	var raw6 [16]byte
 	for _, ip := range ips {
 		if ip = ip.To16(); ip != nil && ip.To4() == nil {
-			copy(ip6[:], ip)
+			copy(raw6[:], ip)
 			break
 		}
 	}
-	if ip6 == ([16]byte{}) {
+	if raw6 == ([16]byte{}) {
 		return errors.New("no IPv6 address provided")
 	}
-	hash := c.hashDomain(domain)
-	if err := c.updateMap(c.dnsCacheV6Map, unsafe.Pointer(&hash), unsafe.Pointer(&ip6)); err != nil {
+	hash := fnv1a32Domain(domain)
+	high := uint64(raw6[0])<<56 | uint64(raw6[1])<<48 | uint64(raw6[2])<<40 | uint64(raw6[3])<<32 |
+		uint64(raw6[4])<<24 | uint64(raw6[5])<<16 | uint64(raw6[6])<<8 | uint64(raw6[7])
+	low := uint64(raw6[8])<<56 | uint64(raw6[9])<<48 | uint64(raw6[10])<<40 | uint64(raw6[11])<<32 |
+		uint64(raw6[12])<<24 | uint64(raw6[13])<<16 | uint64(raw6[14])<<8 | uint64(raw6[15])
+	now := uint64(time.Now().Unix())
+	val := dnsResponseV6{IPHigh: high, IPLow: low, TTL: ttl, ExpireTime: now + uint64(ttl)}
+	if err := c.updateMap(c.dnsCacheV6Map, unsafe.Pointer(&hash), unsafe.Pointer(&val)); err != nil {
 		return err
 	}
-	errors.LogInfo(context.Background(), "Added DNS AAAA record to eBPF cache: ", domain)
 	return nil
 }
 
@@ -177,22 +195,18 @@ func (c *RealEBpfDNSCache) LookupRecord(domain string) ([]net.IP, uint32, error)
 	if !c.enabled {
 		return nil, 0, errors.New("eBPF DNS cache is not enabled")
 	}
-
-	// 计算域名哈希
-	hash := c.hashDomain(domain)
-
-	// 从eBPF map查找
-	var ip uint32
-	if err := c.lookupMap(c.dnsCacheMap, unsafe.Pointer(&hash), unsafe.Pointer(&ip)); err != nil {
-		// 缓存未命中
-		errors.LogInfo(context.Background(), "DNS cache miss: ", domain)
+	hash := fnv1a32Domain(domain)
+	var val dnsResponseV4
+	if err := c.lookupMap(c.dnsCacheMap, unsafe.Pointer(&hash), unsafe.Pointer(&val)); err != nil {
 		return nil, 0, err
 	}
-
-	// 缓存命中
-	ipAddr := c.uint32ToIP(ip)
-	errors.LogInfo(context.Background(), "DNS cache hit: ", domain, " -> ", ipAddr)
-	return []net.IP{ipAddr}, 300, nil
+	now := uint64(time.Now().Unix())
+	if now > val.ExpireTime || val.TTL == 0 {
+		_ = c.deleteMap(c.dnsCacheMap, unsafe.Pointer(&hash))
+		return nil, 0, errors.New("expired")
+	}
+	ipAddr := c.uint32ToIP(val.IP)
+	return []net.IP{ipAddr}, val.TTL, nil
 }
 
 // 查找IPv6记录
@@ -203,13 +217,23 @@ func (c *RealEBpfDNSCache) LookupRecordV6(domain string) ([]net.IP, uint32, erro
 	if c.dnsCacheV6Map == 0 {
 		return nil, 0, errors.New("IPv6 DNS cache map not available")
 	}
-	hash := c.hashDomain(domain)
-	var ip6 [16]byte
-	if err := c.lookupMap(c.dnsCacheV6Map, unsafe.Pointer(&hash), unsafe.Pointer(&ip6)); err != nil {
+	hash := fnv1a32Domain(domain)
+	var val dnsResponseV6
+	if err := c.lookupMap(c.dnsCacheV6Map, unsafe.Pointer(&hash), unsafe.Pointer(&val)); err != nil {
 		return nil, 0, err
 	}
-	ip := net.IP(ip6[:])
-	return []net.IP{ip}, 300, nil
+	now := uint64(time.Now().Unix())
+	if now > val.ExpireTime || val.TTL == 0 {
+		_ = c.deleteMap(c.dnsCacheV6Map, unsafe.Pointer(&hash))
+		return nil, 0, errors.New("expired")
+	}
+	var raw6 [16]byte
+	for i := 0; i < 8; i++ {
+		raw6[i] = byte((val.IPHigh >> uint(56-8*i)) & 0xFF)
+		raw6[8+i] = byte((val.IPLow >> uint(56-8*i)) & 0xFF)
+	}
+	ip := net.IP(raw6[:])
+	return []net.IP{ip}, val.TTL, nil
 }
 
 // 更新eBPF map
@@ -254,13 +278,38 @@ func (c *RealEBpfDNSCache) lookupMap(mapFd int, key, value unsafe.Pointer) error
 	return nil
 }
 
-// 计算域名哈希
-func (c *RealEBpfDNSCache) hashDomain(domain string) uint64 {
-	var hash uint64
-	for _, char := range domain {
-		hash = hash*31 + uint64(char)
+// 删除元素
+func (c *RealEBpfDNSCache) deleteMap(mapFd int, key unsafe.Pointer) error {
+	attr := struct {
+		mapFd uint32
+		key   uintptr
+	}{
+		mapFd: uint32(mapFd),
+		key:   uintptr(key),
 	}
-	return hash
+	_, _, errno := syscall.Syscall(SYS_BPF, BPF_MAP_DELETE_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	if errno != 0 {
+		return fmt.Errorf("bpf map delete failed: %v", errno)
+	}
+	return nil
+}
+
+// 计算域名哈希
+func fnv1a32Domain(domain string) uint32 {
+	const prime uint32 = 16777619
+	var h uint32 = 2166136261
+	for i := 0; i < len(domain); i++ {
+		c := domain[i]
+		if c == '.' {
+			continue
+		}
+		if c >= 'A' && c <= 'Z' {
+			c = c + 32
+		}
+		h ^= uint32(c)
+		h *= prime
+	}
+	return h
 }
 
 // IP地址转换为uint32
