@@ -53,7 +53,7 @@ static __always_inline __u64 now_sec() {
     return bpf_ktime_get_ns() / 1000000000ULL;
 }
 
-SEC("classifier")
+SEC("tc")
 int ip_fastpath_tc(struct __sk_buff *skb) {
     if (!is_enabled()) return TC_ACT_OK;
 

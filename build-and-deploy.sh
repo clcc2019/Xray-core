@@ -102,6 +102,10 @@ cat > $BUILD_DIR/mount-ebpf.sh << 'EOF'
 # Xray eBPF 挂载脚本
 # 自动编译、加载和管理eBPF程序
 
+# 更少输出：默认安静模式；设置 XRAY_EBPF_VERBOSE=1 开启详细日志
+set -euo pipefail
+VERBOSE="${XRAY_EBPF_VERBOSE:-0}"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -113,6 +117,7 @@ log_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
 log_success() { echo -e "${GREEN}✅ $1${NC}"; }
 log_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 log_error() { echo -e "${RED}❌ $1${NC}"; }
+log_debug() { [ "$VERBOSE" = "1" ] && echo -e "${YELLOW}… $1${NC}" || true; }
 
 # 配置
 BPF_ROOT="/sys/fs/bpf/xray"
@@ -205,10 +210,10 @@ compile_ebpf() {
                 total_count=$((total_count + 1))
                 if clang -O2 -g -Wall -target bpf -c -fno-stack-protector \
                     -I/usr/include/bpf -I/usr/include/x86_64-linux-gnu -o "${file%.c}.o" "$file" 2>/dev/null; then
-                    log_success "$dir/$file 编译成功"
+                    log_debug "$dir/$file 编译成功"
                     success_count=$((success_count + 1))
                 else
-                    log_warning "$dir/$file 编译失败"
+                    log_debug "$dir/$file 编译失败"
                 fi
             done
             cd "$build_root"
@@ -320,17 +325,17 @@ load_ebpf() {
       local obj=$1; local pinned_name=$2
       if [ -f "$obj" ]; then
         if bpftool prog load "$obj" "$BPF_ROOT/$pinned_name" type xdp 2>/dev/null; then
-          log_success "$pinned_name 加载成功 (XDP)"
+          log_debug "$pinned_name 加载成功 (XDP)"
           ip link set dev "$interface_name" xdp off 2>/dev/null || true
           if ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" 2>/dev/null; then
-            log_success "$pinned_name 附加到 $interface_name 成功 (原生XDP)"
+            log_debug "$pinned_name 附加到 $interface_name 成功 (原生XDP)"
           elif ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" mode skb 2>/dev/null; then
-            log_success "$pinned_name 附加到 $interface_name 成功 (通用XDP)"
+            log_debug "$pinned_name 附加到 $interface_name 成功 (通用XDP)"
           else
-            log_info "$pinned_name 附加失败，已忽略（继续）"
+            log_debug "$pinned_name 附加失败，已忽略（继续）"
           fi
         else
-          log_info "$pinned_name 加载失败 (XDP)，已忽略"
+          log_debug "$pinned_name 加载失败 (XDP)，已忽略"
         fi
       fi
     }
@@ -355,11 +360,11 @@ load_ebpf() {
       if [ -f "$obj" ]; then
         # 优先使用 loadall + pinmaps；失败则回退逐个 section 加载 classifier/sec tc
         if bpftool prog loadall "$obj" "$BPF_ROOT/$pinned_name" pinmaps "$BPF_ROOT" 2>/dev/null; then
-          log_success "$pinned_name 加载成功 (TC, 已 pin maps)"
+          log_debug "$pinned_name 加载成功 (TC, 已 pin maps)"
           # 使用 obj+sec 方式附加，避免读取 pinned program 失败
           attach_tc "$obj" "$interface_name" 60 60 0
         else
-          log_info "$pinned_name 加载失败 (TC loadall)，尝试 classifier/sec 回退"
+          log_debug "$pinned_name 加载失败 (TC loadall)，尝试 classifier/sec 回退"
           tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
           tc filter replace dev "$interface_name" ingress prio 60 handle 60 bpf da obj "$obj" sec classifier 2>/dev/null || true
           tc filter replace dev "$interface_name" ingress prio 61 handle 61 bpf da obj "$obj" sec tc 2>/dev/null || true
@@ -373,41 +378,41 @@ load_ebpf() {
       # 兼容 legacy section 名称：强制以 sec classifier 再尝试一次（忽略失败）
       tc qdisc add dev "$interface_name" clsact 2>/dev/null || true
       tc filter replace dev "$interface_name" ingress prio 60 handle 60 bpf da obj app/dns/ebpf/dns_router_tc.o sec classifier 2>/dev/null || true
-    if [ "$XRAY_XDP_EXTRA" = "dns" ]; then
+    if [ "${XRAY_XDP_EXTRA:-}" = "dns" ]; then
       # 为 dns_cache.o 绑定已 pin 的 maps，确保与用户态一致
       if [ -f "app/dns/ebpf/dns_cache.o" ]; then
         if bpftool prog load app/dns/ebpf/dns_cache.o "$BPF_ROOT/dns_cache_prog" type xdp \
             map name dns_cache pinned "$BPF_ROOT/dns_cache" \
             map name dns_cache_v6 pinned "$BPF_ROOT/dns_cache_v6" \
             map name dns_stats pinned "$BPF_ROOT/dns_stats" 2>/dev/null; then
-          log_success "dns_cache_prog 加载成功 (XDP+pin maps)"
+           log_debug "dns_cache_prog 加载成功 (XDP+pin maps)"
           ip link set dev "$interface_name" xdp off 2>/dev/null || true
           if ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/dns_cache_prog" 2>/dev/null; then
-            log_success "dns_cache_prog 附加到 $interface_name 成功 (原生XDP)"
+             log_debug "dns_cache_prog 附加到 $interface_name 成功 (原生XDP)"
           elif ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/dns_cache_prog" mode skb 2>/dev/null; then
-            log_success "dns_cache_prog 附加到 $interface_name 成功 (通用XDP)"
+             log_debug "dns_cache_prog 附加到 $interface_name 成功 (通用XDP)"
           else
-            log_info "dns_cache_prog 附加失败，已忽略（继续）"
+             log_debug "dns_cache_prog 附加失败，已忽略（继续）"
           fi
         else
-          log_info "dns_cache_prog 加载失败 (XDP)，已忽略"
+          log_debug "dns_cache_prog 加载失败 (XDP)，已忽略"
         fi
       fi
     fi
 
     # 避免多 XDP 并存，默认不附加 Geo XDP；如需启用请设置 XRAY_XDP_EXTRA=geo
-    if [ "$XRAY_XDP_EXTRA" = "geo" ]; then
+    if [ "${XRAY_XDP_EXTRA:-}" = "geo" ]; then
       load_xdp "app/router/ebpf/geoip_matcher.o" "geoip_matcher"
       load_xdp "app/router/ebpf/geosite_matcher.o" "geosite_matcher"
     fi
 
     # 动态 GeoSite 学习缓存（如果存在动态目标文件则加载并确保 map pin）
     if [[ -f "app/router/ebpf/geosite_matcher_dynamic.o" ]]; then
-        log_info "加载 GeoSite 动态匹配器..."
+        log_debug "加载 GeoSite 动态匹配器..."
         if bpftool prog loadall app/router/ebpf/geosite_matcher_dynamic.o /sys/fs/bpf/xray 2>/dev/null; then
-            log_success "geosite_matcher_dynamic 加载成功"
+            log_debug "geosite_matcher_dynamic 加载成功"
         else
-            log_warning "geosite_matcher_dynamic 加载失败"
+            log_debug "geosite_matcher_dynamic 加载失败"
         fi
         # 确保关键 maps 已 pin（名称需与C文件中的section名一致）
         for m in geosite_dynamic_cache domain_access_stats hot_domain_list geosite_config_dynamic geosite_stats_dynamic; do
@@ -427,11 +432,11 @@ load_ebpf() {
 
     # 动态 GeoIP 学习缓存
     if [[ -f "app/router/ebpf/geoip_matcher_dynamic.o" ]]; then
-        log_info "加载 GeoIP 动态匹配器..."
+        log_debug "加载 GeoIP 动态匹配器..."
         if bpftool prog loadall app/router/ebpf/geoip_matcher_dynamic.o /sys/fs/bpf/xray 2>/dev/null; then
-            log_success "geoip_matcher_dynamic 加载成功"
+            log_debug "geoip_matcher_dynamic 加载成功"
         else
-            log_warning "geoip_matcher_dynamic 加载失败"
+            log_debug "geoip_matcher_dynamic 加载失败"
         fi
         for m in geoip_dynamic_cache ip_access_stats hot_ip_list geoip_config_dynamic geoip_stats_dynamic; do
             if [[ -e "/sys/fs/bpf/xray/$m" ]]; then
@@ -530,18 +535,24 @@ setup_permissions() {
 
 # 显示状态
 show_status() {
-    log_info "eBPF程序状态:"
-    bpftool prog list | grep -E "dns|xray|tcp|xtls|proxy" || true
-    bpftool map list | grep -E "dns|xray|tcp|xtls|proxy" || true
+    if [ "$VERBOSE" = "1" ]; then
+      log_info "eBPF程序状态:"
+      bpftool prog list | grep -E "dns|xray|tcp|xtls|proxy" || true
+      bpftool map list | grep -E "dns|xray|tcp|xtls|proxy" || true
+    fi
     
-    log_info "策略路由规则:"
-    ip -f inet rule list | cat
+    if [ "$VERBOSE" = "1" ]; then
+      log_info "策略路由规则:"
+      ip -f inet rule list | cat
+    fi
     # 避免“FIB table does not exist”报错：仅展示实际引用的表
     local tbls
     tbls=$(ip -f inet rule list 2>/dev/null | awk '/lookup/{for(i=1;i<=NF;i++){if($i=="lookup"){print $(i+1)}}}' | sort -u)
     for t in $tbls; do
-      log_info "路由表 $t:"
-      ip -f inet route show table "$t" 2>/dev/null || true
+      if [ "$VERBOSE" = "1" ]; then
+        log_info "路由表 $t:"
+        ip -f inet route show table "$t" 2>/dev/null || true
+      fi
     done
 }
 

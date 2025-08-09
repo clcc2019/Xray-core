@@ -74,7 +74,7 @@ static __always_inline void update_stats(__u32 stat_type) {
 }
 
 // TC程序 - 完整的TCP+REALITY加速器
-SEC("tc/ingress")
+SEC("tc")
 int tcp_reality_accelerator_tc(struct __sk_buff *skb) {
     // 获取数据包信息
     void *data = (void *)(long)skb->data;

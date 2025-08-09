@@ -22,7 +22,7 @@ struct {
 static __always_inline __u64 get_current_time() { return bpf_ktime_get_ns() / 1000000000ULL; }
 static __always_inline __u64 get_connection_id(__u32 saddr, __u16 sport, __u32 daddr, __u16 dport) { return ((__u64)saddr << 32) | ((__u64)daddr) | ((__u64)sport << 48) | ((__u64)dport << 32); }
 
-SEC("classifier")
+SEC("tc")
 int xtls_vision_inbound_accelerator_tc(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data; void *data_end = (void *)(long)skb->data_end;
     if (data + sizeof(struct ethhdr) > data_end) return TC_ACT_OK;

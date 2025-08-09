@@ -179,7 +179,7 @@ static __always_inline int parse_qname_hash_qtype_tc(void *data, void *data_end,
     return -1;
 }
 
-SEC("classifier")
+SEC("tc")
 int dns_router_tc(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
