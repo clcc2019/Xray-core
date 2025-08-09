@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -80,9 +81,17 @@ func (c *RealEBpfDNSCache) loadEBpfProgram() error {
 
 // 打开eBPF maps
 func (c *RealEBpfDNSCache) openMaps() error {
-	// 打开DNS缓存map
+	// 打开DNS缓存map（重试，等待挂载脚本创建）
 	dnsCachePath := "/sys/fs/bpf/xray/dns_cache"
-	fd, err := syscall.Open(dnsCachePath, syscall.O_RDWR, 0)
+	var fd int
+	var err error
+	for i := 0; i < 10; i++ {
+		fd, err = syscall.Open(dnsCachePath, syscall.O_RDWR, 0)
+		if err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to open DNS cache map: %v", err)
 	}
@@ -101,9 +110,11 @@ func (c *RealEBpfDNSCache) openMaps() error {
 	statsPath := "/sys/fs/bpf/xray/dns_stats"
 	fd, err = syscall.Open(statsPath, syscall.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open stats map: %v", err)
+		// 统计 map 可选，缺失不致命
+		errors.LogInfo(context.Background(), "dns_stats map not available: ", err)
+	} else {
+		c.statsMap = fd
 	}
-	c.statsMap = fd
 
 	errors.LogInfo(context.Background(), "eBPF maps opened successfully")
 	return nil

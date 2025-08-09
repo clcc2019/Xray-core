@@ -133,6 +133,13 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+  # 确保 bpffs 已挂载
+  if ! mountpoint -q /sys/fs/bpf 2>/dev/null; then
+    log_info "挂载 bpffs 到 /sys/fs/bpf..."
+    mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+    mountpoint -q /sys/fs/bpf && log_success "bpffs 已挂载" || log_warning "bpffs 挂载失败（可能已挂载），继续"
+  fi
+
 # 清理函数
 cleanup_ebpf() {
     log_info "清理历史eBPF程序..."
@@ -286,8 +293,11 @@ load_ebpf() {
         return 1
     }
     
-    # 获取网络接口名称
-    local interface_name=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -1)
+    # 获取网络接口名称（可由 XRAY_IFACE 覆盖）
+    local interface_name=${XRAY_IFACE:-}
+    if [ -z "$interface_name" ]; then
+      interface_name=$(ip route get 8.8.8.8 | grep -oP 'dev \K\S+' | head -1)
+    fi
     if [ -z "$interface_name" ]; then
         interface_name="ens5"  # 默认接口
     fi
@@ -503,29 +513,22 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 停止服务
+# 停止服务并备份
 log_info "停止 Xray 服务..."
 systemctl stop xray 2>/dev/null || true
-
-# 备份原文件
 if [ -f /usr/local/bin/xray ]; then
     log_info "备份原文件..."
     cp /usr/local/bin/xray /usr/local/bin/xray.backup.$(date +%Y%m%d_%H%M%S)
 fi
 
-# 部署新文件
+# 部署新二进制（不立即启动）
 log_info "部署新文件..."
-systemctl stop xray
 cp xray-linux-amd64-ebpf /usr/local/bin/xray
 chmod +x /usr/local/bin/xray
-systemctl start xray
-# 挂载eBPF程序
+
+# 先挂载/创建 eBPF maps 与程序，再启动服务，避免程序启动时找不到 maps
 log_info "挂载eBPF程序..."
 bash mount-ebpf.sh
-
-# 启动服务
-log_info "启动 Xray 服务..."
-systemctl start xray
 
 # 检查状态
 log_info "检查服务状态..."
