@@ -147,6 +147,7 @@ cleanup_ebpf() {
       for IF in $IFACES; do
         tc filter del dev "$IF" ingress 2>/dev/null || true
         tc qdisc del dev "$IF" clsact 2>/dev/null || true
+        ip link set dev "$IF" xdp off 2>/dev/null || true
       done
     fi
     # 清理pinned文件
@@ -234,6 +235,8 @@ load_ebpf() {
     bpftool map create $BPF_ROOT/geoip_v4 type hash key 4 value 1 entries 10000 name geoip_v4 2>/dev/null || true
     bpftool map create $BPF_ROOT/geoip_v6 type hash key 8 value 1 entries 10000 name geoip_v6 2>/dev/null || true
     bpftool map create $BPF_ROOT/connection_map type hash key 8 value 64 entries 65536 name connection_map 2>/dev/null || true
+    bpftool map create $BPF_ROOT/route_geoip_v4_hint type lru_hash key 4 value 4 entries 65536 name route_geoip_v4_hint 2>/dev/null || true
+    bpftool map create $BPF_ROOT/xtls_direct_copy_hint type hash key 8 value 1 entries 65536 name xtls_direct_copy_hint 2>/dev/null || true
     
     # 加载函数
     load_program() {
@@ -293,6 +296,7 @@ load_ebpf() {
       if [ -f "$obj" ]; then
         if bpftool prog load "$obj" "$BPF_ROOT/$pinned_name" type xdp 2>/dev/null; then
           log_success "$pinned_name 加载成功 (XDP)"
+          ip link set dev "$interface_name" xdp off 2>/dev/null || true
           if ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" 2>/dev/null; then
             log_success "$pinned_name 附加到 $interface_name 成功 (原生XDP)"
           elif ip link set dev "$interface_name" xdp pinned "$BPF_ROOT/$pinned_name" mode skb 2>/dev/null; then
@@ -317,7 +321,7 @@ load_ebpf() {
       if [ "$use_pinned" = "1" ]; then
         tc filter replace dev "$ifname" ingress prio "$prio" handle "$handle" bpf da pinned "$obj_or_pinned"
       else
-        tc filter replace dev "$ifname" ingress prio "$prio" handle "$handle" bpf da obj "$obj_or_pinned" sec classifier
+        tc filter replace dev "$ifname" ingress prio "$prio" handle "$handle" bpf da obj "$obj_or_pinned" sec tc
       fi
     }
 
@@ -334,11 +338,57 @@ load_ebpf() {
     }
 
     # 加载各模块
-    load_xdp "app/dns/ebpf/dns_cache.o" "dns_cache_prog"
+    # 默认 DNS 走 TC，避免与主 XDP 冲突；如需 XDP 可设置 XRAY_XDP_EXTRA=dns
     load_tc_with_pinmaps "app/dns/ebpf/dns_router_tc.o" "dns_router_tc"
+    if [ "$XRAY_XDP_EXTRA" = "dns" ]; then
+      load_xdp "app/dns/ebpf/dns_cache.o" "dns_cache_prog"
+    fi
 
-    load_xdp "app/router/ebpf/geoip_matcher.o" "geoip_matcher"
-    load_xdp "app/router/ebpf/geosite_matcher.o" "geosite_matcher"
+    # 避免多 XDP 并存，默认不附加 Geo XDP；如需启用请设置 XRAY_XDP_EXTRA=geo
+    if [ "$XRAY_XDP_EXTRA" = "geo" ]; then
+      load_xdp "app/router/ebpf/geoip_matcher.o" "geoip_matcher"
+      load_xdp "app/router/ebpf/geosite_matcher.o" "geosite_matcher"
+    fi
+
+    # 动态 GeoSite 学习缓存（如果存在动态目标文件则加载并确保 map pin）
+    if [[ -f "app/router/ebpf/geosite_matcher_dynamic.o" ]]; then
+        log_info "加载 GeoSite 动态匹配器..."
+        if bpftool prog loadall app/router/ebpf/geosite_matcher_dynamic.o /sys/fs/bpf/xray 2>/dev/null; then
+            log_success "geosite_matcher_dynamic 加载成功"
+        else
+            log_warning "geosite_matcher_dynamic 加载失败"
+        fi
+        # 确保关键 maps 已 pin（名称需与C文件中的section名一致）
+        for m in geosite_dynamic_cache domain_access_stats hot_domain_list geosite_config_dynamic geosite_stats_dynamic; do
+            if [[ -e "/sys/fs/bpf/xray/$m" ]]; then
+                :
+            else
+                # 尝试从已加载对象中pin map（不同内核/版本下名称解析可能不同，这里尽力而为）
+                bpftool map show | awk '/name '$m'/{print $1}' | sed 's/://g' | while read -r id; do
+                    bpftool map pin id $id /sys/fs/bpf/xray/$m || true
+                done
+            fi
+        done
+    fi
+
+    # 动态 GeoIP 学习缓存
+    if [[ -f "app/router/ebpf/geoip_matcher_dynamic.o" ]]; then
+        log_info "加载 GeoIP 动态匹配器..."
+        if bpftool prog loadall app/router/ebpf/geoip_matcher_dynamic.o /sys/fs/bpf/xray 2>/dev/null; then
+            log_success "geoip_matcher_dynamic 加载成功"
+        else
+            log_warning "geoip_matcher_dynamic 加载失败"
+        fi
+        for m in geoip_dynamic_cache ip_access_stats hot_ip_list geoip_config_dynamic geoip_stats_dynamic; do
+            if [[ -e "/sys/fs/bpf/xray/$m" ]]; then
+                :
+            else
+                bpftool map show | awk '/name '$m'/{print $1}' | sed 's/://g' | while read -r id; do
+                    bpftool map pin id $id /sys/fs/bpf/xray/$m || true
+                done
+            fi
+        done
+    fi
 
     load_xdp "transport/internet/tcp/ebpf/tcp_reality_accelerator.o" "tcp_reality_accelerator_xdp"
     load_tc_with_pinmaps "transport/internet/tcp/ebpf/tcp_reality_tc.o" "tcp_reality_accelerator_tc"
@@ -346,8 +396,8 @@ load_ebpf() {
     load_xdp "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_xdp"
     load_tc_with_pinmaps "proxy/ebpf/proxy_accelerator.o" "proxy_accelerator_tc"
 
-    load_xdp "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_xdp"
-    load_tc_with_pinmaps "transport/internet/tcp/ebpf/xtls_vision_accelerator.o" "xtls_vision_inbound_accelerator_tc"
+    load_xdp "transport/internet/tcp/ebpf/xtls_vision_xdp.o" "xtls_vision_inbound_accelerator_xdp"
+    load_tc_with_pinmaps "transport/internet/tcp/ebpf/xtls_vision_tc.o" "xtls_vision_inbound_accelerator_tc"
 
     load_xdp "transport/internet/tcp/ebpf/tcp_congestion_basic.o" "tcp_congestion_basic_xdp"
 }

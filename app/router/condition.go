@@ -174,6 +174,8 @@ func (m *DomainMatcher) ApplyDomain(domain string) bool {
 	result := len(m.matchers.Match(domain)) > 0
 	if result {
 		errors.LogInfo(nil, "DomainMatcher: Standard matcher matched: ", domain)
+		// 将匹配结果写入内核学习缓存（热路径加速）
+		ebpf.PromoteDomain(domain, 1, 900) // 15分钟 TTL
 	} else {
 		errors.LogInfo(nil, "DomainMatcher: No match for domain: ", domain)
 	}

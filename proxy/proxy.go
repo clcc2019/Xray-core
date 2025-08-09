@@ -48,6 +48,51 @@ var (
 	}
 )
 
+// XTLS padding runtime config (tunable via env)
+var xtlsPadCfg struct {
+	bucket1             int32
+	bucket2             int32
+	budget              int32
+	directGraceMs       int
+	disableAfterGrace   bool
+	directMinimalJitter int32
+}
+
+func init() {
+	// defaults
+	xtlsPadCfg.bucket1 = 1448
+	xtlsPadCfg.bucket2 = 2896
+	xtlsPadCfg.budget = 4096
+	xtlsPadCfg.directGraceMs = 200
+	xtlsPadCfg.disableAfterGrace = true
+	xtlsPadCfg.directMinimalJitter = 8
+
+	atoi := func(s string, def int) int {
+		if v, err := strconv.Atoi(s); err == nil {
+			return v
+		}
+		return def
+	}
+	if v := os.Getenv("XRAY_XTLS_BUCKET1"); v != "" {
+		xtlsPadCfg.bucket1 = int32(atoi(v, int(xtlsPadCfg.bucket1)))
+	}
+	if v := os.Getenv("XRAY_XTLS_BUCKET2"); v != "" {
+		xtlsPadCfg.bucket2 = int32(atoi(v, int(xtlsPadCfg.bucket2)))
+	}
+	if v := os.Getenv("XRAY_XTLS_PAD_BUDGET"); v != "" {
+		xtlsPadCfg.budget = int32(atoi(v, int(xtlsPadCfg.budget)))
+	}
+	if v := os.Getenv("XRAY_XTLS_DIRECT_GRACE_MS"); v != "" {
+		xtlsPadCfg.directGraceMs = atoi(v, xtlsPadCfg.directGraceMs)
+	}
+	if v := os.Getenv("XRAY_XTLS_AFTER_GRACE_DISABLE"); v != "" {
+		xtlsPadCfg.disableAfterGrace = v != "0" && v != "false"
+	}
+	if v := os.Getenv("XRAY_XTLS_DIRECT_MIN_JITTER"); v != "" {
+		xtlsPadCfg.directMinimalJitter = int32(atoi(v, int(xtlsPadCfg.directMinimalJitter)))
+	}
+}
+
 const (
 	TlsHandshakeTypeClientHello byte = 0x01
 	TlsHandshakeTypeServerHello byte = 0x02
@@ -112,6 +157,12 @@ type TrafficState struct {
 	Outbound               OutboundState
 	// padding RNG state (per-connection), used to avoid heavy crypto/rand in padding path
 	padRand uint64
+	// per-connection padding budget to avoid excessive padding overhead
+	paddingBudget int32
+	// timestamp when direct-copy is engaged; zero means not engaged
+	directCopySince time.Time
+	// if true, padding will be fully disabled after grace window
+	paddingHardDisable bool
 }
 
 type InboundState struct {
@@ -169,6 +220,7 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 			IsPadding:                true,
 			UplinkWriterDirectCopy:   false,
 		},
+		paddingBudget: xtlsPadCfg.budget,
 	}
 }
 
@@ -256,6 +308,10 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			} else if *currentCommand == 2 {
 				*withinPaddingBuffers = false
 				*switchToDirectCopy = true
+				// record direct-copy since timestamp for padding grace window
+				if w.trafficState.directCopySince.IsZero() {
+					w.trafficState.directCopySince = time.Now()
+				}
 				// 同步直拷提示到 eBPF（仅 Linux 且 XRAY_EBPF=1）
 				if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
 					if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
@@ -413,25 +469,77 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 	if ts != nil {
 		r = ts.nextRand32()
 	}
-	if contentLen < 900 && longPadding {
-		// Push small records to ~900 bytes with slight jitter
-		jitter := int32(r % 128) // 0..127
-		paddingLen = (900 - contentLen)
-		if paddingLen < 0 {
-			paddingLen = 0
-		}
-		paddingLen += jitter
-	} else {
-		// Small random pad
-		paddingLen = int32(r % 256)
-		// Softly nudge towards 4KiB boundary occasionally
-		total := contentLen + 5 + paddingLen // include padding header (5 bytes)
-		if r%16 == 0 {
-			const bucket = 4096
-			rem := int32(bucket - (total % bucket))
-			if rem > 0 && rem <= 128 {
-				paddingLen += rem
+	// Optimized padding strategy
+	if command == CommandPaddingDirect {
+		// When switching to direct copy, avoid heavy padding
+		paddingLen = xtlsPadCfg.directMinimalJitter
+		paddingLen += int32(r % 8)
+		// After a grace window, optionally hard-disable padding
+		if ts != nil && !ts.directCopySince.IsZero() {
+			if time.Since(ts.directCopySince) >= time.Duration(xtlsPadCfg.directGraceMs)*time.Millisecond {
+				if xtlsPadCfg.disableAfterGrace {
+					ts.paddingHardDisable = true
+				}
 			}
+		}
+	} else if longPadding {
+		// MTU-aligned buckets to smooth TLS record sizes without over-padding tiny payloads
+		// Typical TLS appdata targets around MSS (~1460). Use ~1448 and ~2896 buckets.
+		bucket1 := xtlsPadCfg.bucket1
+		bucket2 := xtlsPadCfg.bucket2
+		if contentLen < 1000 {
+			// pad towards first bucket with small jitter
+			jitter := int32(r % 64) // 0..63
+			pad := int32(bucket1) - contentLen
+			if pad < 0 {
+				pad = 0
+			}
+			paddingLen = pad + jitter
+		} else if contentLen < 2800 {
+			// pad towards second bucket with small jitter
+			jitter := int32(r % 96) // 0..95
+			pad := int32(bucket2) - contentLen
+			if pad < 0 {
+				pad = 0
+			}
+			paddingLen = pad + jitter
+		} else {
+			// beyond two buckets, keep small random pad and occasional 4KiB soft alignment
+			paddingLen = int32(r % 192)
+			total := contentLen + 5 + paddingLen
+			if r%16 == 0 {
+				const bucket = 4096
+				rem := int32(bucket - (total % bucket))
+				if rem > 0 && rem <= 128 {
+					paddingLen += rem
+				}
+			}
+		}
+	} else {
+		// non-long padding phase: small perturbation only
+		paddingLen = int32(r % 96)
+	}
+
+	// hard disable after grace if requested
+	if ts != nil && ts.paddingHardDisable {
+		if paddingLen > 16 {
+			paddingLen = 16
+		}
+	}
+
+	// Respect per-connection padding budget if available
+	if ts != nil {
+		if ts.paddingBudget <= 0 {
+			// budget exhausted: keep only minimal noise
+			if paddingLen > 16 {
+				paddingLen = 16
+			}
+		} else if paddingLen > ts.paddingBudget {
+			paddingLen = ts.paddingBudget
+		}
+		ts.paddingBudget -= paddingLen
+		if ts.paddingBudget < 0 {
+			ts.paddingBudget = 0
 		}
 	}
 	if paddingLen > buf.Size-21-contentLen {
