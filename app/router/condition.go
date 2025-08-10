@@ -4,7 +4,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/strmatcher"
@@ -63,9 +62,7 @@ func domainToMatcher(domain *Domain) (strmatcher.Matcher, error) {
 }
 
 type DomainMatcher struct {
-	matchers    strmatcher.IndexMatcher
-	ebpfMatcher *ebpf.EBpfGeoSiteMatcher
-	ebpfEnabled bool
+	matchers strmatcher.IndexMatcher
 }
 
 func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
@@ -82,38 +79,7 @@ func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
 	}
 	g.Build()
 
-	// 初始化eBPF匹配器
-	errors.LogInfo(nil, "NewMphMatcherGroup: Initializing eBPF GeoSite matcher for ", len(domains), " domains")
-	ebpfMatcher, err := ebpf.NewEBpfGeoSiteMatcher("default", false)
-	if err != nil {
-		errors.LogInfo(nil, "NewMphMatcherGroup: Failed to initialize eBPF GeoSite matcher: ", err)
-	} else {
-		errors.LogInfo(nil, "NewMphMatcherGroup: eBPF GeoSite matcher initialized successfully")
-	}
-
-	dm := &DomainMatcher{
-		matchers:    g,
-		ebpfMatcher: ebpfMatcher,
-		ebpfEnabled: ebpfMatcher != nil && ebpfMatcher.IsEnabled(),
-	}
-
-	// 将域名规则添加到eBPF匹配器
-	if dm.ebpfEnabled {
-		for i, d := range domains {
-			siteCode := uint8(i + 1)
-			switch d.Type {
-			case Domain_Full:
-				ebpfMatcher.AddDomain(d.Value, siteCode)
-			case Domain_Plain:
-				ebpfMatcher.AddKeyword(d.Value, siteCode)
-			case Domain_Regex:
-				ebpfMatcher.AddRegex(d.Value, siteCode)
-			case Domain_Domain:
-				ebpfMatcher.AddDomain(d.Value, siteCode)
-			}
-		}
-	}
-
+	dm := &DomainMatcher{matchers: g}
 	return dm, nil
 }
 
@@ -127,59 +93,14 @@ func NewDomainMatcher(domains []*Domain) (*DomainMatcher, error) {
 		g.Add(m)
 	}
 
-	// 初始化动态eBPF匹配器（智能缓存模式）
-	errors.LogInfo(nil, "NewDomainMatcher: Initializing dynamic eBPF GeoSite matcher (smart caching mode)")
-	ebpfMatcher, err := ebpf.NewEBpfGeoSiteMatcher("dynamic", true) // 启用动态模式
-	if err != nil {
-		errors.LogInfo(nil, "NewDomainMatcher: Failed to initialize dynamic eBPF GeoSite matcher: ", err)
-	} else {
-		errors.LogInfo(nil, "NewDomainMatcher: Dynamic eBPF GeoSite matcher initialized successfully")
-	}
-
-	dm := &DomainMatcher{
-		matchers:    g,
-		ebpfMatcher: ebpfMatcher,
-		ebpfEnabled: ebpfMatcher != nil && ebpfMatcher.IsEnabled(),
-	}
-
-	// 动态缓存模式：不预加载所有规则，只在运行时学习热点域名
-	if dm.ebpfEnabled {
-		errors.LogInfo(nil, "NewDomainMatcher: Dynamic caching enabled - ", len(domains), " domain rules will be learned on-demand")
-		// 不预加载规则，让eBPF程序在运行时自动学习热点域名
-	}
-
+	dm := &DomainMatcher{matchers: g}
 	return dm, nil
 }
 
 func (m *DomainMatcher) ApplyDomain(domain string) bool {
 	domain = strings.ToLower(domain)
-	errors.LogInfo(nil, "DomainMatcher.ApplyDomain: Matching domain ", domain, " (eBPF enabled: ", m.ebpfEnabled, ")")
-
-	// 标准匹配优先（避免 eBPF 本地规则误触发到错误的路由规则，如 block）
-	result := len(m.matchers.Match(domain)) > 0
-	if result {
-		errors.LogInfo(nil, "DomainMatcher: Standard matcher matched: ", domain)
-		// 将匹配结果写入内核学习缓存（热路径加速）
-		ebpf.PromoteDomain(domain, 1, 900) // 15分钟 TTL
-	} else {
-		errors.LogInfo(nil, "DomainMatcher: No match for domain: ", domain)
-		// 标准未命中时再尝试 eBPF 作为提示，但不直接决定路由，避免误判
-		if m.ebpfEnabled && m.ebpfMatcher != nil {
-			errors.LogInfo(nil, "DomainMatcher: Trying eBPF hint for ", domain)
-			if matched, err := m.ebpfMatcher.MatchDomain(domain); err == nil {
-				if matched {
-					errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite hinted match: ", domain)
-					// 仅作为学习信号：写入内核缓存，不改变当次路由决策
-					ebpf.PromoteDomain(domain, 1, 900)
-				} else {
-					errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite no match for: ", domain)
-				}
-			} else {
-				errors.LogInfo(nil, "DomainMatcher: eBPF GeoSite match error: ", err)
-			}
-		}
-	}
-	return result
+	errors.LogInfo(nil, "DomainMatcher.ApplyDomain: Matching domain ", domain)
+	return len(m.matchers.Match(domain)) > 0
 }
 
 // Apply implements Condition.

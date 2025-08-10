@@ -107,6 +107,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	if target.Address.Family().IsDomain() {
 		sni = target.Address.Domain()
 	}
+	// Linux-only eBPF hook; on other platforms the symbol may be absent.
+	// Keep call site but guard behind build tag in implementation file.
 	EnableVLESSEBPFAcceleration(ctx, iConn, sni)
 
 	command := protocol.RequestCommandTCP

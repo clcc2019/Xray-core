@@ -34,6 +34,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+var ebpfEnvEnabled = os.Getenv("XRAY_EBPF") == "1"
+
 var useSplice bool
 
 func init() {
@@ -142,7 +144,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			if raw, heErr := h.dialHappyEyeballs(ctx, dialer, dialDest); heErr == nil && raw != nil {
 				conn = raw
 				// 在直连路径上统一应用 TCP 优化（基于环境变量，失败忽略）
-				if os.Getenv("XRAY_EBPF") == "1" {
+				if ebpfEnvEnabled {
 					proxy.OptimizeTCPForDirectCopy(conn)
 				}
 				return nil
@@ -168,7 +170,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		conn = rawConn
-		if os.Getenv("XRAY_EBPF") == "1" {
+		if ebpfEnvEnabled {
 			proxy.OptimizeTCPForDirectCopy(conn)
 		}
 		return nil
@@ -179,7 +181,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
-	// 启用eBPF加速
+	// 启用eBPF加速（Linux 可用；非 Linux 无此符号）
+	// 调用保持在此处，但在非 Linux 下 freedom_ebpf.go 不参与构建
 	EnableEBPFAcceleration(ctx, conn)
 
 	var newCtx context.Context
@@ -230,6 +233,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if os.Getenv("XRAY_EBPF") == "1" {
 			if accelerator := ebpf.GetProxyAccelerator(); accelerator != nil && accelerator.IsEnabled() {
 				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					// 统计记录（Linux-only）
 					go recordConnectionStats(ctx, tcpConn, accelerator)
 				}
 			}
@@ -273,10 +277,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 
 			if !isTLSConn(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
+				// eBPF 热路径提示（更细粒度，可通过 XRAY_EBPF_HINT_SPLICE 控制，默认开启）：
+				// 当检测到 Vision 直拷解析状态为真时，直接开启 splice
+				if ebpfEnvEnabled && os.Getenv("XRAY_EBPF_HINT_SPLICE") != "0" && os.Getenv("XRAY_EBPF_HINT_SPLICE") != "false" {
+					if lAddr, okL := conn.LocalAddr().(*net.TCPAddr); okL && lAddr.IP.To4() != nil {
+						if rAddr, okR := conn.RemoteAddr().(*net.TCPAddr); okR && rAddr.IP.To4() != nil {
+							saddr := binary.BigEndian.Uint32(lAddr.IP.To4())
+							daddr := binary.BigEndian.Uint32(rAddr.IP.To4())
+							sport := uint16(lAddr.Port)
+							dport := uint16(rAddr.Port)
+							if tcpEbpf.GetXTLSVisionManager().IsDirectCopyEnabledIPv4(saddr, sport, daddr, dport) {
+								inbound.CanSpliceCopy = 1
+								for _, obx := range session.OutboundsFromContext(ctx) {
+									obx.CanSpliceCopy = 1
+								}
+								errors.LogDebug(ctx, "freedom splice enabled via eBPF hint for ", lAddr, " -> ", rAddr)
+							}
+						}
+					}
+				}
 				return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
 			} else {
 				// TLS 场景，通知加速器用于统计/策略
-				if os.Getenv("XRAY_EBPF") == "1" {
+				if ebpfEnvEnabled {
 					if accelerator := ebpf.GetProxyAccelerator(); accelerator != nil && accelerator.IsEnabled() {
 						sni := ""
 						if destination.Address.Family().IsDomain() {

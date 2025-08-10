@@ -51,13 +51,16 @@ var (
 	}
 )
 
+// cache XRAY_EBPF once to avoid getenv in hot path
+var ebpfEnvEnabled = os.Getenv("XRAY_EBPF") == "1"
+
 // expvar metrics (global)
 var (
 	xtlsPaddingBytesTotal     = expvar.NewInt("xtls_padding_bytes_total")
 	xtlsPaddingBudgetHitTotal = expvar.NewInt("xtls_padding_budget_exhausted_total")
 	xtlsDirectCopyTotal       = expvar.NewInt("xtls_direct_copy_engaged_total")
 	xtlsPacingMicrosTotal     = expvar.NewInt("xtls_pacing_micros_total")
-	xtlsSpliceTotal           = expvar.NewInt("xtls_splice_total")
+	// NOTE: removed unused splice counter to reduce noise
 )
 
 // sampling control for noisy logs in hot path
@@ -507,7 +510,6 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 		}
 		buffer[i] = nil
 	}
-	buffer = buffer[:0]
 	if atomic.AddInt64(&xtlsLogCounter, 1)%xtlsLogSampleEvery == 0 {
 		errors.LogInfo(ctx, "ReshapeMultiBuffer ", toPrint)
 	}
@@ -822,7 +824,7 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 // - writer are from *transport.Link
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
 	// 尝试启用proxy eBPF加速
-	if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
+	if ebpfEnvEnabled && runtime.GOOS == "linux" {
 		tryProxyEBPFAcceleration(ctx, readerConn, writerConn)
 	}
 
@@ -883,18 +885,16 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			return nil
 		}
-		buffer, err := reader.ReadMultiBuffer()
-		if !buffer.IsEmpty() {
+		if bufRead, rerr := reader.ReadMultiBuffer(); rerr == nil && bufRead != nil && !bufRead.IsEmpty() {
 			if readCounter != nil {
-				readCounter.Add(int64(buffer.Len()))
+				readCounter.Add(int64(bufRead.Len()))
 			}
 			timer.Update()
-			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
+			if werr := writer.WriteMultiBuffer(bufRead); werr != nil {
 				return werr
 			}
-		}
-		if err != nil {
-			return err
+		} else if rerr != nil {
+			return rerr
 		}
 	}
 }

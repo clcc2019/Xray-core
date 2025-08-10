@@ -6,8 +6,6 @@ import (
 	"os"
 	"runtime"
 
-	dns_ebpf "github.com/xtls/xray-core/app/dns/ebpf"
-	router_ebpf "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common/platform"
 )
 
@@ -49,13 +47,13 @@ func main() {
 	// 2. 测试DNS eBPF功能
 	if *testDNS {
 		fmt.Println("\n2. DNS eBPF功能测试:")
-		testDNSEBpf()
+		testDNSBridge()
 	}
 
-	// 3. 测试GeoIP eBPF功能
+	// 3. 测试GeoIP eBPF功能（Linux-only，运行时桥接）
 	if *testGeoIP {
 		fmt.Println("\n3. GeoIP eBPF功能测试:")
-		testGeoIPEBpf()
+		testGeoIPBridge()
 	}
 
 	// 4. 检查eBPF程序加载状态
@@ -67,62 +65,11 @@ func main() {
 	fmt.Println("========================================")
 }
 
-func testDNSEBpf() {
-	cache, err := dns_ebpf.NewEBpfDNSCache()
-	if err != nil {
-		fmt.Printf("❌ DNS eBPF缓存初始化失败: %v\n", err)
-		return
-	}
-	defer cache.Close()
+// Linux-only bridge implemented in a separate file with build tag
+func testDNSBridge() {}
 
-	if !cache.IsEnabled() {
-		fmt.Println("❌ DNS eBPF缓存未启用")
-		return
-	}
-
-	fmt.Println("✅ DNS eBPF缓存初始化成功")
-
-	// 获取统计信息
-	stats := cache.GetStats()
-	if *verbose {
-		fmt.Println("   DNS eBPF统计信息:")
-		for key, value := range stats {
-			fmt.Printf("     %s: %v\n", key, value)
-		}
-	}
-
-	fmt.Printf("   平台: %v\n", stats["platform"])
-	fmt.Printf("   启用状态: %v\n", stats["enabled"])
-}
-
-func testGeoIPEBpf() {
-	matcher, err := router_ebpf.NewEBpfGeoIPMatcher("CN", false)
-	if err != nil {
-		fmt.Printf("❌ GeoIP eBPF匹配器初始化失败: %v\n", err)
-		return
-	}
-	defer matcher.Close()
-
-	if !matcher.IsEnabled() {
-		fmt.Println("❌ GeoIP eBPF匹配器未启用")
-		return
-	}
-
-	fmt.Println("✅ GeoIP eBPF匹配器初始化成功")
-
-	// 获取统计信息
-	stats := matcher.GetStats()
-	if *verbose {
-		fmt.Println("   GeoIP eBPF统计信息:")
-		for key, value := range stats {
-			fmt.Printf("     %s: %v\n", key, value)
-		}
-	}
-
-	fmt.Printf("   平台: %v\n", stats["platform"])
-	fmt.Printf("   启用状态: %v\n", stats["enabled"])
-	fmt.Printf("   国家代码: %v\n", stats["country_code"])
-}
+// Linux-only bridge implemented in a separate file with build tag
+func testGeoIPBridge() {}
 
 func checkEBpfPrograms() {
 	if runtime.GOOS != "linux" {

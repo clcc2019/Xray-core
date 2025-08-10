@@ -9,15 +9,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	ebpf "github.com/xtls/xray-core/app/dns/ebpf"
-	routerebpf "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/strmatcher"
 	"github.com/xtls/xray-core/features/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 // DNS is a DNS rely server.
@@ -32,14 +33,28 @@ type DNS struct {
 	domainMatcher          strmatcher.IndexMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
+
+	// singleflight to deduplicate concurrent lookups for same key
+	sf singleflight.Group
+
+	// lightweight negative cache: domainKey -> expireAt
+	negMu    sync.RWMutex
+	negCache map[string]time.Time
 }
 
 // -------- 双层缓存融合：全局 eBPF 加速器与 eBPF 缓存（懒加载） --------
 
+// ebpfDNSCache 提供最小接口以避免在非 Linux 平台直接依赖具体实现
+type ebpfDNSCache interface {
+	AddRecord(domain string, ips []net.IP, ttl uint32, rcode uint16) error
+	AddRecordV6(domain string, ips []net.IP, ttl uint32, rcode uint16) error
+	IsEnabled() bool
+}
+
 var (
 	ebpfInitOnce    sync.Once
 	ebpfAccelGlobal *ebpf.DNSAccelerator
-	ebpfCacheGlobal *ebpf.EBpfDNSCache
+	ebpfCacheGlobal ebpfDNSCache
 )
 
 func ensureEBPFDNS() {
@@ -47,7 +62,7 @@ func ensureEBPFDNS() {
 		if accel, err := ebpf.NewDNSAccelerator(); err == nil && accel != nil && accel.IsEnabled() {
 			ebpfAccelGlobal = accel
 		}
-		if cache, err := ebpf.NewEBpfDNSCache(); err == nil && cache != nil && cache.IsEnabled() {
+		if cache, ok := newEbpfDNSCache(); ok {
 			ebpfCacheGlobal = cache
 		}
 	})
@@ -58,13 +73,12 @@ func shouldEnableKernelFastpath() bool {
 	return strings.TrimSpace(os.Getenv("XRAY_EBPF")) != ""
 }
 
-// routerebpfLookupSiteCode1Mark: 保守返回 0，避免无策略误打 mark。
-func routerebpfLookupSiteCode1Mark() uint32 {
-	if v, ok := routerebpf.GetGeoSitePolicyMark(1); ok {
-		return v
-	}
-	return 0
-}
+// 下列函数在 Linux 由桥接文件提供实现；非 Linux 为 no-op
+//   - newEbpfDNSCache() (ebpfDNSCache, bool)
+//   - dnsLookupSitePolicyMark() uint32
+//   - ipFastpathEnable(enable bool)
+//   - setIPv4Mark(ip net.IP, mark uint32, ttlSeconds uint32)
+//   - setIPv6Mark(ip net.IP, mark uint32, ttlSeconds uint32)
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher
 type DomainMatcherInfo struct {
@@ -185,6 +199,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		disableFallback:        config.DisableFallback,
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		checkSystem:            checkSystem,
+		negCache:               make(map[string]time.Time),
 	}, nil
 }
 
@@ -238,11 +253,28 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		return nil, 0, errors.New("empty domain name")
 	}
 
+	// Negative cache: quick drop of recent NODATA/NXDOMAIN for small TTL
+	if s.checkSystem == false { // keep behavior conservative under system mode
+		s.negMu.RLock()
+		if exp, ok := s.negCache[domain]; ok && time.Now().Before(exp) {
+			s.negMu.RUnlock()
+			return nil, 0, dns.ErrEmptyResponse
+		}
+		s.negMu.RUnlock()
+	}
+
 	// 🚀 DNS eBPF加速查询（仅在启用时快速路径）
 	ensureEBPFDNS()
 	if ebpfAccelGlobal != nil && ebpfAccelGlobal.IsEnabled() {
-		if result, err := ebpfAccelGlobal.QueryDomain(domain, ebpf.DNSTypeA); err == nil && result.CacheHit {
-			return result.IPs, result.TTL, nil
+		if option.IPv4Enable {
+			if result, err := ebpfAccelGlobal.QueryDomain(domain, ebpf.DNSTypeA); err == nil && result.CacheHit {
+				return result.IPs, result.TTL, nil
+			}
+		}
+		if option.IPv6Enable {
+			if result, err := ebpfAccelGlobal.QueryDomain(domain, ebpf.DNSTypeAAAA); err == nil && result.CacheHit {
+				return result.IPs, result.TTL, nil
+			}
 		}
 	}
 
@@ -279,7 +311,7 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		if err != nil {
 			return nil, 0, err
 		}
-		// 写回 eBPF 缓存（若可用），分别处理 A/AAAA
+		// 写回 eBPF 缓存（若可用），分别处理 A/AAAA；并按策略回写 fastpath mark
 		if ebpfCacheGlobal != nil && len(ips) > 0 {
 			var v4s, v6s []net.IP
 			for _, ip := range ips {
@@ -291,97 +323,168 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 			}
 			if len(v4s) > 0 {
 				_ = ebpfCacheGlobal.AddRecord(domain, v4s, 10, 0)
+				if shouldEnableKernelFastpath() {
+					ipFastpathEnable(true)
+					if mark := dnsLookupSitePolicyMark(); mark != 0 {
+						for _, ip4 := range v4s {
+							setIPv4Mark(ip4, mark, 10)
+						}
+					}
+				}
 			}
 			if len(v6s) > 0 {
 				_ = ebpfCacheGlobal.AddRecordV6(domain, v6s, 10, 0)
+				if shouldEnableKernelFastpath() {
+					ipFastpathEnable(true)
+					if mark := dnsLookupSitePolicyMark(); mark != 0 {
+						for _, ip6 := range v6s {
+							setIPv6Mark(ip6, mark, 10)
+						}
+					}
+				}
 			}
 		}
 		return ips, 10, nil // Hosts ttl is 10
 	}
 
-	// Name servers lookup
-	var errs []error
-	for _, client := range s.sortClients(domain) {
-		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
-			errors.LogDebug(s.ctx, "skip DNS resolution for domain ", domain, " at server ", client.Name())
-			continue
-		}
-
-		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
-
-		if len(ips) > 0 {
-			if ttl == 0 {
-				ttl = 1
+	// Name servers lookup with singleflight (deduplicate concurrent same-domain lookups)
+	v, errSF, _ := s.sf.Do("dns:"+domain+":"+keyOfOption(option), func() (interface{}, error) {
+		var errs []error
+		for _, client := range s.sortClients(domain) {
+			if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
+				errors.LogDebug(s.ctx, "skip DNS resolution for domain ", domain, " at server ", client.Name())
+				continue
 			}
-			// 🚀 将结果写回 eBPF 缓存（仅 A/AAAA 正常响应）
-			if ebpfCacheGlobal != nil {
-				// 限制 TTL 范围，避免过大
-				if ttl > 1800 {
-					ttl = 1800
-				}
+
+			ips, ttl, err := client.QueryIP(s.ctx, domain, option)
+
+			if len(ips) > 0 {
 				if ttl == 0 {
 					ttl = 1
 				}
-				if len(ips) > 0 {
-					var v4s, v6s []net.IP
-					for _, ip := range ips {
-						if ip.To4() != nil {
-							v4s = append(v4s, ip)
-						} else if ip.To16() != nil {
-							v6s = append(v6s, ip)
-						}
+				// 🚀 将结果写回 eBPF 缓存（仅 A/AAAA 正常响应）
+				if ebpfCacheGlobal != nil {
+					// 限制 TTL 范围，避免过大
+					if ttl > 1800 {
+						ttl = 1800
 					}
-					if len(v4s) > 0 {
-						_ = ebpfCacheGlobal.AddRecord(domain, v4s, ttl, 0)
-						// 同步写入 IP fastpath（仅在启用 eBPF 时，且有可用策略 mark 时），不修改服务端配置
-						if shouldEnableKernelFastpath() {
-							routerebpf.EnableIPFastpath(true)
-							if mark := routerebpfLookupSiteCode1Mark(); mark != 0 {
-								for _, ip4 := range v4s {
-									routerebpf.SetIPv4Mark(ip4, mark, ttl)
+					if ttl == 0 {
+						ttl = 1
+					}
+					if len(ips) > 0 {
+						var v4s, v6s []net.IP
+						for _, ip := range ips {
+							if ip.To4() != nil {
+								v4s = append(v4s, ip)
+							} else if ip.To16() != nil {
+								v6s = append(v6s, ip)
+							}
+						}
+						if len(v4s) > 0 {
+							_ = ebpfCacheGlobal.AddRecord(domain, v4s, ttl, 0)
+							// 同步写入 IP fastpath（仅在启用 eBPF 时，且有可用策略 mark 时），不修改服务端配置
+							if shouldEnableKernelFastpath() {
+								ipFastpathEnable(true)
+								if mark := dnsLookupSitePolicyMark(); mark != 0 {
+									for _, ip4 := range v4s {
+										setIPv4Mark(ip4, mark, ttl)
+									}
 								}
 							}
 						}
-					}
-					if len(v6s) > 0 {
-						_ = ebpfCacheGlobal.AddRecordV6(domain, v6s, ttl, 0)
-						if shouldEnableKernelFastpath() {
-							routerebpf.EnableIPFastpath(true)
-							if mark := routerebpfLookupSiteCode1Mark(); mark != 0 {
-								for _, ip6 := range v6s {
-									routerebpf.SetIPv6Mark(ip6, mark, ttl)
+						if len(v6s) > 0 {
+							_ = ebpfCacheGlobal.AddRecordV6(domain, v6s, ttl, 0)
+							if shouldEnableKernelFastpath() {
+								ipFastpathEnable(true)
+								if mark := dnsLookupSitePolicyMark(); mark != 0 {
+									for _, ip6 := range v6s {
+										setIPv6Mark(ip6, mark, ttl)
+									}
 								}
 							}
 						}
 					}
 				}
+				return struct {
+					ips []net.IP
+					ttl uint32
+				}{ips, ttl}, nil
 			}
-			return ips, ttl, nil
-		}
 
-		errors.LogInfoInner(s.ctx, err, "failed to lookup ip for domain ", domain, " at server ", client.Name())
-		if err == nil {
-			err = dns.ErrEmptyResponse
-		}
-		errs = append(errs, err)
-
-		if client.IsFinalQuery() {
-			break
-		}
-	}
-
-	if len(errs) > 0 {
-		allErrs := errors.Combine(errs...)
-		err0 := errs[0]
-		if errors.AllEqual(err0, allErrs) {
-			if go_errors.Is(err0, dns.ErrEmptyResponse) {
-				return nil, 0, dns.ErrEmptyResponse
+			errors.LogInfoInner(s.ctx, err, "failed to lookup ip for domain ", domain, " at server ", client.Name())
+			if err == nil {
+				err = dns.ErrEmptyResponse
 			}
-			return nil, 0, errors.New("returning nil for domain ", domain).Base(err0)
+			errs = append(errs, err)
+
+			if client.IsFinalQuery() {
+				break
+			}
 		}
-		return nil, 0, errors.New("returning nil for domain ", domain).Base(allErrs)
+
+		if len(errs) > 0 {
+			allErrs := errors.Combine(errs...)
+			err0 := errs[0]
+			if errors.AllEqual(err0, allErrs) {
+				if go_errors.Is(err0, dns.ErrEmptyResponse) {
+					return struct {
+						ips []net.IP
+						ttl uint32
+					}{nil, 0}, dns.ErrEmptyResponse
+				}
+				return struct {
+					ips []net.IP
+					ttl uint32
+				}{nil, 0}, errors.New("returning nil for domain ", domain).Base(err0)
+			}
+			return struct {
+				ips []net.IP
+				ttl uint32
+			}{nil, 0}, errors.New("returning nil for domain ", domain).Base(allErrs)
+		}
+		return struct {
+			ips []net.IP
+			ttl uint32
+		}{nil, 0}, dns.ErrEmptyResponse
+	})
+
+	if errSF != nil {
+		if errSF == dns.ErrEmptyResponse {
+			// 更新负缓存：短 TTL
+			if s.checkSystem == false {
+				s.negMu.Lock()
+				s.negCache[domain] = time.Now().Add(8 * time.Second)
+				s.negMu.Unlock()
+			}
+		}
+		return nil, 0, errSF
 	}
-	return nil, 0, dns.ErrEmptyResponse
+	res := v.(struct {
+		ips []net.IP
+		ttl uint32
+	})
+	return res.ips, res.ttl, nil
+}
+
+// keyOfOption 生成 singleflight key 的 option 部分
+func keyOfOption(o dns.IPOption) string {
+	b := strings.Builder{}
+	if o.IPv4Enable {
+		b.WriteByte('4')
+	} else {
+		b.WriteByte('-')
+	}
+	if o.IPv6Enable {
+		b.WriteByte('6')
+	} else {
+		b.WriteByte('-')
+	}
+	if o.FakeEnable {
+		b.WriteByte('F')
+	} else {
+		b.WriteByte('-')
+	}
+	return b.String()
 }
 
 func (s *DNS) sortClients(domain string) []*Client {

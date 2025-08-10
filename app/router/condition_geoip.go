@@ -5,7 +5,6 @@ import (
 	"net/netip"
 	"strconv"
 
-	ebpflearning "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common/net"
 	"go4.org/netipx"
 )
@@ -61,17 +60,7 @@ func (m *GeoIPMatcher) match4(ip net.IP) bool {
 		return false
 	}
 	matched := m.ip4.Contains(nip)
-	// 推送到内核学习缓存（只对IPv4），将匹配IP写入动态缓存和route hint
-	if matched {
-		b := nip.As4()
-		ipBE := binary.BigEndian.Uint32(b[:])
-		// 使用真实国家码（两位）同步写入；若存在 geoip_policy，将同时写入 route_geoip_v4_hint 为 policy id
-		if len(m.countryCode) >= 2 {
-			ebpflearning.PromoteIPv4WithCountry(ipBE, m.countryCode, 600)
-		} else {
-			ebpflearning.PromoteIPv4(ipBE, 1, 600) // 兜底占位
-		}
-	}
+	_ = binary.BigEndian // keep import for future use; no eBPF side-effects in core matcher
 	return matched
 }
 

@@ -15,14 +15,12 @@ import (
 	"time"
 
 	realityprofiler "github.com/xtls/xray-core/app/realityprofiler"
-	routerebpf "github.com/xtls/xray-core/app/router/ebpf"
 	"github.com/xtls/xray-core/common/cmdarg"
 	"github.com/xtls/xray-core/common/errors"
 	clog "github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
-	transportebpf "github.com/xtls/xray-core/transport/internet/tcp/ebpf"
 )
 
 var cmdRun = &base.Command{
@@ -85,13 +83,8 @@ func executeRun(cmd *base.Command, args []string) {
 		os.Exit(23)
 	}
 
-	// Initialize TCP CC eBPF policy (Linux only; no-op elsewhere)
-	_ = transportebpf.InitDefaultTCPCCPolicy()
-	// Router geosite/geoip 策略默认开启：当 XRAY_EBPF=1 时初始化策略管理器
-	// 如环境变量未设置，ApplyDefaultsFromEnv 不会写入任何条目，但管理器可用于后续动态写入
-	if os.Getenv("XRAY_EBPF") == "1" {
-		routerebpf.NewPolicyManager().ApplyDefaultsFromEnv()
-	}
+	// Linux 专用 eBPF 初始化（通过平台桥接）
+	initEBPFAtRun()
 
 	if *test {
 		fmt.Println("Configuration OK.")
@@ -263,10 +256,7 @@ func startXray() (core.Server, error) {
 				if len(t) < 2 {
 					continue
 				}
-				host := strings.ToLower(strings.TrimSpace(t[1]))
-				if strings.HasPrefix(host, "*.") {
-					host = host[2:]
-				}
+				host := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(t[1]), "*."))
 				host = strings.TrimSuffix(host, ".")
 				if host == "" || strings.Contains(host, ":") {
 					continue
