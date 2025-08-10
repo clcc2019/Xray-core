@@ -13,7 +13,8 @@ import (
 
 // optimizeTCPForDirectCopy applies optional TCP/socket options to improve direct-copy phase.
 // Controlled via env flags; failures are ignored.
-func optimizeTCPForDirectCopy(conn net.Conn) {
+// OptimizeTCPForDirectCopy exported for selected callers (e.g., freedom)
+func OptimizeTCPForDirectCopy(conn net.Conn) {
 	sc, ok := conn.(interface{ SyscallConn() (syscallConn, error) })
 	if !ok {
 		return

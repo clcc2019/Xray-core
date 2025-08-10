@@ -356,7 +356,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 										// 写入直拷 hint
 										ebpf.GetXTLSVisionManager().SetDirectCopyHintIPv4(saddr, sport, daddr, dport, true)
 										// 优化 TCP 选项（QUICKACK / ZEROCOPY / NOTSENT_LOWAT）
-										optimizeTCPForDirectCopy(rawConn)
+										OptimizeTCPForDirectCopy(rawConn)
 									}
 								}
 							}

@@ -137,15 +137,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var conn stat.Connection
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
 		dialDest := destination
+		// Happy Eyeballs v2（轻量版）：若为域名，双栈并行拨号，减少首连延迟
 		if h.config.hasStrategy() && dialDest.Address.Family().IsDomain() {
-			ip := h.resolveIP(ctx, dialDest.Address.Domain(), dialer.Address())
-			if ip != nil {
-				dialDest = net.Destination{
-					Network: dialDest.Network,
-					Address: ip,
-					Port:    dialDest.Port,
+			if raw, heErr := h.dialHappyEyeballs(ctx, dialer, dialDest); heErr == nil && raw != nil {
+				conn = raw
+				// 在直连路径上统一应用 TCP 优化（基于环境变量，失败忽略）
+				if os.Getenv("XRAY_EBPF") == "1" {
+					proxy.OptimizeTCPForDirectCopy(conn)
 				}
-				errors.LogInfo(ctx, "dialing to ", dialDest)
+				return nil
 			} else if h.config.forceIP() {
 				return dns.ErrEmptyResponse
 			}
@@ -168,6 +168,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		conn = rawConn
+		if os.Getenv("XRAY_EBPF") == "1" {
+			proxy.OptimizeTCPForDirectCopy(conn)
+		}
 		return nil
 	})
 	if err != nil {
@@ -307,6 +310,59 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	return nil
+}
+
+// dialHappyEyeballs 轻量版双栈竞速：A/AAAA 并行拨号，先成先用；失败回退上层逻辑。
+func (h *Handler) dialHappyEyeballs(ctx context.Context, dialer internet.Dialer, dest net.Destination) (stat.Connection, error) {
+	domain := dest.Address.Domain()
+	ips, _, err := h.dns.LookupIP(domain, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("happy-eyeballs: no ip")
+	}
+	// 构造候选地址（优先 v6，再 v4；分时启动，避免放大并发）
+	type cand struct{ ip net.Address }
+	var cands []cand
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			cands = append(cands, cand{net.IPAddress(ip)})
+		}
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			cands = append(cands, cand{net.IPAddress(ip)})
+		}
+	}
+	if len(cands) == 0 {
+		return nil, errors.New("happy-eyeballs: empty ip list")
+	}
+
+	ctxDial, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type res struct {
+		c stat.Connection
+		e error
+	}
+	ch := make(chan res, len(cands))
+	// 分时并行：第一个立即拨号，后续每 200ms 启动一个
+	for i, c := range cands {
+		go func(i int, a net.Address) {
+			if i > 0 {
+				time.Sleep(200 * time.Millisecond)
+			}
+			d := net.Destination{Network: dest.Network, Address: a, Port: dest.Port}
+			rc, e := dialer.Dial(ctxDial, d)
+			ch <- res{rc, e}
+		}(i, c.ip)
+	}
+	// 取第一个成功的连接
+	for range cands {
+		r := <-ch
+		if r.e == nil && r.c != nil {
+			cancel()
+			return r.c, nil
+		}
+	}
+	return nil, errors.New("happy-eyeballs: all failed")
 }
 
 func isTLSConn(conn stat.Connection) bool {
