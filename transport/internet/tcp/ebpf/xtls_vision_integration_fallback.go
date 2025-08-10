@@ -73,6 +73,11 @@ func (xvm *XTLSVisionManager) IsEnabled() bool {
 	return false // 非Linux平台始终返回false
 }
 
+// GetDynamicHints 返回默认调优建议（非Linux平台fallback）
+func (xvm *XTLSVisionManager) GetDynamicHints() (int, bool) {
+	return 120, true
+}
+
 // SetDirectCopyHintIPv4 设置/清除直拷提示（非Linux平台fallback：no-op）
 func (xvm *XTLSVisionManager) SetDirectCopyHintIPv4(srcIP uint32, srcPort uint16, dstIP uint32, dstPort uint16, enabled bool) error {
 	return nil

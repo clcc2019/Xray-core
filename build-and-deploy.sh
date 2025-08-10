@@ -223,6 +223,7 @@ compile_ebpf() {
     compile_program "app/router/ebpf"
     compile_program "app/stats/ebpf"
     compile_program "transport/internet/ebpf"
+    compile_program "transport/internet/udp/ebpf"
     compile_program "transport/internet/tcp/ebpf"
     compile_program "proxy/ebpf"
     log_success "eBPF编译完成: $success_count/$total_count 成功"
@@ -261,6 +262,20 @@ load_ebpf() {
     bpftool map create $BPF_ROOT/route_ip_v4_hint type lru_hash key 4 value 12 entries 100000 name route_ip_v4_hint 2>/dev/null || true
     bpftool map create $BPF_ROOT/route_ip_v6_hint type lru_hash key 16 value 12 entries 80000 name route_ip_v6_hint 2>/dev/null || true
     bpftool map create $BPF_ROOT/ip_fastpath_enable type array key 4 value 4 entries 1 name ip_fastpath_enable 2>/dev/null || true
+    # Reuseport selector 反馈 map（端口 -> 偏置）及监听端口集合（供 selector 与 cgroup_skb 共用）
+    # v4/v6 区分的端口偏置反馈：key u32(高16位端口 + bit0 is_v6)，value u32
+    bpftool map create $BPF_ROOT/reuseport_feedback type lru_hash key 4 value 4 entries 2048 name reuseport_feedback 2>/dev/null || true
+    # UDP XDP/AF_XDP：队列开关与 xskmap
+    bpftool map create $BPF_ROOT/udp_xdp_queues_enable type array key 4 value 4 entries 64 name udp_xdp_queues_enable 2>/dev/null || true
+    bpftool map create $BPF_ROOT/xsk_udp_map type xskmap key 4 value 4 entries 64 name xsk_udp_map 2>/dev/null || true
+    # UDP 过滤控制与白名单/热点目的地
+    bpftool map create $BPF_ROOT/udp_filter_enable type array key 4 value 4 entries 1 name udp_filter_enable 2>/dev/null || true
+    bpftool map create $BPF_ROOT/udp_allowed_ports type hash key 2 value 1 entries 256 name udp_allowed_ports 2>/dev/null || true
+    bpftool map create $BPF_ROOT/udp_hot_dst_v4 type lru_hash key 4 value 1 entries 65536 name udp_hot_dst_v4 2>/dev/null || true
+    # v6 key 16 字节，这里用 ARRAY_OF_MAPS 的 pinned 简化，实际直接 pin 为 hash 即可
+    bpftool map create $BPF_ROOT/udp_hot_dst_v6 type lru_hash key 16 value 1 entries 32768 name udp_hot_dst_v6 2>/dev/null || true
+    bpftool map create $BPF_ROOT/xray_listen_ports type hash key 2 value 1 entries 1024 name xray_listen_ports 2>/dev/null || true
+    bpftool map create $BPF_ROOT/sockdf_config type array key 4 value 16 entries 1 name sockdf_config 2>/dev/null || true
     
     # 加载函数
     load_program() {
@@ -471,7 +486,85 @@ load_ebpf() {
     # IP 快速路由器（TC）
     load_tc_with_pinmaps "app/router/ebpf/ip_fastpath_tc.o" "ip_fastpath_tc"
 
+    # UDP XDP fastpath（IPv4）：需用户态 AF_XDP 绑定后再启用队列开关
+    load_xdp "transport/internet/udp/ebpf/xdp_udp_fastpath.o" "xdp_udp_fastpath"
+
+    # 可选：根据环境变量开启 UDP 过滤
+    if [ "${XRAY_UDP_FILTER_PORT_WHITELIST:-0}" = "1" ] || [ "${XRAY_UDP_FILTER_HOTDST:-0}" = "1" ]; then
+      key_hex="00 00 00 00"
+      val_hex="00 00 00 00"
+      [ "${XRAY_UDP_FILTER_PORT_WHITELIST:-0}" = "1" ] && val_hex="01 00 00 00"
+      if [ "${XRAY_UDP_FILTER_HOTDST:-0}" = "1" ]; then
+        # 叠加 bit1
+        if [ "$val_hex" = "01 00 00 00" ]; then val_hex="03 00 00 00"; else val_hex="02 00 00 00"; fi
+      fi
+      bpftool map update pinned "$BPF_ROOT/udp_filter_enable" key hex $key_hex value hex $val_hex 2>/dev/null || true
+      # 注入端口白名单（逗号分隔），示例：XRAY_UDP_ALLOWED_PORTS=53,443,853,784,8853
+      if [ -n "${XRAY_UDP_ALLOWED_PORTS:-}" ]; then
+        IFS=',' read -r -a _ports <<< "$XRAY_UDP_ALLOWED_PORTS"
+        for p in "${_ports[@]}"; do
+          pp=$(printf "%04x" "$p")
+          # 小端键
+          key_hex="${pp:2:2} ${pp:0:2}"
+          bpftool map update pinned "$BPF_ROOT/udp_allowed_ports" key hex $key_hex value hex 01 2>/dev/null || true
+        done
+      fi
+    fi
+
     # sk_lookup 重定向已移除（按用户要求精简）
+
+    # cgroup/connect: 加载并附加 socket_direct_cgroup（仅在 cgroup v2 且具备权限时）
+    if [ -f "transport/internet/tcp/ebpf/socket_direct_cgroup.o" ]; then
+      if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        log_info "尝试加载 cgroup connect 程序..."
+        # 创建并 pin 关键 maps（若程序编译时已内嵌 pinmaps，此处幂等）
+        bpftool map create $BPF_ROOT/xray_listen_ports type hash key 2 value 1 entries 1024 name xray_listen_ports 2>/dev/null || true
+        bpftool map create $BPF_ROOT/sockdf_config type array key 4 value 16 entries 1 name sockdf_config 2>/dev/null || true
+        # 加载程序并 pin（section: cgroup_skb/ingress）
+        if bpftool prog loadall transport/internet/tcp/ebpf/socket_direct_cgroup.o $BPF_ROOT/socket_direct_cgroup pinmaps $BPF_ROOT 2>/dev/null; then
+          log_debug "socket_direct_cgroup 加载成功"
+          # 选择 cgroup 根（系统通常为 /sys/fs/cgroup）
+          CGROOT="/sys/fs/cgroup"
+          # 先卸载旧附加（忽略失败）
+          bpftool cgroup detach $CGROOT ingress id 0 2>/dev/null || true
+          # 使用 obj+sec 进行附加，避免 pinned program 读取不兼容
+          if bpftool cgroup attach $CGROOT ingress obj transport/internet/tcp/ebpf/socket_direct_cgroup.o sec cgroup_skb/ingress 2>/dev/null; then
+            log_success "cgroup_skb/ingress 已附加"
+          else
+            log_warning "cgroup_skb/ingress 附加失败（忽略）"
+          fi
+          # 写入默认规则（与用户态保持一致；仅当 map 存在时）
+          if [ -e "$BPF_ROOT/sockdf_config" ]; then
+            # key 0, 值: 01 01 01 01 + 3* u32 0
+            bpftool map update pinned "$BPF_ROOT/sockdf_config" key hex 00 00 00 00 value hex 01 01 01 01 00 00 00 00 00 00 00 00 00 00 00 00 2>/dev/null || true
+          fi
+        else
+          log_warning "socket_direct_cgroup 加载失败（忽略）"
+        fi
+      else
+        log_debug "系统非 cgroup v2，跳过 cgroup/connect"
+      fi
+    fi
+
+    # sk_reuseport selector（若对象存在则加载并附加到监听套接字 cgroup）
+    if [ -f "transport/internet/tcp/ebpf/reuseport_selector.o" ]; then
+      log_info "尝试加载 sk_reuseport 选择器..."
+      # pin program，便于后续管理
+      if bpftool prog load transport/internet/tcp/ebpf/reuseport_selector.o $BPF_ROOT/reuseport_selector type sk_reuseport 2>/dev/null; then
+        log_debug "reuseport_selector 加载成功"
+        # 尝试附加到 cgroup v2 根，绑定到所有 SO_REUSEPORT 的监听集合
+        CGROOT="/sys/fs/cgroup"
+        # 先分离旧选择器（忽略失败）
+        bpftool cgroup detach $CGROOT reuseport id 0 2>/dev/null || true
+        if bpftool cgroup attach $CGROOT reuseport pinned $BPF_ROOT/reuseport_selector 2>/dev/null; then
+          log_success "sk_reuseport 已附加"
+        else
+          log_warning "sk_reuseport 附加失败（忽略）"
+        fi
+      else
+        log_warning "reuseport_selector 加载失败（忽略）"
+      fi
+    fi
 
     # 根据环境变量设置开关位（默认开启，可用环境变量显式置0关闭）
     set_enable_flag() {
@@ -522,6 +615,76 @@ load_ebpf() {
     done
 }
 
+# 网络与内核参数优化（减少丢包）
+tune_network() {
+    # 允许通过 XRAY_TUNE_NET=0 关闭
+    if [ "${XRAY_TUNE_NET:-1}" != "1" ]; then
+      return 0
+    fi
+    log_info "应用网络/内核优化..."
+
+    # sysctl 优化（忽略失败）
+    apply_sysctl() { sysctl -w "$1" 2>/dev/null || true; }
+    apply_sysctl net.core.somaxconn=65535
+    apply_sysctl net.ipv4.tcp_max_syn_backlog=262144
+    apply_sysctl net.core.netdev_max_backlog=250000
+    apply_sysctl net.core.rmem_max=134217728
+    apply_sysctl net.core.wmem_max=134217728
+    apply_sysctl net.core.rmem_default=4194304
+    apply_sysctl net.core.wmem_default=4194304
+    # UDP 缓冲区（可由环境变量覆盖）
+    apply_sysctl net.ipv4.udp_rmem_min=${XRAY_UDP_RMEM_MIN:-262144}
+    apply_sysctl net.ipv4.udp_wmem_min=${XRAY_UDP_WMEM_MIN:-262144}
+    # udp_mem: min pressure max（页为单位，近似计算：内存MB*1024*1024/4096/比例）
+    if [ -n "${XRAY_UDP_MEM:-}" ]; then
+      apply_sysctl net.ipv4.udp_mem="${XRAY_UDP_MEM}"
+    fi
+    # 针对 UDP 工作负载可选增大 rmem/wmem 上限
+    if [ "${XRAY_UDP_HEAVY:-0}" = "1" ]; then
+      apply_sysctl net.core.rmem_max=268435456
+      apply_sysctl net.core.wmem_max=268435456
+    fi
+    apply_sysctl "net.ipv4.tcp_rmem=4096 87380 67108864"
+    apply_sysctl "net.ipv4.tcp_wmem=4096 65536 67108864"
+    apply_sysctl net.ipv4.tcp_fastopen=3
+    apply_sysctl net.ipv4.tcp_mtu_probing=1
+    apply_sysctl net.core.busy_poll=50
+    apply_sysctl net.core.busy_read=50
+    # 优先使用 bbr + fq
+    apply_sysctl net.ipv4.tcp_congestion_control=${XRAY_TCP_CC:-bbr}
+    apply_sysctl net.core.default_qdisc=${XRAY_QDISC_DEFAULT:-fq}
+
+    # 选择网络接口（与 load_ebpf 同逻辑）
+    local interface_name=${XRAY_IFACE:-}
+    if [ -z "$interface_name" ]; then
+      interface_name=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')
+    fi
+    if [ -z "$interface_name" ]; then
+      interface_name=$(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev '^(lo|docker|veth|cni|br-)' | head -1)
+    fi
+    if [ -z "$interface_name" ]; then
+      interface_name="eth0"
+    fi
+
+    # qdisc 调度（默认 fq，可用 XRAY_QDISC 指定 fq_codel 等）
+    local qdisc=${XRAY_QDISC:-fq}
+    tc qdisc replace dev "$interface_name" root "$qdisc" 2>/dev/null || true
+
+    # 提高设备队列长度
+    ip link set dev "$interface_name" txqueuelen ${XRAY_TXQLEN:-20000} 2>/dev/null || true
+
+    # 调整网卡 ring（需要 ethtool 支持）
+    if command -v ethtool >/dev/null 2>&1; then
+      ethtool -G "$interface_name" rx ${XRAY_RING_RX:-4096} tx ${XRAY_RING_TX:-4096} 2>/dev/null || true
+      # 可选开关 GRO/GSO/TSO（默认不改动；设置为 on/off 时生效）
+      [ -n "${XRAY_TUNE_GRO:-}" ] && ethtool -K "$interface_name" gro ${XRAY_TUNE_GRO} 2>/dev/null || true
+      [ -n "${XRAY_TUNE_GSO:-}" ] && ethtool -K "$interface_name" gso ${XRAY_TUNE_GSO} 2>/dev/null || true
+      [ -n "${XRAY_TUNE_TSO:-}" ] && ethtool -K "$interface_name" tso ${XRAY_TUNE_TSO} 2>/dev/null || true
+    fi
+
+    log_success "网络/内核优化完成"
+}
+
 # 设置权限
 setup_permissions() {
     log_info "设置权限..."
@@ -562,6 +725,7 @@ main() {
     check_dependencies
     compile_ebpf
     load_ebpf
+    tune_network
     setup_permissions
     show_status
     

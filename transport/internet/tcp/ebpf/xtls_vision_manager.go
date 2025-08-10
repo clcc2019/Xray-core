@@ -36,6 +36,12 @@ type XTLSVisionManager struct {
 	stats              *XTLSVisionStats
 	lastTLSCompleteTs  time.Time
 	lastVisionActiveTs time.Time
+	// moving error/handshake stats for dynamic tuning
+	recentHandshakeNs []uint64
+	recentErrors      int
+	// derived breakdown by category from connection table sampling
+	errorBreakdown map[string]int
+	lastScan       time.Time
 }
 
 // XTLSVisionStats 服务端入站统计信息
@@ -213,6 +219,8 @@ func (xvm *XTLSVisionManager) collectStats() {
 			return
 		case <-ticker.C:
 			xvm.GetStats()
+			// light-weight periodic sampling for error breakdown
+			xvm.scanInboundSample()
 		}
 	}
 }
@@ -247,16 +255,110 @@ func (xvm *XTLSVisionManager) startEventReader() {
 					t := binary.LittleEndian.Uint32(rec.RawSample[0:4])
 					now := time.Now()
 					xvm.mu.Lock()
-					if t == 2 {
+					switch t {
+					case 1: // handshake start (optional)
+						// no-op
+					case 2: // TLS complete
 						xvm.lastTLSCompleteTs = now
-					} else if t == 3 {
+						if len(xvm.recentHandshakeNs) >= 128 {
+							xvm.recentHandshakeNs = xvm.recentHandshakeNs[1:]
+						}
+						xvm.recentHandshakeNs = append(xvm.recentHandshakeNs, uint64(time.Since(now).Nanoseconds()))
+					case 3: // Vision active
 						xvm.lastVisionActiveTs = now
+					case 4: // error event
+						xvm.recentErrors++
+						if xvm.recentErrors > 10000 {
+							xvm.recentErrors = 10000
+						}
 					}
 					xvm.mu.Unlock()
 				}
 			}
 		}
 	}()
+}
+
+// scanInboundSample 从连接表抽样统计错误分类，避免高开销全量扫描
+func (xvm *XTLSVisionManager) scanInboundSample() {
+	if xvm.inboundConnections == nil {
+		return
+	}
+	// 最多每2秒扫描一次
+	if time.Since(xvm.lastScan) < 2*time.Second {
+		return
+	}
+	xvm.lastScan = time.Now()
+
+	// 采样上限
+	const sampleLimit = 256
+	now := time.Now()
+	type inbound struct {
+		ClientIP        uint32
+		ServerIP        uint32
+		ClientPort      uint16
+		ServerPort      uint16
+		State           uint8
+		RealityVerified uint8
+		TLSVersion      uint8
+		VisionEnabled   uint8
+		HandshakeTime   uint64
+		BytesReceived   uint64
+		BytesSent       uint64
+		SpliceCount     uint32
+		VisionPackets   uint32
+		LastActivity    uint64
+		DestIP          uint32
+		DestPort        uint16
+		UserUUID        [16]byte
+		Command         uint8
+		ContentLen      uint16
+		PaddingLen      uint16
+		ParsingState    uint8
+	}
+	iter := xvm.inboundConnections.Iterate()
+	var (
+		key            uint64
+		v              inbound
+		n              int
+		tlsInvalid     int
+		timeoutCnt     int
+		visionInactive int
+	)
+	for iter.Next(&key, &v) {
+		// 分类：握手超时
+		// LastActivity 为 ns；当解析状态<2 且距今>2.5s 认为握手超时
+		la := time.Unix(0, int64(v.LastActivity))
+		if v.ParsingState < 2 {
+			if now.Sub(la) > 2500*time.Millisecond {
+				timeoutCnt++
+			}
+		}
+		// 分类：TLS版本异常
+		if !(v.TLSVersion >= 0x01 && v.TLSVersion <= 0x04) {
+			// eBPF 以 0x03xx 形式也可能存储；若为0则视为未识别
+			if v.TLSVersion == 0 || v.TLSVersion > 0x10 {
+				tlsInvalid++
+			}
+		}
+		// 分类：Vision未激活
+		if v.ParsingState >= 2 && v.VisionPackets == 0 {
+			visionInactive++
+		}
+		n++
+		if n >= sampleLimit {
+			break
+		}
+	}
+	// 更新分类计数
+	xvm.mu.Lock()
+	if xvm.errorBreakdown == nil {
+		xvm.errorBreakdown = make(map[string]int)
+	}
+	xvm.errorBreakdown["timeout"] = timeoutCnt
+	xvm.errorBreakdown["tls_invalid"] = tlsInvalid
+	xvm.errorBreakdown["vision_inactive"] = visionInactive
+	xvm.mu.Unlock()
 }
 
 // HasRecentVisionActive 返回近期是否有 Vision 激活事件
@@ -267,6 +369,61 @@ func (xvm *XTLSVisionManager) HasRecentVisionActive(d time.Duration) bool {
 		return false
 	}
 	return time.Since(xvm.lastVisionActiveTs) <= d
+}
+
+// GetDynamicHints 返回基于 eBPF 事件推导出的调优建议
+// - 建议直拷宽限时间（毫秒）与 pacing 开关
+func (xvm *XTLSVisionManager) GetDynamicHints() (graceMs int, enablePacing bool) {
+	xvm.mu.RLock()
+	defer xvm.mu.RUnlock()
+	// 基于近期 Vision 激活与错误率做启停控制
+	enablePacing = true
+	if !xvm.lastVisionActiveTs.IsZero() && time.Since(xvm.lastVisionActiveTs) < 5*time.Second {
+		enablePacing = false // Vision 活跃时可放宽 pacing，避免不必要的节流
+	}
+	// 估算握手耗时分位数（粗略）
+	graceMs = 120
+	if n := len(xvm.recentHandshakeNs); n > 0 {
+		// 取末尾 32 个的最大值作为近似上分位
+		start := 0
+		if n > 32 {
+			start = n - 32
+		}
+		max := uint64(0)
+		for _, v := range xvm.recentHandshakeNs[start:] {
+			if v > max {
+				max = v
+			}
+		}
+		ms := int(max / 1_000_000)
+		if ms < 60 {
+			ms = 60
+		}
+		if ms > 300 {
+			ms = 300
+		}
+		graceMs = ms
+	}
+	// 错误偏置：错误过高则提高宽限
+	if xvm.recentErrors > 10 { // 简单阈值，可后续改为滑窗比率
+		if graceMs < 180 {
+			graceMs = 180
+		}
+		enablePacing = true
+	}
+	// 细分错误偏置：若 TLS 版本错误/握手超时较多，提高宽限；若 Vision 未激活较多，保持/开启 pacing
+	if xvm.errorBreakdown != nil {
+		if xvm.errorBreakdown["tls_invalid"] > 5 || xvm.errorBreakdown["timeout"] > 5 {
+			if graceMs < 200 {
+				graceMs = 200
+			}
+			enablePacing = true
+		}
+		if xvm.errorBreakdown["vision_inactive"] > 5 {
+			enablePacing = true
+		}
+	}
+	return
 }
 
 // Close 关闭XTLS Vision管理器

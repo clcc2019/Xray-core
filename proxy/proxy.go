@@ -28,6 +28,7 @@ import (
 	tcpinfo "github.com/xtls/xray-core/common/tcpinfo"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
+	ebpfproxy "github.com/xtls/xray-core/proxy/ebpf"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
@@ -117,6 +118,19 @@ func init() {
 	}
 	if v := os.Getenv("XRAY_XTLS_PACING"); v != "" {
 		xtlsPacingEnabled = v != "0" && v != "false"
+	}
+
+	// If eBPF is enabled and pacing not explicitly set, enable pacing by default.
+	if ebpfEnvEnabled {
+		if _, ok := os.LookupEnv("XRAY_XTLS_PACING"); !ok {
+			xtlsPacingEnabled = true
+		}
+		// Make direct-copy grace shorter for faster engagement when not overridden by env.
+		if _, ok := os.LookupEnv("XRAY_XTLS_DIRECT_GRACE_MS"); !ok {
+			if xtlsPadCfg.directGraceMs > 120 {
+				xtlsPadCfg.directGraceMs = 120
+			}
+		}
 	}
 }
 
@@ -529,6 +543,19 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 	if ts != nil {
 		r = ts.nextRand32()
 	}
+	// 动态调优：根据 eBPF XTLS 事件适配 pacing 与直拷宽限时间（仅在未显式设置环境变量时生效）
+	if os.Getenv("XRAY_EBPF") == "1" && runtime.GOOS == "linux" {
+		if m := ebpf.GetXTLSVisionManager(); m != nil && m.IsEnabled() {
+			if g, pace := m.GetDynamicHints(); g > 0 {
+				if _, ok := os.LookupEnv("XRAY_XTLS_DIRECT_GRACE_MS"); !ok {
+					xtlsPadCfg.directGraceMs = g
+				}
+				if _, ok := os.LookupEnv("XRAY_XTLS_PACING"); !ok {
+					xtlsPacingEnabled = pace
+				}
+			}
+		}
+	}
 	// Optimized padding strategy
 	if command == CommandPaddingDirect {
 		// When switching to direct copy, avoid heavy padding
@@ -919,8 +946,20 @@ func tryProxyEBPFAcceleration(ctx context.Context, readerConn, writerConn net.Co
 		return
 	}
 
-	// 检查连接是否支持XTLS Vision优化
+	// 检查连接是否支持XTLS Vision优化（端口/SNI 降级名单跳过）
 	if readerConn != nil && writerConn != nil {
+		// 提取远端端口用于降级判断
+		if ra, ok := readerConn.RemoteAddr().(*net.TCPAddr); ok {
+			// 从 inbound 属性尝试获取 SNI（若有）
+			var sni string
+			if c := session.ContentFromContext(ctx); c != nil {
+				sni = c.Attribute("sni")
+			}
+			if ebpfproxy.ShouldDegradeFor(sni, ra.Port) {
+				errors.LogInfo(ctx, "Vision eBPF degraded for SNI/port: ", sni, ", ", ra.Port)
+				return
+			}
+		}
 		// 尝试启用Vision eBPF加速
 		EnableVisionEBPFAcceleration(ctx, readerConn, writerConn)
 	}

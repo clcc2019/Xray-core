@@ -6,6 +6,8 @@ import (
 	"context"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +53,11 @@ type ProxyAcceleratorCilium struct {
 var (
 	globalProxyAcceleratorCilium *ProxyAcceleratorCilium
 	initProxyCiliumOnce          sync.Once
+	// degrade lists
+	degradeOnce      sync.Once
+	degradeSNISuffix []string
+	degradeSNIExact  map[string]struct{}
+	degradePorts     map[int]struct{}
 )
 
 // GetProxyAccelerator 获取 Cilium 版本的 proxy 加速器
@@ -69,6 +76,76 @@ func GetProxyAccelerator() *ProxyAcceleratorCilium {
 		}
 	})
 	return globalProxyAcceleratorCilium
+}
+
+// parseDegradeEnv parses XRAY_EBPF_DEGRADE_SNI and XRAY_EBPF_DEGRADE_PORTS
+func parseDegradeEnv() {
+	degradeOnce.Do(func() {
+		degradeSNIExact = make(map[string]struct{})
+		degradePorts = make(map[int]struct{})
+		// SNI list: comma separated, supports exact and wildcard like *.example.com
+		if v := os.Getenv("XRAY_EBPF_DEGRADE_SNI"); v != "" {
+			for _, item := range splitCSV(v) {
+				s := strings.ToLower(strings.TrimSpace(item))
+				if s == "" {
+					continue
+				}
+				if strings.HasPrefix(s, "*.") {
+					degradeSNISuffix = append(degradeSNISuffix, strings.TrimPrefix(s, "*"))
+				} else {
+					degradeSNIExact[s] = struct{}{}
+				}
+			}
+		}
+		if v := os.Getenv("XRAY_EBPF_DEGRADE_PORTS"); v != "" {
+			for _, item := range splitCSV(v) {
+				s := strings.TrimSpace(item)
+				if s == "" {
+					continue
+				}
+				if n, err := strconv.Atoi(s); err == nil && n > 0 && n < 65536 {
+					degradePorts[n] = struct{}{}
+				}
+			}
+		}
+	})
+}
+
+// ShouldDegradeFor returns true if the given sni/port should avoid splice/vision hints
+func ShouldDegradeFor(sni string, port int) bool {
+	if os.Getenv("XRAY_EBPF") != "1" {
+		return false
+	}
+	parseDegradeEnv()
+	if port > 0 {
+		if _, ok := degradePorts[port]; ok {
+			return true
+		}
+	}
+	sni = strings.ToLower(strings.TrimSpace(sni))
+	if sni == "" {
+		return false
+	}
+	if _, ok := degradeSNIExact[sni]; ok {
+		return true
+	}
+	for _, suf := range degradeSNISuffix {
+		if strings.HasSuffix(sni, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // init 初始化 Cilium eBPF 加速器
