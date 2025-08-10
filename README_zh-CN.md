@@ -26,13 +26,10 @@ rsync -r build/ root@your-server:/root/xray-ebpf/
 ssh root@your-server 'cd /root/xray-ebpf && bash deploy.sh'
 ```
 
-## 运行示例（服务端）
+## 运行示例（统一开关）
 ```bash
-export XRAY_EBPF=1              # 开启 eBPF 加速（默认脚本已设置）
-# 可选：子特性开关（均默认为 1，可显式设为 0 关闭）
-export XRAY_EBPF_DNS_ROUTER=1
-export XRAY_EBPF_GEOSITE=1
-export XRAY_EBPF_IP_FASTPATH=1
+# 启用所有 eBPF 相关优化
+export XRAY_EBPF=1
 
 /usr/local/bin/xray run -config /etc/xray/config.yaml
 ```
@@ -46,7 +43,7 @@ journalctl -u xray -n 200 --no-pager
 
 ## 注意事项
 - 仅面向 Linux 服务器；本仓库已精简为 Linux 专用构建
-- 不修改既有 Xray 配置文件的前提下生效（通过环境变量与 eBPF pinned maps 管理）
+- `XRAY_EBPF=1` 为统一总开关，其他子特性默认随部署脚本开启；无需单独设置
 - 若内核/权限不足以加载 eBPF，系统会自动回退到用户态逻辑
 
 ## 常见问题

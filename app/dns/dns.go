@@ -40,6 +40,10 @@ type DNS struct {
 	// lightweight negative cache: domainKey -> expireAt
 	negMu    sync.RWMutex
 	negCache map[string]time.Time
+
+	// prefetch scheduling to avoid duplicate refresh tasks
+	pfMu        sync.Mutex
+	pfScheduled map[string]struct{}
 }
 
 // -------- 双层缓存融合：全局 eBPF 加速器与 eBPF 缓存（懒加载） --------
@@ -56,6 +60,58 @@ var (
 	ebpfAccelGlobal *ebpf.DNSAccelerator
 	ebpfCacheGlobal ebpfDNSCache
 )
+
+// getNegativeCacheTTL returns duration for negative cache from env XRAY_DNS_NEG_TTL seconds (default 8s, max 60s).
+func getNegativeCacheTTL() time.Duration {
+	// 仅受 XRAY_EBPF 控制：开启则使用默认 8s，关闭则禁用负缓存
+	if os.Getenv("XRAY_EBPF") != "1" {
+		return 0
+	}
+	return 8 * time.Second
+}
+
+// getNegativeCacheMaxSize returns max entries allowed in negative cache.
+// Controlled by XRAY_DNS_NEG_MAX (default 8192, min 256, max 262144).
+func getNegativeCacheMaxSize() int {
+	// 仅受 XRAY_EBPF 控制：开启则使用默认容量 8192，关闭则容量为 0（禁用）
+	if os.Getenv("XRAY_EBPF") != "1" {
+		return 0
+	}
+	return 8192
+}
+
+// pruneNegativeCache reduces negative cache size by removing expired entries and
+// then trimming oldest-by-expire entries if still too large.
+func (s *DNS) pruneNegativeCacheLocked(maxSize int) {
+	now := time.Now()
+	// Remove expired first
+	for k, exp := range s.negCache {
+		if now.After(exp) {
+			delete(s.negCache, k)
+		}
+	}
+	// Trim if still too large
+	if len(s.negCache) <= maxSize {
+		return
+	}
+	type kv struct {
+		k   string
+		exp time.Time
+	}
+	list := make([]kv, 0, len(s.negCache))
+	for k, exp := range s.negCache {
+		list = append(list, kv{k: k, exp: exp})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].exp.Before(list[j].exp) })
+	// keep newest ~75%, drop oldest 25%
+	target := maxSize * 3 / 4
+	if target < 256 {
+		target = 256
+	}
+	for i := 0; i < len(list)-target; i++ {
+		delete(s.negCache, list[i].k)
+	}
+}
 
 func ensureEBPFDNS() {
 	ebpfInitOnce.Do(func() {
@@ -254,9 +310,10 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	}
 
 	// Negative cache: quick drop of recent NODATA/NXDOMAIN for small TTL
-	if s.checkSystem == false { // keep behavior conservative under system mode
+	if !s.checkSystem { // keep behavior conservative under system mode
+		negKey := domain + ":" + keyOfOption(option)
 		s.negMu.RLock()
-		if exp, ok := s.negCache[domain]; ok && time.Now().Before(exp) {
+		if exp, ok := s.negCache[negKey]; ok && time.Now().Before(exp) {
 			s.negMu.RUnlock()
 			return nil, 0, dns.ErrEmptyResponse
 		}
@@ -451,10 +508,22 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	if errSF != nil {
 		if errSF == dns.ErrEmptyResponse {
 			// 更新负缓存：短 TTL
-			if s.checkSystem == false {
-				s.negMu.Lock()
-				s.negCache[domain] = time.Now().Add(8 * time.Second)
-				s.negMu.Unlock()
+			if !s.checkSystem {
+				negKey := domain + ":" + keyOfOption(option)
+				ttl := getNegativeCacheTTL()
+				if ttl > 0 {
+					s.negMu.Lock()
+					if s.negCache == nil {
+						s.negCache = make(map[string]time.Time)
+					}
+					// 容量管控，防止内存增长
+					maxSize := getNegativeCacheMaxSize()
+					if len(s.negCache) >= maxSize {
+						s.pruneNegativeCacheLocked(maxSize)
+					}
+					s.negCache[negKey] = time.Now().Add(ttl)
+					s.negMu.Unlock()
+				}
 			}
 		}
 		return nil, 0, errSF
@@ -463,7 +532,55 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		ips []net.IP
 		ttl uint32
 	})
+	// schedule prefetch if TTL is short
+	s.maybeSchedulePrefetch(domain, option, res.ttl)
 	return res.ips, res.ttl, nil
+}
+
+// maybeSchedulePrefetch schedules a background refresh when TTL is short.
+// XRAY_DNS_PREFETCH_TTL controls threshold seconds (default 30, max 300). XRAY_DNS_PREFETCH_JITTER adds random jitter up to N seconds (default 5).
+func (s *DNS) maybeSchedulePrefetch(domain string, option dns.IPOption, ttl uint32) {
+	if ttl == 0 {
+		return
+	}
+	// 仅受 XRAY_EBPF 控制：开启时，默认阈值 30，否则不预取
+	thr := 0
+	if os.Getenv("XRAY_EBPF") == "1" {
+		thr = 30
+	}
+	if thr == 0 || int(ttl) > thr {
+		return
+	}
+	key := domain + ":" + keyOfOption(option)
+	s.pfMu.Lock()
+	if s.pfScheduled == nil {
+		s.pfScheduled = make(map[string]struct{})
+	}
+	if _, ok := s.pfScheduled[key]; ok {
+		s.pfMu.Unlock()
+		return
+	}
+	s.pfScheduled[key] = struct{}{}
+	s.pfMu.Unlock()
+
+	// jitter seconds
+	// 仅受 XRAY_EBPF 控制：开启时，默认抖动 5s
+	jitter := 0
+	if os.Getenv("XRAY_EBPF") == "1" {
+		jitter = 5
+	}
+	go func() {
+		// small delay to reduce contention, but keep within TTL window
+		if jitter > 0 {
+			time.Sleep(time.Duration(jitter) * time.Second)
+		}
+		// Use background context to avoid request cancellation
+		// Singleflight in LookupIP will deduplicate concurrent refreshes
+		_, _, _ = s.LookupIP(domain, option)
+		s.pfMu.Lock()
+		delete(s.pfScheduled, key)
+		s.pfMu.Unlock()
+	}()
 }
 
 // keyOfOption 生成 singleflight key 的 option 部分

@@ -54,6 +54,10 @@ func init() {
 	case defaultFlagValue, "auto", "enable":
 		useSplice = true
 	}
+	// 若 XRAY_EBPF=1，则强制开启 splice 能力（由后续条件再决定是否真正走 splice 路径）
+	if ebpfEnvEnabled {
+		useSplice = true
+	}
 }
 
 // Handler handles Freedom connections.
@@ -230,7 +234,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		// 在复制前启动 eBPF 统计，覆盖完整请求阶段
-		if os.Getenv("XRAY_EBPF") == "1" {
+		if ebpfEnvEnabled {
 			if accelerator := ebpf.GetProxyAccelerator(); accelerator != nil && accelerator.IsEnabled() {
 				if tcpConn, ok := conn.(*net.TCPConn); ok {
 					// 统计记录（Linux-only）
@@ -256,7 +260,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				inTimer = inbound.Timer
 			}
 			// 基于连接键精确读取 parsing_state 直接决策（无需时间窗）
-			if os.Getenv("XRAY_EBPF") == "1" {
+			if ebpfEnvEnabled {
 				if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
 					// 仅处理 TCP/IPv4
 					if lAddr, okL := conn.LocalAddr().(*net.TCPAddr); okL && lAddr.IP.To4() != nil {
@@ -277,9 +281,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 
 			if !isTLSConn(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
-				// eBPF 热路径提示（更细粒度，可通过 XRAY_EBPF_HINT_SPLICE 控制，默认开启）：
-				// 当检测到 Vision 直拷解析状态为真时，直接开启 splice
-				if ebpfEnvEnabled && os.Getenv("XRAY_EBPF_HINT_SPLICE") != "0" && os.Getenv("XRAY_EBPF_HINT_SPLICE") != "false" {
+				// eBPF 热路径提示：当检测到 Vision 直拷解析状态为真时，直接开启 splice
+				if ebpfEnvEnabled {
 					if lAddr, okL := conn.LocalAddr().(*net.TCPAddr); okL && lAddr.IP.To4() != nil {
 						if rAddr, okR := conn.RemoteAddr().(*net.TCPAddr); okR && rAddr.IP.To4() != nil {
 							saddr := binary.BigEndian.Uint32(lAddr.IP.To4())

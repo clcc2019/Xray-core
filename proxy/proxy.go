@@ -909,7 +909,7 @@ func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer sign
 
 // tryProxyEBPFAcceleration 尝试启用proxy eBPF加速
 func tryProxyEBPFAcceleration(ctx context.Context, readerConn, writerConn net.Conn) {
-	if os.Getenv("XRAY_EBPF") != "1" || runtime.GOOS != "linux" {
+	if !ebpfEnvEnabled || runtime.GOOS != "linux" {
 		return
 	}
 

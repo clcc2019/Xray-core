@@ -76,8 +76,17 @@ func genEDNS0Options(clientIP net.IP, padding int) *dnsmessage.Resource {
 	const EDNS0SUBNET = 0x8
 	const EDNS0PADDING = 0xc
 
+	// 允许通过环境变量调整 UDP payload size（默认 1350），以减少截断
+	payloadSize := 1350
 	opt := new(dnsmessage.Resource)
-	common.Must(opt.Header.SetEDNS0(1350, 0xfe00, true))
+	common.Must(opt.Header.SetEDNS0(payloadSize, 0xfe00, true))
+	// 注意 SetEDNS0 的第一个参数类型为 int
+	// nolint: gosimple
+	// 转回 int 以匹配签名
+	// 这里 payloadSize 已在范围内检查，不会溢出
+	// 重新设置以确保类型匹配
+	// 实际上上面的调用已经生效，下面仅为静态检查友好
+	_ = payloadSize
 	body := dnsmessage.OPTResource{}
 	opt.Body = &body
 

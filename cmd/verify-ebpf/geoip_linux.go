@@ -3,33 +3,36 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 
 	router_ebpf "github.com/xtls/xray-core/app/router/ebpf"
 )
 
-func testGeoIPBridge() {
-	matcher, err := router_ebpf.NewEBpfGeoIPMatcher("CN", false)
+// 由 main 注入（Linux 平台声明变量）
+var (
+	geoipCountryFlag string
+	geoipReverseFlag bool
+)
+
+func setGeoIPFlags(country string, reverse bool) {
+	geoipCountryFlag = country
+	geoipReverseFlag = reverse
+}
+
+func testGeoIPBridge() (bool, map[string]interface{}, error) {
+	country := geoipCountryFlag
+	if country == "" {
+		country = "CN"
+	}
+	matcher, err := router_ebpf.NewEBpfGeoIPMatcher(country, geoipReverseFlag)
 	if err != nil {
-		fmt.Printf("❌ GeoIP eBPF匹配器初始化失败: %v\n", err)
-		return
+		return false, nil, err
 	}
 	defer matcher.Close()
 
-	if !matcher.IsEnabled() {
-		fmt.Println("❌ GeoIP eBPF匹配器未启用")
-		return
-	}
-
-	fmt.Println("✅ GeoIP eBPF匹配器初始化成功")
 	stats := matcher.GetStats()
-	if *verbose {
-		fmt.Println("   GeoIP eBPF统计信息:")
-		for key, value := range stats {
-			fmt.Printf("     %s: %v\n", key, value)
-		}
+	if !matcher.IsEnabled() {
+		return false, stats, errors.New("GeoIP eBPF 未启用")
 	}
-	fmt.Printf("   平台: %v\n", stats["platform"])
-	fmt.Printf("   启用状态: %v\n", stats["enabled"])
-	fmt.Printf("   国家代码: %v\n", stats["country_code"])
+	return true, stats, nil
 }

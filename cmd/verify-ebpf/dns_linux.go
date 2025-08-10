@@ -3,31 +3,21 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 
 	dns_ebpf "github.com/xtls/xray-core/app/dns/ebpf"
 )
 
-func testDNSBridge() {
+func testDNSBridge() (bool, map[string]interface{}, error) {
 	cache, err := dns_ebpf.NewEBpfDNSCache()
 	if err != nil {
-		fmt.Printf("❌ DNS eBPF缓存初始化失败: %v\n", err)
-		return
+		return false, nil, err
 	}
 	defer cache.Close()
 
-	if !cache.IsEnabled() {
-		fmt.Println("❌ DNS eBPF缓存未启用")
-		return
-	}
-	fmt.Println("✅ DNS eBPF缓存初始化成功")
 	stats := cache.GetStats()
-	if *verbose {
-		fmt.Println("   DNS eBPF统计信息:")
-		for key, value := range stats {
-			fmt.Printf("     %s: %v\n", key, value)
-		}
+	if !cache.IsEnabled() {
+		return false, stats, errors.New("DNS eBPF 未启用")
 	}
-	fmt.Printf("   平台: %v\n", stats["platform"])
-	fmt.Printf("   启用状态: %v\n", stats["enabled"])
+	return true, stats, nil
 }

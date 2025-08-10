@@ -9,22 +9,18 @@ This fork includes **advanced eBPF acceleration** features for high-performance 
 ## 🚀 eBPF Acceleration Features
 
 ### **Core Optimizations**
-- **Zero-Copy Fast Forwarding** - XDP_TX kernel-level packet forwarding
-- **REALITY Handshake Optimization** - Intelligent session caching and 0-RTT acceleration  
-- **XTLS Vision Acceleration** - Vision protocol kernel-level optimization
-- **TCP Congestion Control** - Smart BBR and ECN-based congestion control
-- **DNS Kernel Cache** - Bypass userspace DNS resolution with in-kernel caching
-- **GeoIP/GeoSite Kernel Matching** - High-speed routing decisions at kernel level
-- **Smart Connection Tracking** - Dynamic hot connection identification
-- **Transparent Performance Monitoring** - Zero-overhead statistics collection
+- **Zero-Copy/Splice Fast Forwarding** (TCP): kernel-assisted direct copy when safe
+- **REALITY Handshake Optimization**: intelligent session caching and 0-RTT acceleration
+- **XTLS Vision Acceleration**: protocol-aware optimization, kernel-assisted hints
+- **TCP Options Orchestration**: QUICKACK/NOTSENT_LOWAT/zerocopy (best-effort)
+- **DNS Accelerator**: kernel/fast-path cache with userspace merge; short-TTL prefetch
+- **GeoIP/GeoSite Matching**: kernel-assisted route hints
+- **Lightweight Connection Tracking**: hot-path recognition & stats
 
-### **Technical Advantages**
-- **True Zero-Copy Data Path**: Direct packet forwarding at driver level
-- **REALITY Security Guarantee**: Strict TLS handshake verification
-- **Session Cache Optimization**: Smart recognition of repeat connections
-- **Hot Connection Identification**: Dynamic fast-path activation
-- **BBR Congestion Control**: Modern congestion control algorithm
-- **ECN Support**: Explicit Congestion Notification handling
+### **Principles**
+- Single switch: `XRAY_EBPF=1` turns on all eBPF-related optimizations; unset to disable and fall back
+- Failure-tolerant: if kernel/programs unavailable, userspace fallback is automatic
+- Transparent: no config-file changes are required
 
 ### **Performance Impact**
 - **TCP+REALITY Acceleration**: Up to 40% latency reduction
@@ -45,14 +41,10 @@ rsync -r build/ root@your-server:/root/xray-ebpf/
 ssh root@your-server 'cd /root/xray-ebpf && bash deploy.sh'
 ```
 
-### **Run with eBPF**
+### **Run (Unified Switch)**
 ```bash
-# Enable eBPF acceleration
+# Enable all eBPF-related optimizations
 export XRAY_EBPF=1
-# Optional sub-features (default off)
-export XRAY_EBPF_DNS_ROUTER=1      # DNS router (TC) on/off
-export XRAY_EBPF_GEOSITE=1         # GeoSite mark apply on/off
-export XRAY_EBPF_IP_FASTPATH=1     # IP fastpath (TC) on/off
 
 ./xray-linux-amd64-ebpf run -config config.json
 ```
@@ -79,18 +71,17 @@ systemctl status xray
 
 ### **Environment Variables**
 ```bash
-# Enable eBPF acceleration
+# Enable all eBPF optimizations
 export XRAY_EBPF=1
 
-# Optional: Debug mode
+# Optional: debug logs
 export XRAY_EBPF_DEBUG=1
- 
-# Optional: XTLS pacing & TCP options
-export XRAY_XTLS_PACING=1                 # enable RTT-based tiny pacing
-export XRAY_SO_ZEROCOPY=1                 # enable SO_ZEROCOPY (Linux)
-export XRAY_SO_ZEROCOPY_DRAIN=1           # drain MSG_ERRQUEUE to avoid buffer retention
-export XRAY_TCP_NOTSENT_LOWAT=65536       # control kernel unsent buffer
-export XRAY_TCP_QUICKACK=1                # short-lived QUICKACK
+
+# Optional: TCP socket tuning (best-effort)
+export XRAY_SO_ZEROCOPY=1
+export XRAY_SO_ZEROCOPY_DRAIN=1
+export XRAY_TCP_NOTSENT_LOWAT=65536
+export XRAY_TCP_QUICKACK=1
 ```
 
 ### **Service Configuration**
@@ -111,7 +102,7 @@ bpftool map dump name tcp_connections
 ### **Performance Metrics**
 - Connection acceleration rate
 - DNS cache hit ratio
-- Zero-copy forwarding count
+- Splice/zerocopy count
 - Congestion control statistics
 
 ## 🔒 Security
