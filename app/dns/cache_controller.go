@@ -4,7 +4,6 @@ import (
 	"context"
 	go_errors "errors"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -30,14 +29,12 @@ type CacheController struct {
 	serveStale      bool
 	serveExpiredTTL int32
 
-	ips      map[string]*record
-	dirtyips map[string]*record
+	// Use sharded cache for better concurrency
+	cache *shardedRecordCache
 
-	sync.RWMutex
-	pub           *pubsub.Service
-	cacheCleanup  *task.Periodic
-	highWatermark int
-	requestGroup  singleflight.Group
+	pub          *pubsub.Service
+	cacheCleanup *task.Periodic
+	requestGroup singleflight.Group
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
@@ -46,7 +43,7 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		disableCache:    disableCache,
 		serveStale:      serveStale,
 		serveExpiredTTL: -int32(serveExpiredTTL),
-		ips:             make(map[string]*record),
+		cache:           newShardedRecordCache(defaultShardCount),
 		pub:             pubsub.NewService(),
 	}
 
@@ -59,113 +56,43 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 
 // CacheCleanup clears expired items from cache
 func (c *CacheController) CacheCleanup() error {
-	expiredKeys, err := c.collectExpiredKeys()
-	if err != nil {
-		return err
+	if c.cache.Len() == 0 {
+		return errors.New("nothing to do. stopping...")
 	}
-	if len(expiredKeys) == 0 {
+
+	// Skip if any migration is in progress
+	if c.cache.HasDirtyItems() {
 		return nil
 	}
-	c.writeAndShrink(expiredKeys)
-	return nil
-}
-
-func (c *CacheController) collectExpiredKeys() ([]string, error) {
-	c.RLock()
-	defer c.RUnlock()
-
-	if len(c.ips) == 0 {
-		return nil, errors.New("nothing to do. stopping...")
-	}
-
-	// skip collection if a migration is in progress
-	if c.dirtyips != nil {
-		return nil, nil
-	}
 
 	now := time.Now()
-	if c.serveStale && c.serveExpiredTTL != 0 {
-		now = now.Add(time.Duration(c.serveExpiredTTL) * time.Second)
-	}
+	expiredKeysList := c.cache.CollectExpiredKeys(now, c.serveStale, c.serveExpiredTTL)
 
-	expiredKeys := make([]string, 0, len(c.ips)/4) // pre-allocate
-
-	for domain, rec := range c.ips {
-		if (rec.A != nil && rec.A.Expire.Before(now)) ||
-			(rec.AAAA != nil && rec.AAAA.Expire.Before(now)) {
-			expiredKeys = append(expiredKeys, domain)
-		}
-	}
-
-	return expiredKeys, nil
-}
-
-func (c *CacheController) writeAndShrink(expiredKeys []string) {
-	c.Lock()
-	defer c.Unlock()
-
-	// double check to prevent upper call multiple cleanup tasks
-	if c.dirtyips != nil {
-		return
-	}
-
-	lenBefore := len(c.ips)
-	if lenBefore > c.highWatermark {
-		c.highWatermark = lenBefore
-	}
-
-	now := time.Now()
-	if c.serveStale && c.serveExpiredTTL != 0 {
-		now = now.Add(time.Duration(c.serveExpiredTTL) * time.Second)
-	}
-
-	for _, domain := range expiredKeys {
-		rec := c.ips[domain]
-		if rec == nil {
+	totalCleaned := 0
+	for _, shardKeys := range expiredKeysList {
+		if len(shardKeys.keys) == 0 {
 			continue
 		}
-		if rec.A != nil && rec.A.Expire.Before(now) {
-			rec.A = nil
-		}
-		if rec.AAAA != nil && rec.AAAA.Expire.Before(now) {
-			rec.AAAA = nil
-		}
-		if rec.A == nil && rec.AAAA == nil {
-			delete(c.ips, domain)
-		}
-	}
 
-	lenAfter := len(c.ips)
-
-	if lenAfter == 0 {
-		if c.highWatermark >= minSizeForEmptyRebuild {
-			errors.LogDebug(context.Background(), c.name,
-				" rebuilding empty cache map to reclaim memory.",
-				" size_before_cleanup=", lenBefore,
-				" peak_size_before_rebuild=", c.highWatermark,
-			)
-
-			c.ips = make(map[string]*record)
-			c.highWatermark = 0
-		}
-		return
-	}
-
-	if reductionFromPeak := c.highWatermark - lenAfter; reductionFromPeak > shrinkAbsoluteThreshold &&
-		float64(reductionFromPeak) > float64(c.highWatermark)*shrinkRatioThreshold {
-		errors.LogDebug(context.Background(), c.name,
-			" shrinking cache map to reclaim memory.",
-			" new_size=", lenAfter,
-			" peak_size_before_shrink=", c.highWatermark,
-			" reduction_since_peak=", reductionFromPeak,
+		cleaned, shouldShrink := c.cache.CleanupShard(
+			shardKeys.shardIdx,
+			shardKeys.keys,
+			now,
+			c.serveStale,
+			c.serveExpiredTTL,
 		)
+		totalCleaned += cleaned
 
-		c.dirtyips = c.ips
-		c.ips = make(map[string]*record, int(float64(lenAfter)*1.1))
-		c.highWatermark = lenAfter
-		go c.migrate()
+		if shouldShrink {
+			go c.migrateShard(shardKeys.shardIdx)
+		}
 	}
 
+	if totalCleaned > 0 {
+		errors.LogDebug(context.Background(), c.name, " cleaned ", totalCleaned, " expired DNS records")
+	}
+
+	return nil
 }
 
 type migrationEntry struct {
@@ -173,72 +100,38 @@ type migrationEntry struct {
 	value *record
 }
 
-func (c *CacheController) migrate() {
+// migrateShard migrates a single shard in the background
+func (c *CacheController) migrateShard(shardIdx int) {
 	defer func() {
 		if r := recover(); r != nil {
-			errors.LogError(context.Background(), c.name, " panic during cache migration: ", r)
-			c.Lock()
-			c.dirtyips = nil
-			// c.ips = make(map[string]*record)
-			// c.highWatermark = 0
-			c.Unlock()
+			errors.LogError(context.Background(), c.name, " panic during shard migration: ", r)
+			c.cache.FinishShardMigration(shardIdx)
 		}
 	}()
 
-	c.RLock()
-	dirtyips := c.dirtyips
-	c.RUnlock()
-
-	// double check to prevent upper call multiple cleanup tasks
-	if dirtyips == nil {
+	oldItems, newSize := c.cache.StartShardMigration(shardIdx)
+	if oldItems == nil {
 		return
 	}
 
-	errors.LogDebug(context.Background(), c.name, " starting background cache migration for ", len(dirtyips), " items")
+	errors.LogDebug(context.Background(), c.name, " starting background shard ", shardIdx, " migration for ", len(oldItems), " items, new size: ", newSize)
 
 	batch := make([]migrationEntry, 0, migrationBatchSize)
-	for domain, recD := range dirtyips {
+	for domain, recD := range oldItems {
 		batch = append(batch, migrationEntry{domain, recD})
 
 		if len(batch) >= migrationBatchSize {
-			c.flush(batch)
+			c.cache.FlushMigrationBatch(shardIdx, batch)
 			batch = batch[:0]
 			runtime.Gosched()
 		}
 	}
 	if len(batch) > 0 {
-		c.flush(batch)
+		c.cache.FlushMigrationBatch(shardIdx, batch)
 	}
 
-	c.Lock()
-	c.dirtyips = nil
-	c.Unlock()
-
-	errors.LogDebug(context.Background(), c.name, " cache migration completed")
-}
-
-func (c *CacheController) flush(batch []migrationEntry) {
-	c.Lock()
-	defer c.Unlock()
-
-	for _, dirty := range batch {
-		if cur := c.ips[dirty.key]; cur != nil {
-			merge := &record{}
-			if cur.A == nil {
-				merge.A = dirty.value.A
-			} else {
-				merge.A = cur.A
-			}
-			if cur.AAAA == nil {
-				merge.AAAA = dirty.value.AAAA
-			} else {
-				merge.AAAA = cur.AAAA
-			}
-			c.ips[dirty.key] = merge
-		} else {
-			c.ips[dirty.key] = dirty.value
-		}
-	}
+	c.cache.FinishShardMigration(shardIdx)
+	errors.LogDebug(context.Background(), c.name, " shard ", shardIdx, " migration completed")
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
@@ -256,18 +149,15 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 		return
 	}
 
-	c.Lock()
-	lockWait := time.Since(req.start) - rtt
+	lockStart := time.Now()
 
 	newRec := &record{}
-	oldRec := c.ips[req.domain]
-	var dirtyRec *record
-	if c.dirtyips != nil {
-		dirtyRec = c.dirtyips[req.domain]
-	}
-
 	var pubRecord *IPRecord
 	var pubSuffix string
+
+	// Get existing records from sharded cache
+	oldRec := c.cache.Get(req.domain)
+	dirtyRec := c.cache.GetDirty(req.domain)
 
 	switch req.reqType {
 	case dnsmessage.TypeA:
@@ -290,8 +180,8 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 		pubSuffix = "4"
 	}
 
-	c.ips[req.domain] = newRec
-	c.Unlock()
+	c.cache.Set(req.domain, newRec)
+	lockWait := time.Since(lockStart)
 
 	if pubRecord != nil {
 		_, ttl, err := pubRecord.getIPs()
@@ -308,14 +198,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 }
 
 func (c *CacheController) findRecords(domain string) *record {
-	c.RLock()
-	defer c.RUnlock()
-
-	rec := c.ips[domain]
-	if rec == nil && c.dirtyips != nil {
-		rec = c.dirtyips[domain]
-	}
-	return rec
+	return c.cache.Get(domain)
 }
 
 func (c *CacheController) registerSubscribers(domain string, option dns_feature.IPOption) (sub4 *pubsub.Subscriber, sub6 *pubsub.Subscriber) {

@@ -55,17 +55,26 @@ func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOpt
 }
 
 func fetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) ([]net.IP, uint32, error) {
-	key := fqdn
+	// Build key more efficiently - avoid string concatenation in hot path
+	var suffix string
 	switch {
 	case option.IPv4Enable && option.IPv6Enable:
-		key = key + "46"
+		suffix = "46"
 	case option.IPv4Enable:
-		key = key + "4"
+		suffix = "4"
 	case option.IPv6Enable:
-		key = key + "6"
+		suffix = "6"
+	default:
+		suffix = ""
 	}
 
-	v, _, _ := s.getCacheController().requestGroup.Do(key, func() (any, error) {
+	// Use a string builder for efficient concatenation
+	keyLen := len(fqdn) + len(suffix)
+	key := make([]byte, keyLen)
+	copy(key, fqdn)
+	copy(key[len(fqdn):], suffix)
+
+	v, _, _ := s.getCacheController().requestGroup.Do(string(key), func() (any, error) {
 		return doFetch(ctx, s, fqdn, option), nil
 	})
 	ret := v.(result)

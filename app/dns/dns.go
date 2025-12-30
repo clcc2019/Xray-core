@@ -20,6 +20,40 @@ import (
 	"github.com/xtls/xray-core/features/dns"
 )
 
+// sortClientsResult holds the cached result of sortClients for a domain
+type sortClientsResult struct {
+	clients []*Client
+	expire  time.Time
+}
+
+// sortClientsCache caches sortClients results to avoid repeated sorting
+type sortClientsCache struct {
+	sync.RWMutex
+	cache map[string]*sortClientsResult
+}
+
+const sortClientsCacheTTL = 5 * time.Minute
+
+// sortClientsBufPool pools temporary slices used in sortClients
+var sortClientsBufPool = sync.Pool{
+	New: func() interface{} {
+		return &sortClientsBuf{
+			clientUsed: make([]bool, 0, 16),
+		}
+	},
+}
+
+type sortClientsBuf struct {
+	clientUsed []bool
+}
+
+// newSortClientsCache creates a new sortClients cache
+func newSortClientsCache() *sortClientsCache {
+	return &sortClientsCache{
+		cache: make(map[string]*sortClientsResult),
+	}
+}
+
 // DNS is a DNS rely server.
 type DNS struct {
 	sync.Mutex
@@ -33,6 +67,7 @@ type DNS struct {
 	domainMatcher          strmatcher.IndexMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
+	sortClientsCache       *sortClientsCache // Per-instance cache for sortClients results
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher
@@ -167,6 +202,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
+		sortClientsCache:       newSortClientsCache(),
 	}, nil
 }
 
@@ -252,30 +288,55 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 }
 
 func (s *DNS) sortClients(domain string) []*Client {
-	clients := make([]*Client, 0, len(s.clients))
-	clientUsed := make([]bool, len(s.clients))
-	clientNames := make([]string, 0, len(s.clients))
-	domainRules := []string{}
+	// Try to get from per-instance cache first
+	s.sortClientsCache.RLock()
+	if cached, ok := s.sortClientsCache.cache[domain]; ok && time.Now().Before(cached.expire) {
+		s.sortClientsCache.RUnlock()
+		return cached.clients
+	}
+	s.sortClientsCache.RUnlock()
+
+	// Get buffer from pool
+	buf := sortClientsBufPool.Get().(*sortClientsBuf)
+	defer sortClientsBufPool.Put(buf)
+
+	// Ensure clientUsed slice has correct size
+	clientCount := len(s.clients)
+	if cap(buf.clientUsed) < clientCount {
+		buf.clientUsed = make([]bool, clientCount)
+	} else {
+		buf.clientUsed = buf.clientUsed[:clientCount]
+		for i := range buf.clientUsed {
+			buf.clientUsed[i] = false
+		}
+	}
+
+	clients := make([]*Client, 0, clientCount)
+	var clientNames []string
+	var domainRules []string
 
 	// Priority domain matching
 	hasMatch := false
 	MatchSlice := s.domainMatcher.Match(domain)
-	sort.Slice(MatchSlice, func(i, j int) bool {
-		return MatchSlice[i] < MatchSlice[j]
-	})
+	if len(MatchSlice) > 1 {
+		sort.Slice(MatchSlice, func(i, j int) bool {
+			return MatchSlice[i] < MatchSlice[j]
+		})
+	}
 	for _, match := range MatchSlice {
 		info := s.matcherInfos[match]
 		client := s.clients[info.clientIdx]
 		domainRule := client.domains[info.domainRuleIdx]
 		domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
-		if clientUsed[info.clientIdx] {
+		if buf.clientUsed[info.clientIdx] {
 			continue
 		}
-		clientUsed[info.clientIdx] = true
+		buf.clientUsed[info.clientIdx] = true
 		clients = append(clients, client)
 		clientNames = append(clientNames, client.Name())
 		hasMatch = true
 		if client.finalQuery {
+			s.cacheAndReturn(domain, clients)
 			return clients
 		}
 	}
@@ -283,13 +344,14 @@ func (s *DNS) sortClients(domain string) []*Client {
 	if !(s.disableFallback || s.disableFallbackIfMatch && hasMatch) {
 		// Default round-robin query
 		for idx, client := range s.clients {
-			if clientUsed[idx] || client.skipFallback {
+			if buf.clientUsed[idx] || client.skipFallback {
 				continue
 			}
-			clientUsed[idx] = true
+			buf.clientUsed[idx] = true
 			clients = append(clients, client)
 			clientNames = append(clientNames, client.Name())
 			if client.finalQuery {
+				s.cacheAndReturn(domain, clients)
 				return clients
 			}
 		}
@@ -312,7 +374,22 @@ func (s *DNS) sortClients(domain string) []*Client {
 		}
 	}
 
+	s.cacheAndReturn(domain, clients)
 	return clients
+}
+
+// cacheAndReturn caches the sortClients result for future use
+func (s *DNS) cacheAndReturn(domain string, clients []*Client) {
+	// Make a copy of clients slice for caching
+	cachedClients := make([]*Client, len(clients))
+	copy(cachedClients, clients)
+
+	s.sortClientsCache.Lock()
+	s.sortClientsCache.cache[domain] = &sortClientsResult{
+		clients: cachedClients,
+		expire:  time.Now().Add(sortClientsCacheTTL),
+	}
+	s.sortClientsCache.Unlock()
 }
 
 func mergeQueryErrors(domain string, errs []error) error {

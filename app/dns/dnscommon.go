@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -17,6 +18,95 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+// Pool for dnsRequest structs to reduce allocations
+var dnsRequestPool = sync.Pool{
+	New: func() interface{} {
+		return &dnsRequest{}
+	},
+}
+
+// Pool for dnsmessage.Message structs
+var dnsMessagePool = sync.Pool{
+	New: func() interface{} {
+		return &dnsmessage.Message{}
+	},
+}
+
+// Pool for IPRecord structs
+var ipRecordPool = sync.Pool{
+	New: func() interface{} {
+		return &IPRecord{}
+	},
+}
+
+// Pool for IP slices (commonly used sizes)
+var ipSlicePool = sync.Pool{
+	New: func() interface{} {
+		s := make([]net.IP, 0, 4)
+		return &s
+	},
+}
+
+// acquireDNSRequest gets a dnsRequest from the pool
+func acquireDNSRequest() *dnsRequest {
+	return dnsRequestPool.Get().(*dnsRequest)
+}
+
+// releaseDNSRequest returns a dnsRequest to the pool
+func releaseDNSRequest(req *dnsRequest) {
+	if req == nil {
+		return
+	}
+	req.reqType = 0
+	req.domain = ""
+	req.start = time.Time{}
+	req.expire = time.Time{}
+	if req.msg != nil {
+		releaseDNSMessage(req.msg)
+		req.msg = nil
+	}
+	dnsRequestPool.Put(req)
+}
+
+// acquireDNSMessage gets a dnsmessage.Message from the pool
+func acquireDNSMessage() *dnsmessage.Message {
+	msg := dnsMessagePool.Get().(*dnsmessage.Message)
+	// Reset the message
+	msg.Header = dnsmessage.Header{}
+	msg.Questions = msg.Questions[:0]
+	msg.Answers = msg.Answers[:0]
+	msg.Authorities = msg.Authorities[:0]
+	msg.Additionals = msg.Additionals[:0]
+	return msg
+}
+
+// releaseDNSMessage returns a dnsmessage.Message to the pool
+func releaseDNSMessage(msg *dnsmessage.Message) {
+	if msg == nil {
+		return
+	}
+	// Clear slices but keep capacity
+	msg.Questions = msg.Questions[:0]
+	msg.Answers = msg.Answers[:0]
+	msg.Authorities = msg.Authorities[:0]
+	msg.Additionals = msg.Additionals[:0]
+	dnsMessagePool.Put(msg)
+}
+
+// acquireIPRecord gets an IPRecord from the pool
+func acquireIPRecord() *IPRecord {
+	rec := ipRecordPool.Get().(*IPRecord)
+	rec.ReqID = 0
+	rec.IP = nil
+	rec.Expire = time.Time{}
+	rec.RCode = 0
+	rec.RawHeader = nil
+	return rec
+}
+
+// Note: IPRecord is not released back to pool because it's stored in cache
+// and may be accessed by multiple goroutines. Only use pool for temporary records.
 
 // Fqdn normalizes domain make sure it ends with '.'
 // case-sensitive
@@ -127,55 +217,81 @@ func genEDNS0Options(clientIP net.IP, padding int) *dnsmessage.Resource {
 	return opt
 }
 
+// dnsRequestSlicePool pools slices of dnsRequest pointers
+var dnsRequestSlicePool = sync.Pool{
+	New: func() interface{} {
+		s := make([]*dnsRequest, 0, 2)
+		return &s
+	},
+}
+
 func buildReqMsgs(domain string, option dns_feature.IPOption, reqIDGen func() uint16, reqOpts *dnsmessage.Resource) []*dnsRequest {
-	qA := dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(domain),
-		Type:  dnsmessage.TypeA,
-		Class: dnsmessage.ClassINET,
+	// Get slice from pool
+	reqs := *dnsRequestSlicePool.Get().(*[]*dnsRequest)
+	reqs = reqs[:0]
+
+	// Parse domain name once
+	name, err := dnsmessage.NewName(domain)
+	if err != nil {
+		// Fallback to MustNewName if parsing fails
+		name = dnsmessage.MustNewName(domain)
 	}
 
-	qAAAA := dnsmessage.Question{
-		Name:  dnsmessage.MustNewName(domain),
-		Type:  dnsmessage.TypeAAAA,
-		Class: dnsmessage.ClassINET,
-	}
-
-	var reqs []*dnsRequest
 	now := time.Now()
 
 	if option.IPv4Enable {
-		msg := new(dnsmessage.Message)
+		msg := acquireDNSMessage()
 		msg.Header.ID = reqIDGen()
 		msg.Header.RecursionDesired = true
-		msg.Questions = []dnsmessage.Question{qA}
+		msg.Questions = append(msg.Questions, dnsmessage.Question{
+			Name:  name,
+			Type:  dnsmessage.TypeA,
+			Class: dnsmessage.ClassINET,
+		})
 		if reqOpts != nil {
 			msg.Additionals = append(msg.Additionals, *reqOpts)
 		}
-		reqs = append(reqs, &dnsRequest{
-			reqType: dnsmessage.TypeA,
-			domain:  domain,
-			start:   now,
-			msg:     msg,
-		})
+
+		req := acquireDNSRequest()
+		req.reqType = dnsmessage.TypeA
+		req.domain = domain
+		req.start = now
+		req.msg = msg
+		reqs = append(reqs, req)
 	}
 
 	if option.IPv6Enable {
-		msg := new(dnsmessage.Message)
+		msg := acquireDNSMessage()
 		msg.Header.ID = reqIDGen()
 		msg.Header.RecursionDesired = true
-		msg.Questions = []dnsmessage.Question{qAAAA}
+		msg.Questions = append(msg.Questions, dnsmessage.Question{
+			Name:  name,
+			Type:  dnsmessage.TypeAAAA,
+			Class: dnsmessage.ClassINET,
+		})
 		if reqOpts != nil {
 			msg.Additionals = append(msg.Additionals, *reqOpts)
 		}
-		reqs = append(reqs, &dnsRequest{
-			reqType: dnsmessage.TypeAAAA,
-			domain:  domain,
-			start:   now,
-			msg:     msg,
-		})
+
+		req := acquireDNSRequest()
+		req.reqType = dnsmessage.TypeAAAA
+		req.domain = domain
+		req.start = now
+		req.msg = msg
+		reqs = append(reqs, req)
 	}
 
 	return reqs
+}
+
+// releaseReqMsgs returns the request slice to the pool (but not the requests themselves)
+func releaseReqMsgs(reqs []*dnsRequest) {
+	// Clear the slice but keep capacity
+	for i := range reqs {
+		reqs[i] = nil
+	}
+	reqs = reqs[:0]
+	dnsRequestSlicePool.Put(&reqs)
 }
 
 // parseResponse parses DNS answers from the returned payload

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -25,6 +26,21 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/net/http2"
 )
+
+// bytesBufferPool pools bytes.Buffer for DoH requests
+var bytesBufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// responseBufferPool pools byte slices for reading HTTP responses
+var responseBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
 
 // DoHNameServer implemented DNS over HTTPS (RFC8484) Wire Format,
 // which is compatible with traditional dns over udp(RFC1035),
@@ -206,7 +222,12 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 }
 
 func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, error) {
-	body := bytes.NewBuffer(b)
+	// Get buffer from pool
+	body := bytesBufferPool.Get().(*bytes.Buffer)
+	body.Reset()
+	body.Write(b)
+	defer bytesBufferPool.Put(body)
+
 	req, err := http.NewRequest("POST", s.dohURL, body)
 	if err != nil {
 		return nil, err
