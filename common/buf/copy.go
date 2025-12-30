@@ -107,8 +107,34 @@ func copyInternal(reader Reader, writer Writer, handler *copyHandler) error {
 	}
 }
 
+// copyFast is an optimized copy path without any handlers.
+// This avoids handler slice allocation and iteration overhead.
+func copyFast(reader Reader, writer Writer) error {
+	for {
+		buffer, err := reader.ReadMultiBuffer()
+		if !buffer.IsEmpty() {
+			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
+				return writeError{werr}
+			}
+		}
+
+		if err != nil {
+			return readError{err}
+		}
+	}
+}
+
 // Copy dumps all payload from reader to writer or stops when an error occurs. It returns nil when EOF.
 func Copy(reader Reader, writer Writer, options ...CopyOption) error {
+	// Fast path: no options, skip handler allocation entirely
+	if len(options) == 0 {
+		err := copyFast(reader, writer)
+		if err != nil && errors.Cause(err) != io.EOF {
+			return err
+		}
+		return nil
+	}
+
 	var handler copyHandler
 	for _, option := range options {
 		option(&handler)

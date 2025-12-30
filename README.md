@@ -6,10 +6,38 @@
 
 本分支专注于以下性能优化：
 
-- **缓冲区管理优化**: Buffer 结构体池化，减少 GC 压力
-- **内存池优化**: 多级内存池设计，减少内存分配
-- **传输管道优化**: 改进的读写信号机制
-- **连接处理优化**: 更高效的连接调度
+### 内存管理优化
+
+- **MultiBuffer 切片池化** (`common/buf/multi_buffer.go`)
+  - 新增 `multiBufferPool` 池化 MultiBuffer 切片
+  - 新增 `GetMultiBuffer()` / `PutMultiBuffer()` 接口
+  - 新增 `ReleaseMultiAndReturn()` 释放并回收到池
+  - 减少高吞吐场景下的切片分配
+
+- **Buffer 结构体池化** (`common/buf/buffer.go`)
+  - 已有的 `bufferPool` 池化 Buffer 结构体
+  - 已有的 `bytespool` 多级内存池 (2KB/8KB/32KB/128KB)
+
+### 数据传输优化
+
+- **Copy 函数快速路径** (`common/buf/copy.go`)
+  - 新增 `copyFast()` 无 handler 快速路径
+  - 无 option 时跳过 handler 分配和迭代
+  - 减少热路径上的开销
+
+### 管道传输优化
+
+- **Pipe 无锁长度查询** (`transport/pipe/impl.go`)
+  - 新增 `dataLen` 原子变量缓存数据长度
+  - `Len()` 和 `hasData()` 无需获取锁
+  - 减少锁竞争，提高并发性能
+
+### 信号通知优化
+
+- **Notifier 池化** (`common/signal/notifier.go`)
+  - 新增 `notifierPool` 池化 Notifier 实例
+  - 新增 `Release()` 方法回收到池
+  - 减少频繁创建销毁的开销
 
 ## License
 

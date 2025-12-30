@@ -5,6 +5,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -39,6 +40,7 @@ type pipe struct {
 	errChan     chan error
 	option      pipeOption
 	state       state
+	dataLen     atomic.Int32 // cached data length for lock-free reads
 }
 
 var (
@@ -46,12 +48,16 @@ var (
 	errSlowDown   = errors.New("slow down")
 )
 
+// Len returns the current data length without acquiring the lock.
+// This is an optimization for frequent length checks.
 func (p *pipe) Len() int32 {
-	data := p.data
-	if data == nil {
-		return 0
-	}
-	return data.Len()
+	return p.dataLen.Load()
+}
+
+// hasData returns true if there's data available without acquiring the lock.
+// This is used for fast-path optimization in read operations.
+func (p *pipe) hasData() bool {
+	return p.dataLen.Load() > 0
 }
 
 func (p *pipe) getState(forRead bool) error {
@@ -86,6 +92,7 @@ func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error) {
 
 	data := p.data
 	p.data = nil
+	p.dataLen.Store(0)
 	return data, nil
 }
 
@@ -136,10 +143,12 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 
 	if p.data == nil {
 		p.data = mb
+		p.dataLen.Store(mb.Len())
 		return nil
 	}
 
 	p.data, _ = buf.MergeMulti(p.data, mb)
+	p.dataLen.Store(p.data.Len())
 	return errSlowDown
 }
 
@@ -203,6 +212,7 @@ func (p *pipe) Interrupt() {
 	if !p.data.IsEmpty() {
 		buf.ReleaseMulti(p.data)
 		p.data = nil
+		p.dataLen.Store(0)
 		if p.state == closed {
 			p.state = errord
 		}

@@ -2,11 +2,38 @@ package buf
 
 import (
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/serial"
 )
+
+// multiBufferPool is a pool for MultiBuffer slices to reduce GC pressure.
+// This helps reduce heap allocations in high-throughput scenarios.
+var multiBufferPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(MultiBuffer, 0, 16)
+		return &mb
+	},
+}
+
+// GetMultiBuffer gets a MultiBuffer from the pool.
+func GetMultiBuffer() MultiBuffer {
+	mb := multiBufferPool.Get().(*MultiBuffer)
+	return (*mb)[:0]
+}
+
+// PutMultiBuffer returns a MultiBuffer to the pool after clearing it.
+// The MultiBuffer should be empty (all buffers released) before calling this.
+func PutMultiBuffer(mb MultiBuffer) {
+	if cap(mb) < 16 || cap(mb) > 128 {
+		// Don't pool very small or very large slices
+		return
+	}
+	mb = mb[:0]
+	multiBufferPool.Put(&mb)
+}
 
 // ReadAllToBytes reads all content from the reader into a byte array, until EOF.
 func ReadAllToBytes(reader io.Reader) ([]byte, error) {
@@ -54,12 +81,23 @@ func MergeBytes(dest MultiBuffer, src []byte) MultiBuffer {
 }
 
 // ReleaseMulti releases all content of the MultiBuffer, and returns an empty MultiBuffer.
+// Consider using ReleaseMultiAndReturn if you want to return the slice to the pool.
 func ReleaseMulti(mb MultiBuffer) MultiBuffer {
 	for i := range mb {
 		mb[i].Release()
 		mb[i] = nil
 	}
 	return mb[:0]
+}
+
+// ReleaseMultiAndReturn releases all content and returns the slice to the pool.
+// After calling this, the MultiBuffer should not be used anymore.
+func ReleaseMultiAndReturn(mb MultiBuffer) {
+	for i := range mb {
+		mb[i].Release()
+		mb[i] = nil
+	}
+	PutMultiBuffer(mb)
 }
 
 // Copy copied the beginning part of the MultiBuffer into the given byte array.
@@ -77,7 +115,7 @@ func (mb MultiBuffer) Copy(b []byte) int {
 
 // ReadFrom reads all content from reader until EOF.
 func ReadFrom(reader io.Reader) (MultiBuffer, error) {
-	mb := make(MultiBuffer, 0, 16)
+	mb := GetMultiBuffer()
 	for {
 		b := New()
 		_, err := b.ReadFullFrom(reader, Size)
