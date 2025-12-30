@@ -222,3 +222,63 @@ func BenchmarkWriteByte8(b *testing.B) {
 		buffer.Clear()
 	}
 }
+
+// BenchmarkNewBufferParallel tests Buffer allocation under concurrent access
+func BenchmarkNewBufferParallel(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			buffer := New()
+			buffer.Release()
+		}
+	})
+}
+
+// BenchmarkBufferPoolReuse tests the efficiency of buffer reuse
+func BenchmarkBufferPoolReuse(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		buffer := New()
+		buffer.Write([]byte("test data for buffer pool"))
+		buffer.Release()
+	}
+}
+
+// BenchmarkBufferPoolReuseParallel tests buffer reuse under concurrent access
+func BenchmarkBufferPoolReuseParallel(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			buffer := New()
+			buffer.Write([]byte("test data for buffer pool"))
+			buffer.Release()
+		}
+	})
+}
+
+// BenchmarkFromBytes tests FromBytes allocation
+func BenchmarkFromBytes(b *testing.B) {
+	data := make([]byte, 1024)
+	rand.Read(data)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buffer := FromBytes(data)
+		buffer.Release()
+	}
+}
+
+// BenchmarkNewWithSize tests NewWithSize allocation
+func BenchmarkNewWithSize(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		buffer := NewWithSize(4096)
+		buffer.Release()
+	}
+}
+
+// BenchmarkNewExisted tests NewExisted allocation
+func BenchmarkNewExisted(b *testing.B) {
+	data := make([]byte, Size)
+	rand.Read(data)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buffer := NewExisted(data)
+		buffer.Release()
+	}
+}
