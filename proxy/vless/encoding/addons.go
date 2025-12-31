@@ -285,13 +285,25 @@ type LengthPacketReader struct {
 	cache []byte
 }
 
+// lengthPacketMBPool 用于 LengthPacketReader 的 MultiBuffer 切片池
+var lengthPacketMBPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(buf.MultiBuffer, 0, 4) // 大多数 UDP 包只需要 1-2 个 buffer
+		return &mb
+	},
+}
+
 func (r *LengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if _, err := io.ReadFull(r.Reader, r.cache); err != nil { // maybe EOF
 		return nil, errors.New("failed to read packet length").Base(err)
 	}
 	length := int32(r.cache[0])<<8 | int32(r.cache[1])
 	// fmt.Println("Read", length)
-	mb := make(buf.MultiBuffer, 0, length/buf.Size+1)
+
+	// 使用池化的 MultiBuffer 切片
+	mbPtr := lengthPacketMBPool.Get().(*buf.MultiBuffer)
+	mb := (*mbPtr)[:0]
+
 	for length > 0 {
 		size := length
 		if size > buf.Size {
@@ -300,9 +312,20 @@ func (r *LengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		length -= size
 		b := buf.New()
 		if _, err := b.ReadFullFrom(r.Reader, size); err != nil {
+			// 错误时释放已分配的 buffers 并归还切片
+			buf.ReleaseMulti(mb)
+			*mbPtr = mb[:0]
+			lengthPacketMBPool.Put(mbPtr)
 			return nil, errors.New("failed to read packet payload").Base(err)
 		}
 		mb = append(mb, b)
 	}
-	return mb, nil
+
+	// 创建返回值拷贝并归还池化切片
+	result := make(buf.MultiBuffer, len(mb))
+	copy(result, mb)
+	*mbPtr = mb[:0]
+	lengthPacketMBPool.Put(mbPtr)
+
+	return result, nil
 }

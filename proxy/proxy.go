@@ -279,14 +279,20 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	if *withinPaddingBuffers || w.trafficState.NumberOfPacketToFilter > 0 {
-		mb2 := make(buf.MultiBuffer, 0, len(buffer))
+		// 复用 buffer 切片，避免分配新的 MultiBuffer
+		writeIdx := 0
 		for _, b := range buffer {
 			newbuffer := XtlsUnpadding(b, w.trafficState, w.isUplink, w.ctx)
 			if newbuffer.Len() > 0 {
-				mb2 = append(mb2, newbuffer)
+				buffer[writeIdx] = newbuffer
+				writeIdx++
 			}
 		}
-		buffer = mb2
+		// 清除多余的元素
+		for i := writeIdx; i < len(buffer); i++ {
+			buffer[i] = nil
+		}
+		buffer = buffer[:writeIdx]
 		if *remainingContent > 0 || *remainingPadding > 0 || *currentCommand == 0 {
 			*withinPaddingBuffers = true
 		} else if *currentCommand == 1 {

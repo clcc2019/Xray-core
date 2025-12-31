@@ -65,6 +65,10 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 		// This disables Nagle's algorithm which can cause delays for small writes.
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 
+		// Enable TCP_QUICKACK by default to send ACKs immediately.
+		// This can improve latency for request-response patterns like TLS handshakes.
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+
 		tfo := config.ParseTFOValue()
 		if tfo > 0 {
 			tfo = 1
@@ -165,6 +169,9 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 	if isTCPSocket(network) {
 		// Enable TCP_NODELAY by default
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+
+		// Enable TCP_QUICKACK by default for faster ACKs
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
 		tfo := config.ParseTFOValue()
 		if tfo >= 0 {
