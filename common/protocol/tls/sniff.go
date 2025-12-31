@@ -3,6 +3,7 @@ package tls
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol"
@@ -10,6 +11,27 @@ import (
 
 type SniffHeader struct {
 	domain string
+}
+
+// sniffHeaderPool pools SniffHeader objects to reduce allocations
+var sniffHeaderPool = sync.Pool{
+	New: func() interface{} {
+		return &SniffHeader{}
+	},
+}
+
+// AcquireSniffHeader gets a SniffHeader from the pool
+func AcquireSniffHeader() *SniffHeader {
+	return sniffHeaderPool.Get().(*SniffHeader)
+}
+
+// ReleaseSniffHeader returns a SniffHeader to the pool
+func ReleaseSniffHeader(h *SniffHeader) {
+	if h == nil {
+		return
+	}
+	h.domain = ""
+	sniffHeaderPool.Put(h)
 }
 
 func (h *SniffHeader) Protocol() string {
@@ -144,10 +166,13 @@ func SniffTLS(b []byte) (*SniffHeader, error) {
 		return nil, common.ErrNoClue
 	}
 
-	h := &SniffHeader{}
+	// 使用池化的 SniffHeader 减少分配
+	h := AcquireSniffHeader()
 	err := ReadClientHello(b[5:5+headerLen], h)
 	if err == nil {
 		return h, nil
 	}
+	// 错误时归还到池中
+	ReleaseSniffHeader(h)
 	return nil, err
 }

@@ -11,10 +11,33 @@ type Instance struct {
 	closed bool
 }
 
+// instancePool pools Instance objects to reduce allocations
+var instancePool = sync.Pool{
+	New: func() interface{} {
+		return &Instance{
+			c: make(chan struct{}),
+		}
+	},
+}
+
 // New returns a new Done.
 func New() *Instance {
-	return &Instance{
-		c: make(chan struct{}),
+	d := instancePool.Get().(*Instance)
+	// Reset instance if it was previously used
+	if d.closed {
+		d.c = make(chan struct{})
+		d.closed = false
+	}
+	return d
+}
+
+// Release returns the Instance to the pool for reuse.
+// This should only be called after Close() has been called.
+// After calling Release, the Instance should not be used anymore.
+func (d *Instance) Release() {
+	// Only return to pool if closed
+	if d.closed {
+		instancePool.Put(d)
 	}
 }
 
