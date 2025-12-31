@@ -1,6 +1,7 @@
 package router
 
 import (
+	"container/list"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,7 +43,8 @@ type routeCacheEntry struct {
 	rule      *Rule
 	ruleTag   string
 	outTag    string
-	expiresAt int64 // Unix timestamp in nanoseconds
+	expiresAt int64         // Unix timestamp in nanoseconds
+	key       routeCacheKey // Store key for O(1) deletion
 }
 
 // isExpired checks if the cache entry has expired
@@ -51,10 +53,11 @@ func (e *routeCacheEntry) isExpired() bool {
 }
 
 // routeCacheShard is a single shard of the route cache
+// Uses doubly-linked list for O(1) LRU operations
 type routeCacheShard struct {
 	sync.RWMutex
-	entries map[routeCacheKey]*routeCacheEntry
-	order   []routeCacheKey // LRU order tracking
+	entries map[routeCacheKey]*list.Element // map key -> list element
+	lruList *list.List                      // doubly-linked list for LRU order
 	maxSize int
 }
 
@@ -89,8 +92,8 @@ func NewRouteCache(maxSize int, ttl time.Duration) *RouteCache {
 
 	for i := 0; i < cacheShardCount; i++ {
 		cache.shards[i] = &routeCacheShard{
-			entries: make(map[routeCacheKey]*routeCacheEntry, shardSize),
-			order:   make([]routeCacheKey, 0, shardSize),
+			entries: make(map[routeCacheKey]*list.Element, shardSize),
+			lruList: list.New(),
 			maxSize: shardSize,
 		}
 	}
@@ -150,22 +153,26 @@ func (c *RouteCache) Get(ctx routing.Context) (*Rule, string, bool) {
 
 	shard := c.getShard(key)
 	shard.RLock()
-	entry, exists := shard.entries[*key]
-	shard.RUnlock()
-
+	elem, exists := shard.entries[*key]
 	if !exists {
+		shard.RUnlock()
 		c.misses.Add(1)
 		return nil, "", false
 	}
+	entry := elem.Value.(*routeCacheEntry)
+	expired := entry.isExpired()
+	rule := entry.rule
+	outTag := entry.outTag
+	shard.RUnlock()
 
-	if entry.isExpired() {
+	if expired {
 		// Entry expired, will be cleaned up on next write
 		c.misses.Add(1)
 		return nil, "", false
 	}
 
 	c.hits.Add(1)
-	return entry.rule, entry.outTag, true
+	return rule, outTag, true
 }
 
 // Put stores a route result in the cache
@@ -190,6 +197,7 @@ func (c *RouteCache) Put(ctx routing.Context, rule *Rule, outTag string) {
 		ruleTag:   "",
 		outTag:    outTag,
 		expiresAt: time.Now().Add(c.ttl).UnixNano(),
+		key:       *key,
 	}
 	if rule != nil {
 		entry.ruleTag = rule.RuleTag
@@ -199,11 +207,10 @@ func (c *RouteCache) Put(ctx routing.Context, rule *Rule, outTag string) {
 	defer shard.Unlock()
 
 	// Check if key already exists
-	if _, exists := shard.entries[*key]; exists {
-		// Update existing entry
-		shard.entries[*key] = entry
-		// Move to front of LRU order
-		c.moveToFront(shard, *key)
+	if elem, exists := shard.entries[*key]; exists {
+		// Update existing entry and move to front - O(1) operation
+		elem.Value = entry
+		shard.lruList.MoveToFront(elem)
 		return
 	}
 
@@ -212,49 +219,45 @@ func (c *RouteCache) Put(ctx routing.Context, rule *Rule, outTag string) {
 		c.evictOldest(shard)
 	}
 
-	// Add new entry
-	shard.entries[*key] = entry
-	shard.order = append(shard.order, *key)
-}
-
-// moveToFront moves a key to the front of the LRU order
-func (c *RouteCache) moveToFront(shard *routeCacheShard, key routeCacheKey) {
-	// Find and remove the key from its current position
-	for i, k := range shard.order {
-		if k == key {
-			// Remove from current position
-			copy(shard.order[i:], shard.order[i+1:])
-			shard.order = shard.order[:len(shard.order)-1]
-			break
-		}
-	}
-	// Add to front
-	shard.order = append([]routeCacheKey{key}, shard.order...)
+	// Add new entry to front of LRU list - O(1) operation
+	elem := shard.lruList.PushFront(entry)
+	shard.entries[*key] = elem
 }
 
 // evictOldest removes the oldest entry from the shard
+// This is O(k) where k is the number of entries evicted, not O(n)
 func (c *RouteCache) evictOldest(shard *routeCacheShard) {
-	// First, try to remove expired entries
 	now := time.Now().UnixNano()
-	newOrder := make([]routeCacheKey, 0, len(shard.order))
 
-	for _, key := range shard.order {
-		if entry, exists := shard.entries[key]; exists {
-			if entry.expiresAt < now {
-				delete(shard.entries, key)
-				c.evictions.Add(1)
-			} else {
-				newOrder = append(newOrder, key)
-			}
+	// Iterate from back (oldest) and remove expired entries
+	for elem := shard.lruList.Back(); elem != nil; {
+		entry := elem.Value.(*routeCacheEntry)
+		prev := elem.Prev()
+
+		if entry.expiresAt < now {
+			// Remove expired entry - O(1) operation
+			shard.lruList.Remove(elem)
+			delete(shard.entries, entry.key)
+			c.evictions.Add(1)
+		}
+
+		elem = prev
+
+		// Stop if we're under capacity
+		if len(shard.entries) < shard.maxSize {
+			return
 		}
 	}
-	shard.order = newOrder
 
-	// If still at capacity, remove oldest entries
-	for len(shard.entries) >= shard.maxSize && len(shard.order) > 0 {
-		oldest := shard.order[len(shard.order)-1]
-		shard.order = shard.order[:len(shard.order)-1]
-		delete(shard.entries, oldest)
+	// If still at capacity after removing expired, remove oldest entries
+	for len(shard.entries) >= shard.maxSize {
+		elem := shard.lruList.Back()
+		if elem == nil {
+			break
+		}
+		entry := elem.Value.(*routeCacheEntry)
+		shard.lruList.Remove(elem)
+		delete(shard.entries, entry.key)
 		c.evictions.Add(1)
 	}
 }
@@ -263,8 +266,8 @@ func (c *RouteCache) evictOldest(shard *routeCacheShard) {
 func (c *RouteCache) Invalidate() {
 	for _, shard := range c.shards {
 		shard.Lock()
-		shard.entries = make(map[routeCacheKey]*routeCacheEntry, shard.maxSize)
-		shard.order = shard.order[:0]
+		shard.entries = make(map[routeCacheKey]*list.Element, shard.maxSize)
+		shard.lruList.Init() // Clear the list efficiently
 		shard.Unlock()
 	}
 }
@@ -273,15 +276,16 @@ func (c *RouteCache) Invalidate() {
 func (c *RouteCache) InvalidateByInboundTag(tag string) {
 	for _, shard := range c.shards {
 		shard.Lock()
-		newOrder := make([]routeCacheKey, 0, len(shard.order))
-		for _, key := range shard.order {
-			if key.inboundTag == tag {
-				delete(shard.entries, key)
-			} else {
-				newOrder = append(newOrder, key)
+		// Iterate through list and remove matching entries
+		for elem := shard.lruList.Front(); elem != nil; {
+			entry := elem.Value.(*routeCacheEntry)
+			next := elem.Next()
+			if entry.key.inboundTag == tag {
+				shard.lruList.Remove(elem)
+				delete(shard.entries, entry.key)
 			}
+			elem = next
 		}
-		shard.order = newOrder
 		shard.Unlock()
 	}
 }

@@ -125,7 +125,7 @@ func parseSecurityType(b byte) protocol.SecurityType {
 
 // DecodeRequestHeader decodes and returns (if successful) a RequestHeader from an input stream.
 func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*protocol.RequestHeader, error) {
-	buffer := buf.New()
+	buffer := buf.StackNew()
 
 	drainer, err := drain.NewBehaviorSeedLimitedDrainer(int64(s.userValidator.GetBehaviorSeed()), 16+38, 3266, 64)
 	if err != nil {
@@ -210,7 +210,7 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 		request.Port = 0
 
 	case protocol.RequestCommandTCP, protocol.RequestCommandUDP:
-		if addr, port, err := addrParser.ReadAddressPort(buffer, decryptor); err == nil {
+		if addr, port, err := addrParser.ReadAddressPort(&buffer, decryptor); err == nil {
 			request.Address = addr
 			request.Port = port
 		}

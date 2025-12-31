@@ -1,6 +1,9 @@
 package strmatcher
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 func breakDomain(domain string) []string {
 	return strings.Split(domain, ".")
@@ -44,6 +47,15 @@ func (g *DomainMatcherGroup) addMatcher(m domainMatcher, value uint32) {
 	g.Add(string(m), value)
 }
 
+// matchesPool pools slice of slices to reduce allocations in Match()
+// Most domain names have at most 8 parts (e.g., a.b.c.d.example.co.uk)
+var matchesPool = sync.Pool{
+	New: func() interface{} {
+		s := make([][]uint32, 0, 8)
+		return &s
+	},
+}
+
 func (g *DomainMatcherGroup) Match(domain string) []uint32 {
 	if domain == "" {
 		return nil
@@ -63,7 +75,10 @@ func (g *DomainMatcherGroup) Match(domain string) []uint32 {
 		return -1
 	}
 
-	matches := [][]uint32{}
+	// Get matches slice from pool to reduce allocations
+	matchesPtr := matchesPool.Get().(*[][]uint32)
+	matches := (*matchesPtr)[:0]
+
 	idx := len(domain)
 	for {
 		if idx == -1 || current.sub == nil {
@@ -82,17 +97,29 @@ func (g *DomainMatcherGroup) Match(domain string) []uint32 {
 			matches = append(matches, current.values)
 		}
 	}
+
+	var result []uint32
 	switch len(matches) {
 	case 0:
-		return nil
+		result = nil
 	case 1:
-		return matches[0]
+		result = matches[0]
 	default:
-		result := []uint32{}
+		// Pre-calculate total size to avoid multiple allocations
+		totalSize := 0
+		for _, m := range matches {
+			totalSize += len(m)
+		}
+		result = make([]uint32, 0, totalSize)
 		for idx := range matches {
 			// Insert reversely, the subdomain that matches further ranks higher
 			result = append(result, matches[len(matches)-1-idx]...)
 		}
-		return result
 	}
+
+	// Return matches slice to pool
+	*matchesPtr = matches
+	matchesPool.Put(matchesPtr)
+
+	return result
 }

@@ -298,11 +298,11 @@ func writeSocks5AuthenticationResponse(writer io.Writer, version byte, auth byte
 }
 
 func writeSocks5Response(writer io.Writer, errCode byte, address net.Address, port net.Port) error {
-	buffer := buf.New()
+	buffer := buf.StackNew()
 	defer buffer.Release()
 
 	common.Must2(buffer.Write([]byte{socks5Version, errCode, 0x00 /* reserved */}))
-	if err := addrParser.WriteAddressPort(buffer, address, port); err != nil {
+	if err := addrParser.WriteAddressPort(&buffer, address, port); err != nil {
 		return err
 	}
 
@@ -424,7 +424,7 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 		authByte = byte(authPassword)
 	}
 
-	b := buf.New()
+	b := buf.StackNew()
 	defer b.Release()
 
 	common.Must2(b.Write([]byte{socks5Version, 0x01, authByte}))
@@ -475,7 +475,7 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 	if request.Command == protocol.RequestCommandUDP {
 		common.Must2(b.Write([]byte{1, 0, 0, 0, 0, 0, 0 /* RFC 1928 */}))
 	} else {
-		if err := addrParser.WriteAddressPort(b, request.Address, request.Port); err != nil {
+		if err := addrParser.WriteAddressPort(&b, request.Address, request.Port); err != nil {
 			return nil, err
 		}
 	}
@@ -496,7 +496,7 @@ func ClientHandshake(request *protocol.RequestHeader, reader io.Reader, writer i
 
 	b.Clear()
 
-	address, port, err := addrParser.ReadAddressPort(b, reader)
+	address, port, err := addrParser.ReadAddressPort(&b, reader)
 	if err != nil {
 		return nil, err
 	}

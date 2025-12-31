@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"hash/fnv"
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/bitmask"
@@ -21,6 +22,14 @@ import (
 	vmessaead "github.com/xtls/xray-core/proxy/vmess/aead"
 	"golang.org/x/crypto/chacha20poly1305"
 )
+
+// randomBytesPool pools 33-byte slices for NewClientSession
+var randomBytesPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 33)
+		return &b
+	},
+}
 
 // ClientSession stores connection session info for VMess client.
 type ClientSession struct {
@@ -38,11 +47,15 @@ type ClientSession struct {
 func NewClientSession(ctx context.Context, behaviorSeed int64) *ClientSession {
 	session := &ClientSession{}
 
-	randomBytes := make([]byte, 33) // 16 + 16 + 1
+	// Get random bytes from pool
+	randomBytesPtr := randomBytesPool.Get().(*[]byte)
+	randomBytes := *randomBytesPtr
 	common.Must2(rand.Read(randomBytes))
 	copy(session.requestBodyKey[:], randomBytes[:16])
 	copy(session.requestBodyIV[:], randomBytes[16:32])
 	session.responseHeader = randomBytes[32]
+	// Return to pool
+	randomBytesPool.Put(randomBytesPtr)
 
 	BodyKey := sha256.Sum256(session.requestBodyKey[:])
 	copy(session.responseBodyKey[:], BodyKey[:16])
@@ -63,7 +76,7 @@ func NewClientSession(ctx context.Context, behaviorSeed int64) *ClientSession {
 func (c *ClientSession) EncodeRequestHeader(header *protocol.RequestHeader, writer io.Writer) error {
 	account := header.User.Account.(*vmess.MemoryAccount)
 
-	buffer := buf.New()
+	buffer := buf.StackNew()
 	defer buffer.Release()
 
 	common.Must(buffer.WriteByte(Version))
@@ -77,7 +90,7 @@ func (c *ClientSession) EncodeRequestHeader(header *protocol.RequestHeader, writ
 	common.Must2(buffer.Write([]byte{security, byte(0), byte(header.Command)}))
 
 	if header.Command != protocol.RequestCommandMux {
-		if err := addrParser.WriteAddressPort(buffer, header.Address, header.Port); err != nil {
+		if err := addrParser.WriteAddressPort(&buffer, header.Address, header.Port); err != nil {
 			return errors.New("failed to writer address and port").Base(err)
 		}
 	}

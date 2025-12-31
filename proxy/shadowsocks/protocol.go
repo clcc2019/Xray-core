@@ -63,7 +63,7 @@ func ReadTCPSession(validator *Validator, reader io.Reader) (*protocol.RequestHe
 	}
 
 	var r buf.Reader
-	buffer := buf.New()
+	buffer := buf.StackNew()
 	defer buffer.Release()
 
 	if _, err := buffer.ReadFullFrom(reader, 50); err != nil {
@@ -113,7 +113,7 @@ func ReadTCPSession(validator *Validator, reader io.Reader) (*protocol.RequestHe
 
 	buffer.Clear()
 
-	addr, port, err := addrParser.ReadAddressPort(buffer, br)
+	addr, port, err := addrParser.ReadAddressPort(&buffer, br)
 	if err != nil {
 		drainer.AcknowledgeReceive(int(buffer.Len()))
 		return nil, nil, drain.WithError(drainer, reader, errors.New("failed to read address").Base(err))

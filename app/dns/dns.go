@@ -27,12 +27,20 @@ type sortClientsResult struct {
 }
 
 // sortClientsCache caches sortClients results to avoid repeated sorting
+// with automatic cleanup of expired entries
 type sortClientsCache struct {
 	sync.RWMutex
-	cache map[string]*sortClientsResult
+	cache         map[string]*sortClientsResult
+	lastCleanup   time.Time
+	cleanupPeriod time.Duration
+	maxSize       int
 }
 
-const sortClientsCacheTTL = 5 * time.Minute
+const (
+	sortClientsCacheTTL     = 5 * time.Minute
+	sortClientsCacheMaxSize = 10000 // Max cache entries before forced cleanup
+	sortClientsCacheCleanup = 1 * time.Minute
+)
 
 // sortClientsBufPool pools temporary slices used in sortClients
 var sortClientsBufPool = sync.Pool{
@@ -50,7 +58,39 @@ type sortClientsBuf struct {
 // newSortClientsCache creates a new sortClients cache
 func newSortClientsCache() *sortClientsCache {
 	return &sortClientsCache{
-		cache: make(map[string]*sortClientsResult),
+		cache:         make(map[string]*sortClientsResult, 256),
+		lastCleanup:   time.Now(),
+		cleanupPeriod: sortClientsCacheCleanup,
+		maxSize:       sortClientsCacheMaxSize,
+	}
+}
+
+// cleanup removes expired entries from the cache
+// Must be called with write lock held
+func (c *sortClientsCache) cleanup() {
+	now := time.Now()
+	for domain, result := range c.cache {
+		if now.After(result.expire) {
+			delete(c.cache, domain)
+		}
+	}
+	c.lastCleanup = now
+}
+
+// maybeCleanup performs cleanup if enough time has passed
+func (c *sortClientsCache) maybeCleanup() {
+	now := time.Now()
+	// Check without lock first (read of lastCleanup is safe enough for this purpose)
+	if now.Sub(c.lastCleanup) < c.cleanupPeriod && len(c.cache) < c.maxSize {
+		return
+	}
+
+	c.Lock()
+	defer c.Unlock()
+
+	// Double check under lock
+	if now.Sub(c.lastCleanup) >= c.cleanupPeriod || len(c.cache) >= c.maxSize {
+		c.cleanup()
 	}
 }
 
@@ -380,6 +420,9 @@ func (s *DNS) sortClients(domain string) []*Client {
 
 // cacheAndReturn caches the sortClients result for future use
 func (s *DNS) cacheAndReturn(domain string, clients []*Client) {
+	// Trigger cleanup periodically
+	s.sortClientsCache.maybeCleanup()
+
 	// Make a copy of clients slice for caching
 	cachedClients := make([]*Client, len(clients))
 	copy(cachedClients, clients)

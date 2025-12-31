@@ -2,15 +2,32 @@ package internet
 
 import (
 	"context"
+	"sync"
+	"time"
+
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"time"
 )
 
 type result struct {
 	err   error
 	conn  net.Conn
 	index int
+}
+
+// ipSlicesPool pools IP slices for sortIPs to reduce allocations
+var ipSlicesPool = sync.Pool{
+	New: func() interface{} {
+		return &ipSlices{
+			ip4: make([]net.IP, 0, 8),
+			ip6: make([]net.IP, 0, 8),
+		}
+	},
+}
+
+type ipSlices struct {
+	ip4 []net.IP
+	ip6 []net.IP
 }
 
 func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, domain string) (net.Conn, error) {
@@ -97,12 +114,17 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 }
 
 // sortIPs sort IPs according to rfc 8305.
+// Uses object pool to reduce slice allocations in hot path.
 func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 	if len(ips) == 0 {
 		return ips
 	}
-	var ip4 = make([]net.IP, 0, len(ips))
-	var ip6 = make([]net.IP, 0, len(ips))
+
+	// Get temporary slices from pool
+	slices := ipSlicesPool.Get().(*ipSlices)
+	ip4 := slices.ip4[:0]
+	ip6 := slices.ip6[:0]
+
 	for _, ip := range ips {
 		parsedIp := net.IPAddress(ip).IP()
 		if len(parsedIp) == net.IPv4len {
@@ -112,18 +134,22 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 		}
 	}
 
+	// If only one type of IP, return early
 	if len(ip4) == 0 || len(ip6) == 0 {
+		// Clear and return to pool
+		slices.ip4 = ip4[:0]
+		slices.ip6 = ip6[:0]
+		ipSlicesPool.Put(slices)
 		return ips
 	}
 
-	var newIPs = make([]net.IP, 0, len(ips))
+	// Allocate result slice
+	newIPs := make([]net.IP, 0, len(ips))
 	consumeIP4 := 0
 	consumeIP6 := 0
 	consumeTurn := uint32(0)
-	ip4turn := true
-	if prioritizeIPv6 {
-		ip4turn = false
-	}
+	ip4turn := !prioritizeIPv6
+
 	for {
 		if ip4turn {
 			newIPs = append(newIPs, ip4[consumeIP4])
@@ -135,7 +161,7 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 			consumeTurn++
 			if consumeTurn == interleave {
 				ip4turn = false
-				consumeTurn = uint32(0)
+				consumeTurn = 0
 			}
 		} else {
 			newIPs = append(newIPs, ip6[consumeIP6])
@@ -147,10 +173,15 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 			consumeTurn++
 			if consumeTurn == interleave {
 				ip4turn = true
-				consumeTurn = uint32(0)
+				consumeTurn = 0
 			}
 		}
 	}
+
+	// Clear and return slices to pool
+	slices.ip4 = ip4[:0]
+	slices.ip6 = ip6[:0]
+	ipSlicesPool.Put(slices)
 
 	return newIPs
 }

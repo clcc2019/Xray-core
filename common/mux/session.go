@@ -5,6 +5,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -20,7 +21,8 @@ type SessionManager struct {
 	sync.RWMutex
 	sessions map[uint16]*Session
 	count    uint16
-	closed   bool
+	size     atomic.Int32 // atomic size for lock-free reads
+	closed   atomic.Bool  // atomic closed flag for lock-free reads
 }
 
 func NewSessionManager() *SessionManager {
@@ -30,20 +32,17 @@ func NewSessionManager() *SessionManager {
 	}
 }
 
+// Closed returns whether the manager is closed (lock-free)
 func (m *SessionManager) Closed() bool {
-	m.RLock()
-	defer m.RUnlock()
-
-	return m.closed
+	return m.closed.Load()
 }
 
+// Size returns the number of active sessions (lock-free)
 func (m *SessionManager) Size() int {
-	m.RLock()
-	defer m.RUnlock()
-
-	return len(m.sessions)
+	return int(m.size.Load())
 }
 
+// Count returns the total connection count
 func (m *SessionManager) Count() int {
 	m.RLock()
 	defer m.RUnlock()
@@ -58,7 +57,7 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
 	MaxConcurrency := int(Strategy.MaxConcurrency)
 	MaxConnection := uint16(Strategy.MaxConnection)
 
-	if m.closed || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
+	if m.closed.Load() || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
 		return nil
 	}
 
@@ -69,6 +68,7 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
 		done:   done.New(),
 	}
 	m.sessions[s.ID] = s
+	m.size.Store(int32(len(m.sessions)))
 	return s
 }
 
@@ -76,12 +76,13 @@ func (m *SessionManager) Add(s *Session) bool {
 	m.Lock()
 	defer m.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return false
 	}
 
 	m.count++
 	m.sessions[s.ID] = s
+	m.size.Store(int32(len(m.sessions)))
 	return true
 }
 
@@ -92,11 +93,12 @@ func (m *SessionManager) Remove(locked bool, id uint16) {
 	}
 	locked = true
 
-	if m.closed {
+	if m.closed.Load() {
 		return
 	}
 
 	delete(m.sessions, id)
+	m.size.Store(int32(len(m.sessions)))
 
 	/*
 		if len(m.sessions) == 0 {
@@ -109,7 +111,7 @@ func (m *SessionManager) Get(id uint16) (*Session, bool) {
 	m.RLock()
 	defer m.RUnlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return nil, false
 	}
 
@@ -121,7 +123,7 @@ func (m *SessionManager) CloseIfNoSessionAndIdle(checkSize int, checkCount int) 
 	m.Lock()
 	defer m.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return true
 	}
 
@@ -129,8 +131,8 @@ func (m *SessionManager) CloseIfNoSessionAndIdle(checkSize int, checkCount int) 
 		return false
 	}
 
-	m.closed = true
-
+	m.closed.Store(true)
+	m.size.Store(0)
 	m.sessions = nil
 	return true
 }
@@ -139,16 +141,17 @@ func (m *SessionManager) Close() error {
 	m.Lock()
 	defer m.Unlock()
 
-	if m.closed {
+	if m.closed.Load() {
 		return nil
 	}
 
-	m.closed = true
+	m.closed.Store(true)
 
 	for _, s := range m.sessions {
 		s.Close(true)
 	}
 
+	m.size.Store(0)
 	m.sessions = nil
 	return nil
 }

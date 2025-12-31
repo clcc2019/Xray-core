@@ -194,16 +194,15 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 			}
 			prefix := []byte("https://" + uConn.ServerName)
 			maps.Lock()
-			if maps.maps == nil {
-				maps.maps = make(map[string]map[string]struct{})
+			if maps.cache == nil {
+				maps.cache = make(map[string]*pathCache)
 			}
-			paths := maps.maps[uConn.ServerName]
-			if paths == nil {
-				paths = make(map[string]struct{})
-				paths[config.SpiderX] = struct{}{}
-				maps.maps[uConn.ServerName] = paths
+			pathsCache := maps.cache[uConn.ServerName]
+			if pathsCache == nil {
+				pathsCache = newPathCache(config.SpiderX)
+				maps.cache[uConn.ServerName] = pathsCache
 			}
-			firstURL := string(prefix) + getPathLocked(paths)
+			firstURL := string(prefix) + getPathLocked(pathsCache)
 			maps.Unlock()
 			get := func(first bool) {
 				var (
@@ -215,9 +214,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 				if first {
 					req, _ = http.NewRequest("GET", firstURL, nil)
 				} else {
-					maps.Lock()
-					req, _ = http.NewRequest("GET", string(prefix)+getPathLocked(paths), nil)
-					maps.Unlock()
+					maps.RLock()
+					req, _ = http.NewRequest("GET", string(prefix)+getPathLocked(pathsCache), nil)
+					maps.RUnlock()
 				}
 				if req == nil {
 					return
@@ -247,14 +246,14 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					for _, m := range href.FindAllSubmatch(body, -1) {
 						m[1] = bytes.TrimPrefix(m[1], prefix)
 						if !bytes.Contains(m[1], dot) {
-							paths[string(m[1])] = struct{}{}
+							pathsCache.add(string(m[1]))
 						}
 					}
-					req.URL.Path = getPathLocked(paths)
+					req.URL.Path = getPathLocked(pathsCache)
 					if config.Show {
 						fmt.Printf("REALITY localAddr: %v\treq.Referer(): %v\n", localAddr, req.Referer())
 						fmt.Printf("REALITY localAddr: %v\tlen(body): %v\n", localAddr, len(body))
-						fmt.Printf("REALITY localAddr: %v\tlen(paths): %v\n", localAddr, len(paths))
+						fmt.Printf("REALITY localAddr: %v\tlen(paths): %v\n", localAddr, pathsCache.len())
 					}
 					maps.Unlock()
 					if !first {
@@ -280,19 +279,43 @@ var (
 	dot  = []byte(".")
 )
 
-var maps struct {
-	sync.Mutex
-	maps map[string]map[string]struct{}
+// pathCache stores paths for spider with O(1) random access
+type pathCache struct {
+	paths []string
+	set   map[string]struct{}
 }
 
-func getPathLocked(paths map[string]struct{}) string {
-	stopAt := int(crypto.RandBetween(0, int64(len(paths)-1)))
-	i := 0
-	for s := range paths {
-		if i == stopAt {
-			return s
-		}
-		i++
+func newPathCache(initialPath string) *pathCache {
+	return &pathCache{
+		paths: []string{initialPath},
+		set:   map[string]struct{}{initialPath: {}},
 	}
-	return "/"
+}
+
+func (c *pathCache) add(path string) {
+	if _, exists := c.set[path]; !exists {
+		c.set[path] = struct{}{}
+		c.paths = append(c.paths, path)
+	}
+}
+
+func (c *pathCache) getRandom() string {
+	if len(c.paths) == 0 {
+		return "/"
+	}
+	return c.paths[crypto.RandBetween(0, int64(len(c.paths)-1))]
+}
+
+func (c *pathCache) len() int {
+	return len(c.paths)
+}
+
+var maps struct {
+	sync.RWMutex
+	cache map[string]*pathCache
+}
+
+// getPathLocked returns a random path from the cache (requires lock held)
+func getPathLocked(cache *pathCache) string {
+	return cache.getRandom()
 }
