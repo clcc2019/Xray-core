@@ -3,10 +3,19 @@ package crypto
 import (
 	"encoding/binary"
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 )
+
+// chunkMultiBufferPool 用于池化 chunk writer 的 MultiBuffer 切片
+var chunkMultiBufferPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(buf.MultiBuffer, 0, 32)
+		return &mb
+	},
+}
 
 // ChunkSizeDecoder is a utility class to decode size value from bytes.
 type ChunkSizeDecoder interface {
@@ -139,8 +148,10 @@ func NewChunkStreamWriter(sizeEncoder ChunkSizeEncoder, writer io.Writer) *Chunk
 
 func (w *ChunkStreamWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	const sliceSize = 8192
-	mbLen := mb.Len()
-	mb2Write := make(buf.MultiBuffer, 0, mbLen/buf.Size+mbLen/sliceSize+2)
+
+	// 使用池化的 MultiBuffer 切片减少分配
+	mb2WritePtr := chunkMultiBufferPool.Get().(*buf.MultiBuffer)
+	mb2Write := (*mb2WritePtr)[:0]
 
 	for {
 		mb2, slice := buf.SplitSize(mb, sliceSize)
@@ -156,5 +167,11 @@ func (w *ChunkStreamWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 	}
 
-	return w.writer.WriteMultiBuffer(mb2Write)
+	err := w.writer.WriteMultiBuffer(mb2Write)
+
+	// 归还到池中
+	*mb2WritePtr = (*mb2WritePtr)[:0]
+	chunkMultiBufferPool.Put(mb2WritePtr)
+
+	return err
 }

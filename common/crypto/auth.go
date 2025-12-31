@@ -4,6 +4,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -11,6 +12,14 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 )
+
+// authMultiBufferPool pools MultiBuffer slices for auth reader/writer
+var authMultiBufferPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(buf.MultiBuffer, 0, 16)
+		return &mb
+	},
+}
 
 type BytesGenerator func() []byte
 
@@ -205,9 +214,15 @@ func (r *AuthenticationReader) readInternal(soft bool, mb *buf.MultiBuffer) erro
 
 func (r *AuthenticationReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	const readSize = 16
-	mb := make(buf.MultiBuffer, 0, readSize)
+
+	// 使用池化的 MultiBuffer 切片
+	mbPtr := authMultiBufferPool.Get().(*buf.MultiBuffer)
+	mb := (*mbPtr)[:0]
+
 	if err := r.readInternal(false, &mb); err != nil {
 		buf.ReleaseMulti(mb)
+		*mbPtr = mb[:0]
+		authMultiBufferPool.Put(mbPtr)
 		return nil, err
 	}
 
@@ -218,11 +233,19 @@ func (r *AuthenticationReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 		if err != nil {
 			buf.ReleaseMulti(mb)
+			*mbPtr = mb[:0]
+			authMultiBufferPool.Put(mbPtr)
 			return nil, err
 		}
 	}
 
-	return mb, nil
+	// 创建返回值的拷贝，并归还原切片到池
+	result := make(buf.MultiBuffer, len(mb))
+	copy(result, mb)
+	*mbPtr = mb[:0]
+	authMultiBufferPool.Put(mbPtr)
+
+	return result, nil
 }
 
 type AuthenticationWriter struct {
@@ -284,7 +307,10 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 	}
 
 	payloadSize := buf.Size - int32(w.auth.Overhead()) - w.sizeParser.SizeBytes() - maxPadding
-	mb2Write := make(buf.MultiBuffer, 0, len(mb)+10)
+
+	// 使用池化的 MultiBuffer 切片
+	mb2WritePtr := authMultiBufferPool.Get().(*buf.MultiBuffer)
+	mb2Write := (*mb2WritePtr)[:0]
 
 	temp := buf.New()
 	defer temp.Release()
@@ -298,6 +324,8 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 		eb, err := w.seal(rawBytes[:nBytes])
 		if err != nil {
 			buf.ReleaseMulti(mb2Write)
+			*mb2WritePtr = mb2Write[:0]
+			authMultiBufferPool.Put(mb2WritePtr)
 			return err
 		}
 		mb2Write = append(mb2Write, eb)
@@ -306,13 +334,21 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 		}
 	}
 
-	return w.writer.WriteMultiBuffer(mb2Write)
+	err := w.writer.WriteMultiBuffer(mb2Write)
+
+	// 归还到池中
+	*mb2WritePtr = (*mb2WritePtr)[:0]
+	authMultiBufferPool.Put(mb2WritePtr)
+
+	return err
 }
 
 func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
-	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
+	// 使用池化的 MultiBuffer 切片
+	mb2WritePtr := authMultiBufferPool.Get().(*buf.MultiBuffer)
+	mb2Write := (*mb2WritePtr)[:0]
 
 	for _, b := range mb {
 		if b.IsEmpty() {
@@ -327,11 +363,19 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 		mb2Write = append(mb2Write, eb)
 	}
 
-	if mb2Write.IsEmpty() {
+	if len(mb2Write) == 0 {
+		*mb2WritePtr = mb2Write[:0]
+		authMultiBufferPool.Put(mb2WritePtr)
 		return nil
 	}
 
-	return w.writer.WriteMultiBuffer(mb2Write)
+	err := w.writer.WriteMultiBuffer(mb2Write)
+
+	// 归还到池中
+	*mb2WritePtr = (*mb2WritePtr)[:0]
+	authMultiBufferPool.Put(mb2WritePtr)
+
+	return err
 }
 
 // WriteMultiBuffer implements buf.Writer.
