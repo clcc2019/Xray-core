@@ -197,3 +197,117 @@ XF1a/qnao6nMjyTIyQ==
 		assert.Equal(t, "xI/4mNm8xF9uDT4vA9G1+aKAaybwNlkRECnN8vGAHTM=", hashstr)
 	})
 }
+
+func TestVerifyPinnedCertChain(t *testing.T) {
+	// Test data - a simple cert chain
+	cert1 := []byte("test certificate 1")
+	cert2 := []byte("test certificate 2")
+	rawCerts := [][]byte{cert1, cert2}
+
+	// Calculate the expected hash
+	expectedHash := GenerateCertChainHash(rawCerts)
+
+	t.Run("matching_hash", func(t *testing.T) {
+		pinnedHashes := [][]byte{expectedHash}
+		assert.True(t, VerifyPinnedCertChain(rawCerts, pinnedHashes))
+	})
+
+	t.Run("non_matching_hash", func(t *testing.T) {
+		wrongHash := make([]byte, HashSize)
+		pinnedHashes := [][]byte{wrongHash}
+		assert.False(t, VerifyPinnedCertChain(rawCerts, pinnedHashes))
+	})
+
+	t.Run("multiple_pinned_hashes", func(t *testing.T) {
+		wrongHash := make([]byte, HashSize)
+		pinnedHashes := [][]byte{wrongHash, expectedHash}
+		assert.True(t, VerifyPinnedCertChain(rawCerts, pinnedHashes))
+	})
+
+	t.Run("empty_pinned_hashes", func(t *testing.T) {
+		// No pinning configured should return true
+		assert.True(t, VerifyPinnedCertChain(rawCerts, nil))
+		assert.True(t, VerifyPinnedCertChain(rawCerts, [][]byte{}))
+	})
+
+	t.Run("empty_certs", func(t *testing.T) {
+		pinnedHashes := [][]byte{expectedHash}
+		assert.False(t, VerifyPinnedCertChain(nil, pinnedHashes))
+		assert.False(t, VerifyPinnedCertChain([][]byte{}, pinnedHashes))
+	})
+
+	t.Run("invalid_hash_length", func(t *testing.T) {
+		shortHash := []byte("too short")
+		pinnedHashes := [][]byte{shortHash}
+		assert.False(t, VerifyPinnedCertChain(rawCerts, pinnedHashes))
+	})
+}
+
+func TestValidatePinnedHashFormat(t *testing.T) {
+	t.Run("valid_hash", func(t *testing.T) {
+		validHash := make([]byte, HashSize)
+		assert.True(t, ValidatePinnedHashFormat(validHash))
+	})
+
+	t.Run("invalid_hash_short", func(t *testing.T) {
+		shortHash := make([]byte, HashSize-1)
+		assert.False(t, ValidatePinnedHashFormat(shortHash))
+	})
+
+	t.Run("invalid_hash_long", func(t *testing.T) {
+		longHash := make([]byte, HashSize+1)
+		assert.False(t, ValidatePinnedHashFormat(longHash))
+	})
+
+	t.Run("empty_hash", func(t *testing.T) {
+		assert.False(t, ValidatePinnedHashFormat(nil))
+		assert.False(t, ValidatePinnedHashFormat([]byte{}))
+	})
+}
+
+func TestValidateAllPinnedHashes(t *testing.T) {
+	validHash1 := make([]byte, HashSize)
+	validHash2 := make([]byte, HashSize)
+	invalidHash := make([]byte, HashSize-1)
+
+	t.Run("all_valid", func(t *testing.T) {
+		hashes := [][]byte{validHash1, validHash2}
+		assert.True(t, ValidateAllPinnedHashes(hashes))
+	})
+
+	t.Run("one_invalid", func(t *testing.T) {
+		hashes := [][]byte{validHash1, invalidHash}
+		assert.False(t, ValidateAllPinnedHashes(hashes))
+	})
+
+	t.Run("empty_list", func(t *testing.T) {
+		assert.True(t, ValidateAllPinnedHashes(nil))
+		assert.True(t, ValidateAllPinnedHashes([][]byte{}))
+	})
+}
+
+func TestGenerateCertChainHashEdgeCases(t *testing.T) {
+	t.Run("nil_input", func(t *testing.T) {
+		hash := GenerateCertChainHash(nil)
+		assert.Nil(t, hash)
+	})
+
+	t.Run("empty_input", func(t *testing.T) {
+		hash := GenerateCertChainHash([][]byte{})
+		assert.Nil(t, hash)
+	})
+
+	t.Run("single_cert", func(t *testing.T) {
+		cert := []byte("single certificate")
+		hash := GenerateCertChainHash([][]byte{cert})
+		assert.NotNil(t, hash)
+		assert.Equal(t, HashSize, len(hash))
+	})
+}
+
+func TestGenerateCertPublicKeyHashEdgeCases(t *testing.T) {
+	t.Run("nil_cert", func(t *testing.T) {
+		hash := GenerateCertPublicKeyHash(nil)
+		assert.Nil(t, hash)
+	})
+}

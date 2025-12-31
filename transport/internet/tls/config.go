@@ -3,11 +3,9 @@ package tls
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"os"
 	"slices"
 	"strings"
@@ -281,56 +279,92 @@ func (c *Config) parseServerName() string {
 	return c.ServerName
 }
 
+// verifyPeerCert implements custom certificate verification including:
+// 1. DNS name verification against VerifyPeerCertInNames
+// 2. Certificate chain pinning via SHA256 hash
+// 3. Public key pinning via SHA256 hash of SPKI
+//
+// Security considerations:
+// - All hash comparisons use constant-time comparison (hmac.Equal) to prevent timing attacks
+// - Error messages do not leak certificate hash values to prevent information disclosure
+// - Pinning is checked in order: chain hash first, then public key hash
 func (r *RandCarrier) verifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-	if r.VerifyPeerCertInNames != nil {
-		if len(r.VerifyPeerCertInNames) > 0 {
-			certs := make([]*x509.Certificate, len(rawCerts))
-			for i, asn1Data := range rawCerts {
-				certs[i], _ = x509.ParseCertificate(asn1Data)
+	// Step 1: Verify DNS names if configured
+	if len(r.VerifyPeerCertInNames) > 0 {
+		if err := r.verifyDNSNames(rawCerts); err != nil {
+			// If DNS name verification fails and no pinning is configured, fail immediately
+			if r.PinnedPeerCertificateChainSha256 == nil && r.PinnedPeerCertificatePublicKeySha256 == nil {
+				return errors.New("certificate verification failed: DNS name mismatch")
 			}
-			opts := x509.VerifyOptions{
-				Roots:         r.RootCAs,
-				CurrentTime:   time.Now(),
-				Intermediates: x509.NewCertPool(),
-			}
-			for _, cert := range certs[1:] {
-				opts.Intermediates.AddCert(cert)
-			}
-			for _, opts.DNSName = range r.VerifyPeerCertInNames {
-				if _, err := certs[0].Verify(opts); err == nil {
-					return nil
-				}
-			}
-		}
-		if r.PinnedPeerCertificateChainSha256 == nil {
-			return errors.New("peer cert is invalid.")
+			// Otherwise, fall through to pinning verification
+		} else {
+			// DNS name verified successfully
+			return nil
 		}
 	}
 
-	if r.PinnedPeerCertificateChainSha256 != nil {
-		hashValue := GenerateCertChainHash(rawCerts)
-		for _, v := range r.PinnedPeerCertificateChainSha256 {
-			if hmac.Equal(hashValue, v) {
-				return nil
-			}
+	// Step 2: Verify certificate chain hash pinning
+	if len(r.PinnedPeerCertificateChainSha256) > 0 {
+		if VerifyPinnedCertChain(rawCerts, r.PinnedPeerCertificateChainSha256) {
+			return nil
 		}
-		return errors.New("peer cert is unrecognized: ", base64.StdEncoding.EncodeToString(hashValue))
+		// Chain hash verification failed - don't leak the actual hash in error message
+		return errors.New("certificate chain hash verification failed")
 	}
 
-	if r.PinnedPeerCertificatePublicKeySha256 != nil {
-		for _, v := range verifiedChains {
-			for _, cert := range v {
-				publicHash := GenerateCertPublicKeyHash(cert)
-				for _, c := range r.PinnedPeerCertificatePublicKeySha256 {
-					if hmac.Equal(publicHash, c) {
-						return nil
-					}
-				}
-			}
+	// Step 3: Verify public key hash pinning
+	if len(r.PinnedPeerCertificatePublicKeySha256) > 0 {
+		if VerifyPinnedPublicKey(verifiedChains, r.PinnedPeerCertificatePublicKeySha256) {
+			return nil
 		}
-		return errors.New("peer public key is unrecognized.")
+		// Public key hash verification failed - don't leak the actual hash
+		return errors.New("certificate public key hash verification failed")
 	}
+
 	return nil
+}
+
+// verifyDNSNames verifies the certificate against a list of allowed DNS names
+func (r *RandCarrier) verifyDNSNames(rawCerts [][]byte) error {
+	if len(rawCerts) == 0 {
+		return errors.New("no certificates provided")
+	}
+
+	// Parse certificates
+	certs := make([]*x509.Certificate, 0, len(rawCerts))
+	for _, asn1Data := range rawCerts {
+		cert, err := x509.ParseCertificate(asn1Data)
+		if err != nil {
+			return errors.New("failed to parse certificate").Base(err)
+		}
+		certs = append(certs, cert)
+	}
+
+	if len(certs) == 0 {
+		return errors.New("no valid certificates")
+	}
+
+	// Build verification options
+	opts := x509.VerifyOptions{
+		Roots:         r.RootCAs,
+		CurrentTime:   time.Now(),
+		Intermediates: x509.NewCertPool(),
+	}
+
+	// Add intermediate certificates
+	for _, cert := range certs[1:] {
+		opts.Intermediates.AddCert(cert)
+	}
+
+	// Try each allowed DNS name
+	for _, dnsName := range r.VerifyPeerCertInNames {
+		opts.DNSName = dnsName
+		if _, err := certs[0].Verify(opts); err == nil {
+			return nil
+		}
+	}
+
+	return errors.New("certificate does not match any allowed DNS name")
 }
 
 type RandCarrier struct {
