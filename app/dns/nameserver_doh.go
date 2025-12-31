@@ -251,7 +251,32 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 		return nil, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	// DNS responses are typically small (< 512 bytes), use pooled buffer
+	bufPtr := responseBufferPool.Get().(*[]byte)
+	buf := (*bufPtr)[:cap(*bufPtr)]
+	defer responseBufferPool.Put(bufPtr)
+
+	n, err := io.ReadFull(resp.Body, buf)
+	if err == io.ErrUnexpectedEOF || err == io.EOF {
+		// Response fit in buffer, return a copy
+		result := make([]byte, n)
+		copy(result, buf[:n])
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Response is larger than buffer, fall back to ReadAll for the rest
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]byte, n+len(rest))
+	copy(result, buf[:n])
+	copy(result[n:], rest)
+	return result, nil
 }
 
 // QueryIP implements Server.

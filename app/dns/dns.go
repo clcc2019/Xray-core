@@ -543,6 +543,30 @@ type queryResult struct {
 	index int
 }
 
+// queryResultPool pools queryResult objects for parallel DNS queries
+var queryResultPool = sync.Pool{
+	New: func() interface{} {
+		return &queryResult{}
+	},
+}
+
+// acquireQueryResult gets a queryResult from the pool
+func acquireQueryResult() *queryResult {
+	return queryResultPool.Get().(*queryResult)
+}
+
+// releaseQueryResult returns a queryResult to the pool
+func releaseQueryResult(r *queryResult) {
+	if r == nil {
+		return
+	}
+	r.ips = nil
+	r.ttl = 0
+	r.err = nil
+	r.index = 0
+	queryResultPool.Put(r)
+}
+
 func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
 	if len(clients) == 0 {
 		ch := make(chan queryResult)

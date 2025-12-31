@@ -27,6 +27,22 @@ import (
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
 
+// regexCache caches compiled regular expressions to avoid repeated compilation
+var regexCache sync.Map // map[string]*regexp.Regexp
+
+// getCompiledRegex returns a cached compiled regex or compiles and caches it
+func getCompiledRegex(pattern string) (*regexp.Regexp, error) {
+	if cached, ok := regexCache.Load(pattern); ok {
+		return cached.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	regexCache.Store(pattern, re)
+	return re, nil
+}
+
 type cachedReader struct {
 	sync.Mutex
 	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
@@ -242,10 +258,10 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 	if domain == "" {
 		return false
 	}
-	for _, d := range request.ExcludeForDomain {
-		if strings.HasPrefix(d, "regexp:") {
-			pattern := d[7:]
-			re, err := regexp.Compile(pattern)
+	for _, exclude := range request.ExcludeForDomain {
+		if strings.HasPrefix(exclude, "regexp:") {
+			pattern := exclude[7:]
+			re, err := getCompiledRegex(pattern)
 			if err != nil {
 				errors.LogInfo(ctx, "Unable to compile regex")
 				continue
@@ -254,7 +270,7 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 				return false
 			}
 		} else {
-			if strings.ToLower(domain) == d {
+			if strings.ToLower(domain) == exclude {
 				return false
 			}
 		}

@@ -1,7 +1,6 @@
 package dns
 
 import (
-	"hash/fnv"
 	"sync"
 	"time"
 )
@@ -16,6 +15,21 @@ const (
 type shardedRecordCache struct {
 	shards    []*recordCacheShard
 	shardMask uint32
+}
+
+// fnvHash computes a simple FNV-1a hash inline without allocations
+// This is much faster than using hash/fnv which allocates a new hash state each time
+func fnvHash(s string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime32
+	}
+	return h
 }
 
 type recordCacheShard struct {
@@ -60,10 +74,9 @@ func nextPowerOf2(n int) int {
 }
 
 // getShard returns the shard for the given key
+// Uses inline FNV-1a hash to avoid allocations
 func (c *shardedRecordCache) getShard(key string) *recordCacheShard {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return c.shards[h.Sum32()&c.shardMask]
+	return c.shards[fnvHash(key)&c.shardMask]
 }
 
 // Get retrieves a record from the cache

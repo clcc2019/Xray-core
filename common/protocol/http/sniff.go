@@ -5,11 +5,34 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 )
+
+// sniffHeaderPool pools SniffHeader objects to reduce allocations
+var sniffHeaderPool = sync.Pool{
+	New: func() interface{} {
+		return &SniffHeader{}
+	},
+}
+
+// AcquireSniffHeader gets a SniffHeader from the pool
+func AcquireSniffHeader() *SniffHeader {
+	return sniffHeaderPool.Get().(*SniffHeader)
+}
+
+// ReleaseSniffHeader returns a SniffHeader to the pool
+func ReleaseSniffHeader(h *SniffHeader) {
+	if h == nil {
+		return
+	}
+	h.version = 0
+	h.host = ""
+	sniffHeaderPool.Put(h)
+}
 
 type version byte
 
