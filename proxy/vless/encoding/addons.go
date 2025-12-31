@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -14,19 +15,65 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Addons 结构体池，减少内存分配
+var addonsPool = sync.Pool{
+	New: func() interface{} {
+		return new(Addons)
+	},
+}
+
+// AcquireAddons 从池中获取 Addons 结构体
+func AcquireAddons() *Addons {
+	return addonsPool.Get().(*Addons)
+}
+
+// ReleaseAddons 将 Addons 结构体归还到池中
+func ReleaseAddons(addons *Addons) {
+	if addons == nil {
+		return
+	}
+	// 重置字段
+	addons.Flow = ""
+	addons.Seed = nil
+	addonsPool.Put(addons)
+}
+
+// protobuf 序列化缓冲区池
+var protoBufferPool = sync.Pool{
+	New: func() interface{} {
+		// 预分配 64 字节，足够大多数 Addons 序列化
+		b := make([]byte, 0, 64)
+		return &b
+	},
+}
+
 func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
 	switch addons.Flow {
 	case vless.XRV:
-		bytes, err := proto.Marshal(addons)
+		// 使用池化缓冲区进行 protobuf 序列化
+		bufPtr := protoBufferPool.Get().(*[]byte)
+		protoBytes := *bufPtr
+		protoBytes = protoBytes[:0]
+
+		var err error
+		protoBytes, err = proto.MarshalOptions{}.MarshalAppend(protoBytes, addons)
 		if err != nil {
+			*bufPtr = protoBytes
+			protoBufferPool.Put(bufPtr)
 			return errors.New("failed to marshal addons protobuf value").Base(err)
 		}
-		if err := buffer.WriteByte(byte(len(bytes))); err != nil {
+		if err := buffer.WriteByte(byte(len(protoBytes))); err != nil {
+			*bufPtr = protoBytes
+			protoBufferPool.Put(bufPtr)
 			return errors.New("failed to write addons protobuf length").Base(err)
 		}
-		if _, err := buffer.Write(bytes); err != nil {
+		if _, err := buffer.Write(protoBytes); err != nil {
+			*bufPtr = protoBytes
+			protoBufferPool.Put(bufPtr)
 			return errors.New("failed to write addons protobuf value").Base(err)
 		}
+		*bufPtr = protoBytes
+		protoBufferPool.Put(bufPtr)
 	default:
 		if err := buffer.WriteByte(0); err != nil {
 			return errors.New("failed to write addons protobuf length").Base(err)
@@ -37,19 +84,23 @@ func EncodeHeaderAddons(buffer *buf.Buffer, addons *Addons) error {
 }
 
 func DecodeHeaderAddons(buffer *buf.Buffer, reader io.Reader) (*Addons, error) {
-	addons := new(Addons)
+	// 使用池化的 Addons 结构体
+	addons := AcquireAddons()
 	buffer.Clear()
 	if _, err := buffer.ReadFullFrom(reader, 1); err != nil {
+		ReleaseAddons(addons)
 		return nil, errors.New("failed to read addons protobuf length").Base(err)
 	}
 
 	if length := int32(buffer.Byte(0)); length != 0 {
 		buffer.Clear()
 		if _, err := buffer.ReadFullFrom(reader, length); err != nil {
+			ReleaseAddons(addons)
 			return nil, errors.New("failed to read addons protobuf value").Base(err)
 		}
 
 		if err := proto.Unmarshal(buffer.Bytes(), addons); err != nil {
+			ReleaseAddons(addons)
 			return nil, errors.New("failed to unmarshal addons protobuf value").Base(err)
 		}
 
@@ -84,10 +135,23 @@ func DecodeBodyAddons(reader io.Reader, request *protocol.RequestHeader, addons 
 	return buf.NewReader(reader)
 }
 
+// MultiLengthPacketWriter 池
+var multiLengthPacketWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &MultiLengthPacketWriter{}
+	},
+}
+
 func NewMultiLengthPacketWriter(writer buf.Writer) *MultiLengthPacketWriter {
-	return &MultiLengthPacketWriter{
-		Writer: writer,
-	}
+	w := multiLengthPacketWriterPool.Get().(*MultiLengthPacketWriter)
+	w.Writer = writer
+	return w
+}
+
+// Release 将 MultiLengthPacketWriter 归还到池中
+func (w *MultiLengthPacketWriter) Release() {
+	w.Writer = nil
+	multiLengthPacketWriterPool.Put(w)
 }
 
 type MultiLengthPacketWriter struct {
@@ -123,11 +187,27 @@ func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.Writer.WriteMultiBuffer(mb2Write)
 }
 
+// LengthPacketWriter 池
+var lengthPacketWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &LengthPacketWriter{
+			cache: make([]byte, 0, 65536),
+		}
+	},
+}
+
 func NewLengthPacketWriter(writer io.Writer) *LengthPacketWriter {
-	return &LengthPacketWriter{
-		Writer: writer,
-		cache:  make([]byte, 0, 65536),
-	}
+	w := lengthPacketWriterPool.Get().(*LengthPacketWriter)
+	w.Writer = writer
+	w.cache = w.cache[:0]
+	return w
+}
+
+// Release 将 LengthPacketWriter 归还到池中
+func (w *LengthPacketWriter) Release() {
+	w.Writer = nil
+	w.cache = w.cache[:0]
+	lengthPacketWriterPool.Put(w)
 }
 
 type LengthPacketWriter struct {
@@ -156,11 +236,25 @@ func (w *LengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
+// LengthPacketReader 池
+var lengthPacketReaderPool = sync.Pool{
+	New: func() interface{} {
+		return &LengthPacketReader{
+			cache: make([]byte, 2),
+		}
+	},
+}
+
 func NewLengthPacketReader(reader io.Reader) *LengthPacketReader {
-	return &LengthPacketReader{
-		Reader: reader,
-		cache:  make([]byte, 2),
-	}
+	r := lengthPacketReaderPool.Get().(*LengthPacketReader)
+	r.Reader = reader
+	return r
+}
+
+// Release 将 LengthPacketReader 归还到池中
+func (r *LengthPacketReader) Release() {
+	r.Reader = nil
+	lengthPacketReaderPool.Put(r)
 }
 
 type LengthPacketReader struct {

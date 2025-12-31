@@ -61,16 +61,18 @@ func EncodeRequestHeader(writer io.Writer, request *protocol.RequestHeader, requ
 }
 
 // DecodeRequestHeader decodes and returns (if successful) a RequestHeader from an input stream.
+// 注意：调用方负责在使用完毕后调用 protocol.ReleaseRequestHeader(request) 归还到池中
 func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validator vless.Validator) ([]byte, *protocol.RequestHeader, *Addons, bool, error) {
 	buffer := buf.StackNew()
 	defer buffer.Release()
 
-	request := new(protocol.RequestHeader)
+	request := protocol.AcquireRequestHeader()
 
 	if isfb {
 		request.Version = first.Byte(0)
 	} else {
 		if _, err := buffer.ReadFullFrom(reader, 1); err != nil {
+			protocol.ReleaseRequestHeader(request)
 			return nil, nil, nil, false, errors.New("failed to read request version").Base(err)
 		}
 		request.Version = buffer.Byte(0)
@@ -86,6 +88,7 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 		} else {
 			buffer.Clear()
 			if _, err := buffer.ReadFullFrom(reader, 16); err != nil {
+				protocol.ReleaseRequestHeader(request)
 				return nil, nil, nil, false, errors.New("failed to read request user id").Base(err)
 			}
 			copy(id[:], buffer.Bytes())
@@ -93,6 +96,7 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 
 		if request.User = validator.Get(id); request.User == nil {
 			u := uuid.UUID(id)
+			protocol.ReleaseRequestHeader(request)
 			return nil, nil, nil, isfb, errors.New("invalid request user id: " + u.String())
 		}
 
@@ -102,11 +106,14 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 
 		requestAddons, err := DecodeHeaderAddons(&buffer, reader)
 		if err != nil {
+			protocol.ReleaseRequestHeader(request)
 			return nil, nil, nil, false, errors.New("failed to decode request header addons").Base(err)
 		}
 
 		buffer.Clear()
 		if _, err := buffer.ReadFullFrom(reader, 1); err != nil {
+			protocol.ReleaseRequestHeader(request)
+			ReleaseAddons(requestAddons)
 			return nil, nil, nil, false, errors.New("failed to read request command").Base(err)
 		}
 
@@ -123,10 +130,13 @@ func DecodeRequestHeader(isfb bool, first *buf.Buffer, reader io.Reader, validat
 			}
 		}
 		if request.Address == nil {
+			protocol.ReleaseRequestHeader(request)
+			ReleaseAddons(requestAddons)
 			return nil, nil, nil, false, errors.New("invalid request address")
 		}
 		return id[:], request, requestAddons, false, nil
 	default:
+		protocol.ReleaseRequestHeader(request)
 		return nil, nil, nil, isfb, errors.New("invalid request version")
 	}
 }

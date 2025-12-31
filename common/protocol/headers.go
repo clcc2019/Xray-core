@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"runtime"
+	sync "sync"
 
 	"github.com/xtls/xray-core/common/bitmask"
 	"github.com/xtls/xray-core/common/net"
@@ -50,6 +51,34 @@ type RequestHeader struct {
 	Port     net.Port
 	Address  net.Address
 	User     *MemoryUser
+}
+
+// RequestHeader 池，减少内存分配
+var requestHeaderPool = sync.Pool{
+	New: func() interface{} {
+		return new(RequestHeader)
+	},
+}
+
+// AcquireRequestHeader 从池中获取 RequestHeader
+func AcquireRequestHeader() *RequestHeader {
+	return requestHeaderPool.Get().(*RequestHeader)
+}
+
+// ReleaseRequestHeader 将 RequestHeader 归还到池中
+func ReleaseRequestHeader(h *RequestHeader) {
+	if h == nil {
+		return
+	}
+	// 重置字段
+	h.Version = 0
+	h.Command = 0
+	h.Option = 0
+	h.Security = 0
+	h.Port = 0
+	h.Address = nil
+	h.User = nil
+	requestHeaderPool.Put(h)
 }
 
 func (h *RequestHeader) Destination() net.Destination {

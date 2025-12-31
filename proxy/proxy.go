@@ -13,6 +13,8 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -138,36 +140,61 @@ type OutboundState struct {
 	UplinkWriterDirectCopy bool
 }
 
+// TrafficState 结构体池
+var trafficStatePool = sync.Pool{
+	New: func() interface{} {
+		return &TrafficState{}
+	},
+}
+
+// NewTrafficState 从池中获取并初始化 TrafficState
 func NewTrafficState(userUUID []byte) *TrafficState {
-	return &TrafficState{
-		UserUUID:               userUUID,
-		NumberOfPacketToFilter: 8,
-		EnableXtls:             false,
-		IsTLS12orAbove:         false,
-		IsTLS:                  false,
-		Cipher:                 0,
-		RemainingServerHello:   -1,
-		Inbound: InboundState{
-			WithinPaddingBuffers:     true,
-			UplinkReaderDirectCopy:   false,
-			RemainingCommand:         -1,
-			RemainingContent:         -1,
-			RemainingPadding:         -1,
-			CurrentCommand:           0,
-			IsPadding:                true,
-			DownlinkWriterDirectCopy: false,
-		},
-		Outbound: OutboundState{
-			WithinPaddingBuffers:     true,
-			DownlinkReaderDirectCopy: false,
-			RemainingCommand:         -1,
-			RemainingContent:         -1,
-			RemainingPadding:         -1,
-			CurrentCommand:           0,
-			IsPadding:                true,
-			UplinkWriterDirectCopy:   false,
-		},
+	s := trafficStatePool.Get().(*TrafficState)
+	// 复制 userUUID 以避免外部修改
+	if cap(s.UserUUID) >= len(userUUID) {
+		s.UserUUID = s.UserUUID[:len(userUUID)]
+		copy(s.UserUUID, userUUID)
+	} else {
+		s.UserUUID = make([]byte, len(userUUID))
+		copy(s.UserUUID, userUUID)
 	}
+	s.NumberOfPacketToFilter = 8
+	s.EnableXtls = false
+	s.IsTLS12orAbove = false
+	s.IsTLS = false
+	s.Cipher = 0
+	s.RemainingServerHello = -1
+	s.Inbound = InboundState{
+		WithinPaddingBuffers:     true,
+		UplinkReaderDirectCopy:   false,
+		RemainingCommand:         -1,
+		RemainingContent:         -1,
+		RemainingPadding:         -1,
+		CurrentCommand:           0,
+		IsPadding:                true,
+		DownlinkWriterDirectCopy: false,
+	}
+	s.Outbound = OutboundState{
+		WithinPaddingBuffers:     true,
+		DownlinkReaderDirectCopy: false,
+		RemainingCommand:         -1,
+		RemainingContent:         -1,
+		RemainingPadding:         -1,
+		CurrentCommand:           0,
+		IsPadding:                true,
+		UplinkWriterDirectCopy:   false,
+	}
+	return s
+}
+
+// ReleaseTrafficState 将 TrafficState 归还到池中
+func ReleaseTrafficState(s *TrafficState) {
+	if s == nil {
+		return
+	}
+	// 保留 UserUUID 的底层数组以便复用
+	s.UserUUID = s.UserUUID[:0]
+	trafficStatePool.Put(s)
 }
 
 // VisionReader is used to read xtls vision protocol
@@ -186,17 +213,38 @@ type VisionReader struct {
 	directReadCounter stats.Counter
 }
 
+// VisionReader 池
+var visionReaderPool = sync.Pool{
+	New: func() interface{} {
+		return &VisionReader{}
+	},
+}
+
 func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
-	return &VisionReader{
-		Reader:       reader,
-		trafficState: trafficState,
-		ctx:          ctx,
-		isUplink:     isUplink,
-		conn:         conn,
-		input:        input,
-		rawInput:     rawInput,
-		ob:           ob,
-	}
+	r := visionReaderPool.Get().(*VisionReader)
+	r.Reader = reader
+	r.trafficState = trafficState
+	r.ctx = ctx
+	r.isUplink = isUplink
+	r.conn = conn
+	r.input = input
+	r.rawInput = rawInput
+	r.ob = ob
+	r.directReadCounter = nil
+	return r
+}
+
+// Release 将 VisionReader 归还到池中
+func (w *VisionReader) Release() {
+	w.Reader = nil
+	w.trafficState = nil
+	w.ctx = nil
+	w.conn = nil
+	w.input = nil
+	w.rawInput = nil
+	w.ob = nil
+	w.directReadCounter = nil
+	visionReaderPool.Put(w)
 }
 
 func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -300,22 +348,56 @@ type VisionWriter struct {
 	testseed []uint32
 }
 
+// VisionWriter 池
+var visionWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &VisionWriter{
+			writeOnceUserUUID: make([]byte, 0, 16), // 预分配 UUID 长度
+		}
+	},
+}
+
+// 默认 testseed
+var defaultTestseed = []uint32{900, 500, 900, 256}
+
 func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, ob *session.Outbound, testseed []uint32) *VisionWriter {
-	w := make([]byte, len(trafficState.UserUUID))
-	copy(w, trafficState.UserUUID)
+	vw := visionWriterPool.Get().(*VisionWriter)
+	vw.Writer = writer
+	vw.trafficState = trafficState
+	vw.ctx = ctx
+	vw.isUplink = isUplink
+	vw.conn = conn
+	vw.ob = ob
+	vw.directWriteCounter = nil
+
+	// 复用 writeOnceUserUUID 底层数组
+	if cap(vw.writeOnceUserUUID) >= len(trafficState.UserUUID) {
+		vw.writeOnceUserUUID = vw.writeOnceUserUUID[:len(trafficState.UserUUID)]
+	} else {
+		vw.writeOnceUserUUID = make([]byte, len(trafficState.UserUUID))
+	}
+	copy(vw.writeOnceUserUUID, trafficState.UserUUID)
+
 	if len(testseed) < 4 {
-		testseed = []uint32{900, 500, 900, 256}
+		vw.testseed = defaultTestseed
+	} else {
+		vw.testseed = testseed
 	}
-	return &VisionWriter{
-		Writer:            writer,
-		trafficState:      trafficState,
-		ctx:               ctx,
-		writeOnceUserUUID: w,
-		isUplink:          isUplink,
-		conn:              conn,
-		ob:                ob,
-		testseed:          testseed,
-	}
+	return vw
+}
+
+// Release 将 VisionWriter 归还到池中
+func (w *VisionWriter) Release() {
+	w.Writer = nil
+	w.trafficState = nil
+	w.ctx = nil
+	w.conn = nil
+	w.ob = nil
+	w.directWriteCounter = nil
+	// 保留 writeOnceUserUUID 底层数组
+	w.writeOnceUserUUID = w.writeOnceUserUUID[:0]
+	w.testseed = nil
+	visionWriterPool.Put(w)
 }
 
 func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -393,16 +475,42 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.Writer.WriteMultiBuffer(mb)
 }
 
+// isCompleteRecordBufferPool 用于 IsCompleteRecord 的缓冲区池
+var isCompleteRecordBufferPool = sync.Pool{
+	New: func() interface{} {
+		// 预分配 16KB，足够大多数 TLS 记录
+		b := make([]byte, 16*1024)
+		return &b
+	},
+}
+
 // IsCompleteRecord Is complete tls data record
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
-	b := make([]byte, buffer.Len())
-	if buffer.Copy(b) != int(buffer.Len()) {
+	totalLen := int(buffer.Len())
+	if totalLen == 0 {
+		return false
+	}
+
+	// 从池中获取缓冲区
+	bufPtr := isCompleteRecordBufferPool.Get().(*[]byte)
+	b := *bufPtr
+
+	// 确保缓冲区足够大
+	if cap(b) < totalLen {
+		b = make([]byte, totalLen)
+	} else {
+		b = b[:totalLen]
+	}
+
+	if buffer.Copy(b) != totalLen {
+		*bufPtr = b
+		isCompleteRecordBufferPool.Put(bufPtr)
 		panic("impossible bytes allocation")
 	}
+
 	var headerLen int = 5
 	var recordLen int
 
-	totalLen := len(b)
 	i := 0
 	for i < totalLen {
 		// record header: 0x17 0x3 0x3 + 2 bytes length
@@ -412,14 +520,20 @@ func IsCompleteRecord(buffer buf.MultiBuffer) bool {
 			switch headerLen {
 			case 5:
 				if data != 0x17 {
+					*bufPtr = b
+					isCompleteRecordBufferPool.Put(bufPtr)
 					return false
 				}
 			case 4:
 				if data != 0x03 {
+					*bufPtr = b
+					isCompleteRecordBufferPool.Put(bufPtr)
 					return false
 				}
 			case 3:
 				if data != 0x03 {
+					*bufPtr = b
+					isCompleteRecordBufferPool.Put(bufPtr)
 					return false
 				}
 			case 2:
@@ -431,6 +545,8 @@ func IsCompleteRecord(buffer buf.MultiBuffer) bool {
 		} else if recordLen > 0 {
 			remaining := totalLen - i
 			if remaining < recordLen {
+				*bufPtr = b
+				isCompleteRecordBufferPool.Put(bufPtr)
 				return false
 			} else {
 				i += recordLen
@@ -438,9 +554,15 @@ func IsCompleteRecord(buffer buf.MultiBuffer) bool {
 				headerLen = 5
 			}
 		} else {
+			*bufPtr = b
+			isCompleteRecordBufferPool.Put(bufPtr)
 			return false
 		}
 	}
+
+	*bufPtr = b
+	isCompleteRecordBufferPool.Put(bufPtr)
+
 	if headerLen == 5 && recordLen == 0 {
 		return true
 	}
@@ -452,14 +574,15 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 	needReshape := 0
 	for _, b := range buffer {
 		if b.Len() >= buf.Size-21 {
-			needReshape += 1
+			needReshape++
 		}
 	}
 	if needReshape == 0 {
 		return buffer
 	}
 	mb2 := make(buf.MultiBuffer, 0, len(buffer)+needReshape)
-	toPrint := ""
+	// 使用 strings.Builder 减少字符串拼接分配
+	var toPrint strings.Builder
 	for i, buffer1 := range buffer {
 		if buffer1.Len() >= buf.Size-21 {
 			index := int32(bytes.LastIndex(buffer1.Bytes(), TlsApplicationDataStart))
@@ -470,15 +593,19 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 			buffer2.Write(buffer1.BytesFrom(index))
 			buffer1.Resize(0, index)
 			mb2 = append(mb2, buffer1, buffer2)
-			toPrint += " " + strconv.Itoa(int(buffer1.Len())) + " " + strconv.Itoa(int(buffer2.Len()))
+			toPrint.WriteByte(' ')
+			toPrint.WriteString(strconv.Itoa(int(buffer1.Len())))
+			toPrint.WriteByte(' ')
+			toPrint.WriteString(strconv.Itoa(int(buffer2.Len())))
 		} else {
 			mb2 = append(mb2, buffer1)
-			toPrint += " " + strconv.Itoa(int(buffer1.Len()))
+			toPrint.WriteByte(' ')
+			toPrint.WriteString(strconv.Itoa(int(buffer1.Len())))
 		}
 		buffer[i] = nil
 	}
 	buffer = buffer[:0]
-	errors.LogDebug(ctx, "ReshapeMultiBuffer ", toPrint)
+	errors.LogDebug(ctx, "ReshapeMultiBuffer ", toPrint.String())
 	return mb2
 }
 
