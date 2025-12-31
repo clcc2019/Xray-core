@@ -96,9 +96,13 @@ func init() {
 		case "arm", "mips", "mipsle":
 			defaultBufferSize = 0
 		case "arm64", "mips64", "mips64le":
-			defaultBufferSize = 4 * 1024 // 4k cache for low-end devices
+			defaultBufferSize = 16 * 1024 // 16k cache for low-end devices (increased from 4k)
 		default:
-			defaultBufferSize = 512 * 1024
+			// Increased from 512KB to 2MB for better throughput on high-bandwidth connections.
+			// This allows more data to be buffered before backpressure kicks in,
+			// improving performance for bursty traffic patterns (video streaming, large downloads).
+			// Trade-off: ~4x memory per connection, but enables much higher throughput.
+			defaultBufferSize = 2 * 1024 * 1024
 		}
 	default:
 		defaultBufferSize = int32(size) * 1024 * 1024

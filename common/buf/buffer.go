@@ -11,7 +11,10 @@ import (
 
 const (
 	// Size of a regular buffer.
-	Size = 8192
+	// Increased from 8KB to 16KB for better throughput on high-bandwidth connections.
+	// This reduces syscall overhead and improves copy efficiency.
+	// Trade-off: ~2x memory per buffer, but significantly better performance for large transfers.
+	Size = 16384
 )
 
 var ErrBufferFull = errors.New("buffer is full")

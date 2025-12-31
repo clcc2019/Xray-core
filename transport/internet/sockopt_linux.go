@@ -53,7 +53,18 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 		}
 	}
 
+	// Always set larger socket buffers for better throughput.
+	// These settings trade memory for better TCP performance.
+	// Default kernel values are typically 208KB, we increase to 4MB for high-throughput scenarios.
+	const defaultSocketBufferSize = 4 * 1024 * 1024 // 4MB
+	_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, defaultSocketBufferSize)
+	_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, defaultSocketBufferSize)
+
 	if isTCPSocket(network) {
+		// Enable TCP_NODELAY by default to reduce latency for interactive traffic.
+		// This disables Nagle's algorithm which can cause delays for small writes.
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+
 		tfo := config.ParseTFOValue()
 		if tfo > 0 {
 			tfo = 1
@@ -145,7 +156,16 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 			return errors.New("failed to set SO_MARK").Base(err)
 		}
 	}
+
+	// Always set larger socket buffers for better throughput.
+	const defaultSocketBufferSize = 4 * 1024 * 1024 // 4MB
+	_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, defaultSocketBufferSize)
+	_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, defaultSocketBufferSize)
+
 	if isTCPSocket(network) {
+		// Enable TCP_NODELAY by default
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+
 		tfo := config.ParseTFOValue()
 		if tfo >= 0 {
 			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_TCP, unix.TCP_FASTOPEN, tfo); err != nil {

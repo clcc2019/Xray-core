@@ -158,9 +158,21 @@ type MultiLengthPacketWriter struct {
 	buf.Writer
 }
 
+// multiBufferSmallPool 用于 MultiLengthPacketWriter 的 MultiBuffer 切片池
+var multiBufferSmallPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(buf.MultiBuffer, 0, 8) // 预分配 8 个元素，适合大多数情况
+		return &mb
+	},
+}
+
 func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
-	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
+
+	// 从池中获取 MultiBuffer 切片
+	mb2WritePtr := multiBufferSmallPool.Get().(*buf.MultiBuffer)
+	mb2Write := (*mb2WritePtr)[:0]
+
 	for _, b := range mb {
 		length := b.Len()
 		if length == 0 || length+2 > buf.Size {
@@ -181,10 +193,21 @@ func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		mb2Write = append(mb2Write, eb)
 	}
-	if mb2Write.IsEmpty() {
+
+	if len(mb2Write) == 0 {
+		// 归还到池中
+		*mb2WritePtr = mb2Write
+		multiBufferSmallPool.Put(mb2WritePtr)
 		return nil
 	}
-	return w.Writer.WriteMultiBuffer(mb2Write)
+
+	err := w.Writer.WriteMultiBuffer(mb2Write)
+
+	// 注意：WriteMultiBuffer 会消费 mb2Write，所以这里只需要重置切片
+	*mb2WritePtr = (*mb2WritePtr)[:0]
+	multiBufferSmallPool.Put(mb2WritePtr)
+
+	return err
 }
 
 // LengthPacketWriter 池

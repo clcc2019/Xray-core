@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -77,9 +78,21 @@ type PacketWriter struct {
 	GlobalID [8]byte
 }
 
+// multiBufferPool pools MultiBuffer slices for packet writing
+var multiBufferPool = sync.Pool{
+	New: func() interface{} {
+		mb := make(buf.MultiBuffer, 0, 16)
+		return &mb
+	},
+}
+
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
-	mb2Write := make(buf.MultiBuffer, 0, len(mb))
+
+	// Get MultiBuffer from pool
+	mb2WritePtr := multiBufferPool.Get().(*buf.MultiBuffer)
+	mb2Write := (*mb2WritePtr)[:0]
+
 	for _, b := range mb {
 		length := b.Len()
 		if length == 0 || length+666 > buf.Size {
@@ -114,10 +127,21 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 		mb2Write = append(mb2Write, eb)
 	}
+
 	if mb2Write.IsEmpty() {
+		// Return to pool before returning
+		*mb2WritePtr = mb2Write[:0]
+		multiBufferPool.Put(mb2WritePtr)
 		return nil
 	}
-	return w.Writer.WriteMultiBuffer(mb2Write)
+
+	err := w.Writer.WriteMultiBuffer(mb2Write)
+
+	// Return slice to pool (buffers are now owned by Writer)
+	*mb2WritePtr = (*mb2WritePtr)[:0]
+	multiBufferPool.Put(mb2WritePtr)
+
+	return err
 }
 
 func NewPacketReader(reader io.Reader) *PacketReader {

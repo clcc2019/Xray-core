@@ -65,6 +65,29 @@ type ConnExpire struct {
 	Expire time.Time
 }
 
+// connExpirePool 用于池化 ConnExpire 结构体，减少 GC 压力
+var connExpirePool = sync.Pool{
+	New: func() interface{} {
+		return &ConnExpire{}
+	},
+}
+
+func acquireConnExpire(conn stat.Connection, expire time.Time) *ConnExpire {
+	ce := connExpirePool.Get().(*ConnExpire)
+	ce.Conn = conn
+	ce.Expire = expire
+	return ce
+}
+
+func releaseConnExpire(ce *ConnExpire) {
+	if ce == nil {
+		return
+	}
+	ce.Conn = nil
+	ce.Expire = time.Time{}
+	connExpirePool.Put(ce)
+}
+
 // New creates a new VLess outbound handler.
 func New(ctx context.Context, config *Config) (*Handler, error) {
 	if config.Vnext == nil {
@@ -157,8 +180,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 							errors.LogWarningInner(ctx, err, "pre-connect failed")
 							continue
 						}
-						h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)} // TODO: customize & randomize
-						time.Sleep(time.Millisecond * 200)                                             // TODO: customize & randomize
+						// 使用池化的 ConnExpire 结构体
+						h.preConns <- acquireConnExpire(conn, time.Now().Add(time.Minute*2)) // TODO: customize & randomize
+						time.Sleep(time.Millisecond * 200)                                   // TODO: customize & randomize
 					}
 				}()
 			}
@@ -170,9 +194,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			if time.Now().Before(connTime.Expire) {
 				conn = connTime.Conn
+				releaseConnExpire(connTime) // 归还结构体到池中（连接仍然被使用）
 				break
 			}
 			connTime.Conn.Close()
+			releaseConnExpire(connTime) // 连接过期，关闭并归还结构体
 		}
 	}
 

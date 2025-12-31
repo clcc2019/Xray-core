@@ -8,9 +8,8 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"io"
-	"math/big"
+	"math/rand/v2"
 	"runtime"
 	"strconv"
 	"strings"
@@ -610,6 +609,7 @@ func ReshapeMultiBuffer(ctx context.Context, buffer buf.MultiBuffer) buf.MultiBu
 }
 
 // XtlsPadding add padding to eliminate length signature during tls handshake
+// Uses math/rand/v2 for faster random number generation (padding length is not security-critical)
 func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool, ctx context.Context, testseed []uint32) *buf.Buffer {
 	var contentLen int32 = 0
 	var paddingLen int32 = 0
@@ -617,17 +617,10 @@ func XtlsPadding(b *buf.Buffer, command byte, userUUID *[]byte, longPadding bool
 		contentLen = b.Len()
 	}
 	if contentLen < int32(testseed[0]) && longPadding {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[1])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64()) + int32(testseed[2]) - contentLen
+		// Use math/rand/v2 - much faster than crypto/rand for non-security-critical padding
+		paddingLen = int32(rand.IntN(int(testseed[1]))) + int32(testseed[2]) - contentLen
 	} else {
-		l, err := rand.Int(rand.Reader, big.NewInt(int64(testseed[3])))
-		if err != nil {
-			errors.LogDebugInner(ctx, err, "failed to generate padding")
-		}
-		paddingLen = int32(l.Int64())
+		paddingLen = int32(rand.IntN(int(testseed[3])))
 	}
 	if paddingLen > buf.Size-21-contentLen {
 		paddingLen = buf.Size - 21 - contentLen

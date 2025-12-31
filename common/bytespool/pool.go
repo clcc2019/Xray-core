@@ -12,8 +12,10 @@ func createAllocFunc(size int32) func() interface{} {
 // There are numPools pools. Starting from 2k size, the size of each pool is sizeMulti of the previous one.
 // Package buf is guaranteed to not use buffers larger than the largest pool.
 // Other packets may use larger buffers.
+// Note: Increased pool count and added larger buffer sizes for high-throughput scenarios.
+// This trades memory for better performance on high-bandwidth connections.
 const (
-	numPools  = 4
+	numPools  = 6 // Extended from 4 to 6 pools: 2K, 8K, 32K, 128K, 512K, 2M
 	sizeMulti = 4
 )
 

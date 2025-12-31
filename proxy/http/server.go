@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -311,33 +312,60 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 	return result
 }
 
+// http1xxBufferPool pools buffers for HTTP 1xx response handling
+var http1xxBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 256) // Most 1xx responses are small
+		return &b
+	},
+}
+
+// endOfHeader is the HTTP header terminator
+var endOfHeader = []byte{'\r', '\n', '\r', '\n'}
+
 // Sometimes, server might send 1xx response to client
 // it should not be processed by http proxy handler, just forward it to client
 func readResponseAndHandle100Continue(r *bufio.Reader, req *http.Request, writer io.Writer) (*http.Response, error) {
 	// have a little look of response
 	peekBytes, err := r.Peek(56)
 	if err == nil || err == bufio.ErrBufferFull {
-		str := string(peekBytes)
-		ResponseLine := strings.Split(str, "\r\n")[0]
-		_, status, _ := strings.Cut(ResponseLine, " ")
-		// only handle 1xx response
-		if strings.HasPrefix(status, "1") {
-			ResponseHeader1xx := []byte{}
-			// read until \r\n\r\n (end of http response header)
-			for {
-				data, err := r.ReadSlice('\n')
-				if err != nil {
-					return nil, errors.New("failed to read http 1xx response").Base(err)
-				}
-				ResponseHeader1xx = append(ResponseHeader1xx, data...)
-				if bytes.Equal(ResponseHeader1xx[len(ResponseHeader1xx)-4:], []byte{'\r', '\n', '\r', '\n'}) {
-					break
-				}
-				if len(ResponseHeader1xx) > 1024 {
-					return nil, errors.New("too big http 1xx response")
+		// Find the first line without allocating
+		firstLineEnd := bytes.IndexByte(peekBytes, '\r')
+		if firstLineEnd > 0 {
+			// Find status code position (after "HTTP/x.x ")
+			spaceIdx := bytes.IndexByte(peekBytes[:firstLineEnd], ' ')
+			if spaceIdx > 0 && spaceIdx+1 < firstLineEnd {
+				// Check if status starts with '1' (1xx response)
+				if peekBytes[spaceIdx+1] == '1' {
+					// Get buffer from pool
+					bufPtr := http1xxBufferPool.Get().(*[]byte)
+					responseHeader := (*bufPtr)[:0]
+
+					// read until \r\n\r\n (end of http response header)
+					for {
+						data, err := r.ReadSlice('\n')
+						if err != nil {
+							http1xxBufferPool.Put(bufPtr)
+							return nil, errors.New("failed to read http 1xx response").Base(err)
+						}
+						responseHeader = append(responseHeader, data...)
+						headerLen := len(responseHeader)
+						if headerLen >= 4 && bytes.Equal(responseHeader[headerLen-4:], endOfHeader) {
+							break
+						}
+						if headerLen > 1024 {
+							http1xxBufferPool.Put(bufPtr)
+							return nil, errors.New("too big http 1xx response")
+						}
+					}
+
+					writer.Write(responseHeader)
+
+					// Return buffer to pool
+					*bufPtr = responseHeader[:0]
+					http1xxBufferPool.Put(bufPtr)
 				}
 			}
-			writer.Write(ResponseHeader1xx)
 		}
 	}
 	return http.ReadResponse(r, req)

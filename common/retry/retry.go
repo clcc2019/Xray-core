@@ -1,6 +1,7 @@
 package retry // import "github.com/xtls/xray-core/common/retry"
 
 import (
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -14,6 +15,14 @@ type Strategy interface {
 	On(func() error) error
 }
 
+// errorSlicePool pools error slices to reduce allocations during retries
+var errorSlicePool = sync.Pool{
+	New: func() interface{} {
+		s := make([]error, 0, 8) // Most retry scenarios have < 8 unique errors
+		return &s
+	},
+}
+
 type retryer struct {
 	totalAttempt int
 	nextDelay    func() uint32
@@ -22,7 +31,19 @@ type retryer struct {
 // On implements Strategy.On.
 func (r *retryer) On(method func() error) error {
 	attempt := 0
-	accumulatedError := make([]error, 0, r.totalAttempt)
+
+	// Get error slice from pool
+	errSlicePtr := errorSlicePool.Get().(*[]error)
+	accumulatedError := (*errSlicePtr)[:0]
+	defer func() {
+		// Clear references before returning to pool
+		for i := range accumulatedError {
+			accumulatedError[i] = nil
+		}
+		*errSlicePtr = accumulatedError[:0]
+		errorSlicePool.Put(errSlicePtr)
+	}()
+
 	for attempt < r.totalAttempt {
 		err := method()
 		if err == nil {
@@ -36,7 +57,12 @@ func (r *retryer) On(method func() error) error {
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 		attempt++
 	}
-	return errors.New(accumulatedError).Base(ErrRetryFailed)
+
+	// Make a copy of errors for the final error message
+	// since we're returning the slice to the pool
+	finalErrors := make([]error, len(accumulatedError))
+	copy(finalErrors, accumulatedError)
+	return errors.New(finalErrors).Base(ErrRetryFailed)
 }
 
 // Timed returns a retry strategy with fixed interval.

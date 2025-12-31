@@ -26,8 +26,12 @@ func (s *allocStrategy) Adjust(n uint32) {
 		s.current = n
 	}
 
-	if s.current > 8 {
-		s.current = 8
+	// Increased from 8 to 16 for better throughput on high-bandwidth connections.
+	// This allows readv to batch more buffers in a single syscall, reducing overhead.
+	// Trade-off: Uses more memory per read operation, but significantly improves
+	// throughput for large data transfers (e.g., video streaming, file downloads).
+	if s.current > 16 {
+		s.current = 16
 	}
 
 	if s.current == 0 {

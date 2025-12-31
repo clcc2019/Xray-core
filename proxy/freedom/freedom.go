@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	sync "sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -567,13 +568,59 @@ func (f *FragmentWriter) Write(b []byte) (int, error) {
 	}
 }
 
+// randomBytesPool pools byte slices for noise generation
+// Uses common sizes: 64, 256, 1024, 4096 bytes
+var randomBytesPools = [4]*sync.Pool{
+	{New: func() interface{} { b := make([]byte, 64); return &b }},
+	{New: func() interface{} { b := make([]byte, 256); return &b }},
+	{New: func() interface{} { b := make([]byte, 1024); return &b }},
+	{New: func() interface{} { b := make([]byte, 4096); return &b }},
+}
+
+var randomPoolSizes = [4]int64{64, 256, 1024, 4096}
+
+// getRandomBytesPool returns appropriate pool for the given size
+func getRandomBytesPool(n int64) (*sync.Pool, int64) {
+	for i, size := range randomPoolSizes {
+		if n <= size {
+			return randomBytesPools[i], size
+		}
+	}
+	return nil, 0
+}
+
+// GenerateRandomBytes generates n random bytes.
+// For common sizes, it uses pooled buffers to reduce allocations.
 func GenerateRandomBytes(n int64) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+
+	// Try to use pooled buffer for common sizes
+	if pool, poolSize := getRandomBytesPool(n); pool != nil {
+		bufPtr := pool.Get().(*[]byte)
+		buf := (*bufPtr)[:n]
+		_, err := rand.Read(buf)
+		if err != nil {
+			pool.Put(bufPtr)
+			return nil, err
+		}
+		// Make a copy since we're returning the pooled buffer
+		result := make([]byte, n)
+		copy(result, buf)
+		// Clear and return to pool
+		for i := int64(0); i < poolSize; i++ {
+			(*bufPtr)[i] = 0
+		}
+		pool.Put(bufPtr)
+		return result, nil
+	}
+
+	// For larger sizes, allocate directly
 	b := make([]byte, n)
 	_, err := rand.Read(b)
-	// Note that err == nil only if we read len(b) bytes.
 	if err != nil {
 		return nil, err
 	}
-
 	return b, nil
 }
