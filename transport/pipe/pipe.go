@@ -47,15 +47,18 @@ func OptionsFromContext(ctx context.Context) []Option {
 }
 
 // New creates a new Reader and Writer that connects to each other.
+// The pipe is acquired from a pool for better memory efficiency.
 func New(opts ...Option) (*Reader, *Writer) {
-	p := &pipe{
-		readSignal:  signal.NewNotifier(),
-		writeSignal: signal.NewNotifier(),
-		done:        done.New(),
-		errChan:     make(chan error, 1),
-		option: pipeOption{
-			limit: -1,
-		},
+	p := acquirePipe()
+
+	// Initialize signals from pool
+	p.readSignal = signal.NewNotifier()
+	p.writeSignal = signal.NewNotifier()
+	p.done = done.New()
+
+	// Reset option to default
+	p.option = pipeOption{
+		limit: -1,
 	}
 
 	for _, opt := range opts {

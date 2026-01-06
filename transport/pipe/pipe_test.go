@@ -151,3 +151,79 @@ func BenchmarkPipeReadWrite(b *testing.B) {
 		c = d
 	}
 }
+
+func BenchmarkPipeReadWriteParallel(b *testing.B) {
+	reader, writer := New(WithoutSizeLimit())
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_, err := reader.ReadMultiBuffer()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			a := buf.New()
+			a.Extend(buf.Size)
+			writer.WriteMultiBuffer(buf.MultiBuffer{a})
+		}
+	})
+
+	close(done)
+	writer.Close()
+}
+
+func BenchmarkPipeCreation(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reader, writer := New(WithoutSizeLimit())
+		writer.Close()
+		// Release to pool for next iteration
+		reader.Release()
+	}
+}
+
+func BenchmarkPipeCreationWithLimit(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reader, writer := New(WithSizeLimit(16 * 1024))
+		writer.Close()
+		reader.Release()
+	}
+}
+
+func BenchmarkPipeHighThroughput(b *testing.B) {
+	reader, writer := New(WithoutSizeLimit())
+
+	// Simulate high throughput scenario
+	go func() {
+		for {
+			mb, err := reader.ReadMultiBuffer()
+			if err != nil {
+				return
+			}
+			buf.ReleaseMulti(mb)
+		}
+	}()
+
+	b.ResetTimer()
+	b.SetBytes(buf.Size)
+	for i := 0; i < b.N; i++ {
+		a := buf.New()
+		a.Extend(buf.Size)
+		if err := writer.WriteMultiBuffer(buf.MultiBuffer{a}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	writer.Close()
+}

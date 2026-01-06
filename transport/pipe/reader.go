@@ -1,6 +1,7 @@
 package pipe
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -8,7 +9,8 @@ import (
 
 // Reader is a buf.Reader that reads content from a pipe.
 type Reader struct {
-	pipe *pipe
+	pipe     *pipe
+	released atomic.Bool
 }
 
 // ReadMultiBuffer implements buf.Reader.
@@ -38,4 +40,13 @@ func (r *Reader) Recover() (err error) {
 	default:
 	}
 	return
+}
+
+// Release returns the underlying pipe to the pool.
+// This should only be called when both Reader and Writer are done.
+// After calling Release, the Reader should not be used anymore.
+func (r *Reader) Release() {
+	if r.released.CompareAndSwap(false, true) {
+		r.pipe.Release()
+	}
 }
