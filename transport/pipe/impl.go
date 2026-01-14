@@ -333,36 +333,36 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 		if err == errSlowDown {
 			p.readSignal.Signal()
-
-			// Yield current goroutine. Hopefully the reading counterpart can pick up the payload.
 			runtime.Gosched()
 			return nil
 		}
 
-		if err == errBufferFull && p.option.discardOverflow {
-			buf.ReleaseMulti(mb)
-			return nil
-		}
+		if err == errBufferFull {
+			if p.option.discardOverflow {
+				buf.ReleaseMulti(mb)
+				return nil
+			}
 
-		if err != errBufferFull {
-			buf.ReleaseMulti(mb)
-			p.readSignal.Signal()
-			return err
-		}
+			// Spin-wait before blocking
+			spinWait()
 
-		// Spin-wait before blocking
-		spinWait()
+			// Check again after spin
+			if p.tryWriteFast() {
+				continue
+			}
 
-		// Check again after spin
-		if p.tryWriteFast() {
+			select {
+			case <-p.writeSignal.Wait():
+			case <-p.done.Wait():
+				buf.ReleaseMulti(mb)
+				return io.ErrClosedPipe
+			}
 			continue
 		}
 
-		select {
-		case <-p.writeSignal.Wait():
-		case <-p.done.Wait():
-			return io.ErrClosedPipe
-		}
+		buf.ReleaseMulti(mb)
+		p.readSignal.Signal()
+		return err
 	}
 }
 
